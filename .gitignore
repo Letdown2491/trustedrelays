@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Data
+data/
+
+# Config (contains private keys)
+config.json
+
+# Environment variables
+.env
+.env.*
+
+# Logs
+logs/
+*.log
+
+# Test coverage
+coverage/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

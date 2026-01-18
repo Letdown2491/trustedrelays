@@ -1,0 +1,37 @@
+[Unit]
+Description=Trusted Relay Assertions Provider
+Documentation=https://github.com/Letdown2491/trustedrelays
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trustedrelays
+Group=trustedrelays
+WorkingDirectory=/opt/trustedrelays
+
+# Environment
+Environment=NODE_ENV=production
+EnvironmentFile=-/opt/trustedrelays/.env
+
+# Run daemon
+ExecStart=/usr/local/bin/bun run src/index.ts daemon --config /opt/trustedrelays/config.json
+
+# Restart on failure
+Restart=on-failure
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/trustedrelays/data
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trustedrelays
+
+[Install]
+WantedBy=multi-user.target

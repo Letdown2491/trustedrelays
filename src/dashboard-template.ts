@@ -1,0 +1,960 @@
+/**
+ * Dashboard HTML template
+ * Extracted from api.ts for better code organization
+ */
+export const DASHBOARD_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Trust scores for Nostr relays. Find reliable, secure, and accessible relays with transparency into how scores are computed.">
+  <meta name="keywords" content="nostr, relay, trust, score, decentralized, social, protocol">
+  <meta name="author" content="Trusted Relays">
+  <meta name="robots" content="index, follow">
+
+  <!-- OpenGraph -->
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Trusted Relays - Nostr Relay Trust Scores">
+  <meta property="og:description" content="Trust scores for Nostr relays. Find reliable, secure, and accessible relays with transparency into how scores are computed.">
+  <meta property="og:url" content="https://trustedrelays.xyz">
+  <meta property="og:site_name" content="Trusted Relays">
+  <meta property="og:image" content="https://trustedrelays.xyz/og-image.svg">
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Trusted Relays - Nostr Relay Trust Scores">
+  <meta name="twitter:description" content="Trust scores for Nostr relays. Find reliable, secure, and accessible relays.">
+  <meta name="twitter:image" content="https://trustedrelays.xyz/og-image.svg">
+
+  <link rel="canonical" href="https://trustedrelays.xyz">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <title>Trusted Relays - Nostr Relay Trust Scores</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="header">
+    <div class="header-left">
+      <h1>Trusted Relays</h1>
+    </div>
+    <div class="header-right">
+      <span class="freshness-dot" id="freshness-dot" title="Data freshness"></span>
+      <button class="btn btn-icon" id="algo-link" title="How trust scores are calculated">?</button>
+      <a href="https://github.com/Letdown2491/trustedrelays" target="_blank" rel="noopener" class="btn btn-icon" title="View on GitHub">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      </a>
+    </div>
+  </div>
+
+  <div class="toolbar">
+    <input type="text" class="search-input" id="search" placeholder="Search relays..." title="Search by relay name or URL">
+    <div class="filter-group" title="Filter by access policy">
+      <span class="filter-label">Policy</span>
+      <select id="filter-policy">
+        <option value="">All</option>
+        <option value="open">Open</option>
+        <option value="moderated">Moderated</option>
+        <option value="curated">Curated</option>
+        <option value="specialized">Specialized</option>
+      </select>
+    </div>
+    <div class="filter-group" title="Filter by overall trust score">
+      <span class="filter-label">Score</span>
+      <select id="filter-score">
+        <option value="">All</option>
+        <option value="high">70+ Good</option>
+        <option value="medium">40-69 Fair</option>
+        <option value="low">&lt;40 Poor</option>
+      </select>
+    </div>
+    <div class="filter-group hide-mobile" title="Filter by server location">
+      <span class="filter-label">Country</span>
+      <select id="filter-country"><option value="">All</option></select>
+    </div>
+    <div class="filter-group hide-mobile" title="Filter by connection security">
+      <span class="filter-label">Security</span>
+      <select id="filter-secure">
+        <option value="">All</option>
+        <option value="secure">Encrypted (wss)</option>
+        <option value="insecure">Unencrypted (ws)</option>
+      </select>
+    </div>
+    <div class="toolbar-right">
+      <button class="btn" id="btn-refresh" title="Refresh data from server">↻</button>
+      <button class="btn" id="btn-export-csv" title="Download filtered results as CSV">CSV</button>
+      <button class="btn" id="btn-export-json" title="Download filtered results as JSON">JSON</button>
+    </div>
+  </div>
+
+  <div class="content">
+    <table>
+      <thead>
+        <tr>
+          <th data-sort="name" class="col-relay" title="Relay name and URL" id="th-relay">Relay</th>
+          <th data-sort="policy" class="col-policy hide-mobile" title="Access policy: Open, Moderated, Curated, or Specialized">Policy</th>
+          <th data-sort="countryCode" class="col-loc center hide-mobile" title="Server location (country code)" id="th-location">Location</th>
+          <th data-sort="confidence" class="col-conf center hide-tablet" title="Data confidence based on observation count">Confidence</th>
+          <th data-sort="reliability" class="col-score right hide-tablet" title="Reliability score: Connection stability and latency">Reliability</th>
+          <th data-sort="quality" class="col-score right hide-tablet" title="Quality score: Spam filtering, policy clarity, security">Quality</th>
+          <th data-sort="accessibility" class="col-score right hide-tablet" title="Accessibility score: Access barriers, limits, jurisdiction">Accessibility</th>
+          <th data-sort="score" class="col-final right sorted" title="Overall trust score (0-100)"><span class="hide-mobile">Trust </span>Score</th>
+        </tr>
+      </thead>
+      <tbody id="relay-tbody">
+        <!-- Skeleton rows while loading -->
+        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton-score-bar"><div class="skeleton skeleton-text skeleton-num"></div><div class="skeleton skeleton-bar"></div></div></td></tr>
+        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton-score-bar"><div class="skeleton skeleton-text skeleton-num"></div><div class="skeleton skeleton-bar"></div></div></td></tr>
+        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton-score-bar"><div class="skeleton skeleton-text skeleton-num"></div><div class="skeleton skeleton-bar"></div></div></td></tr>
+        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton-score-bar"><div class="skeleton skeleton-text skeleton-num"></div><div class="skeleton skeleton-bar"></div></div></td></tr>
+        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton-score-bar"><div class="skeleton skeleton-text skeleton-num"></div><div class="skeleton skeleton-bar"></div></div></td></tr>
+        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton-score-bar"><div class="skeleton skeleton-text skeleton-num"></div><div class="skeleton skeleton-bar"></div></div></td></tr>
+        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton-score-bar"><div class="skeleton skeleton-text skeleton-num"></div><div class="skeleton skeleton-bar"></div></div></td></tr>
+        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton-score-bar"><div class="skeleton skeleton-text skeleton-num"></div><div class="skeleton skeleton-bar"></div></div></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="footer">
+    <div class="footer-stats">
+      <div>High: <span id="foot-high">-</span></div>
+      <div>Medium: <span id="foot-med">-</span></div>
+      <div>Low: <span id="foot-low">-</span></div>
+      <div>Unreachable: <span id="foot-unreach">-</span></div>
+    </div>
+    <div>Auto-refresh: <span id="auto-refresh-status">30s</span></div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <div class="modal-overlay" id="modal">
+    <div class="modal">
+      <div class="modal-header">
+        <div>
+          <h2 id="modal-title">Relay Details</h2>
+          <div class="modal-subtitle" id="modal-subtitle"></div>
+        </div>
+        <div class="modal-actions">
+          <button class="btn" id="modal-copy">Copy<span class="hide-mobile"> URL</span></button>
+          <div class="dropdown">
+            <button class="dropdown-btn" id="modal-open-dropdown">Open ▾</button>
+            <div class="dropdown-content" id="open-dropdown-content">
+              <button class="dropdown-item" id="modal-open-relay">Open relay</button>
+              <a class="dropdown-item" id="modal-nostr-watch" href="#" target="_blank" rel="noopener">View on nostr.watch</a>
+            </div>
+          </div>
+          <button class="modal-close" onclick="closeModal()">×</button>
+        </div>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="algo-modal">
+    <div class="modal" style="max-width: 800px;">
+      <div class="modal-header">
+        <div>
+          <h2>How Trust Scores Work</h2>
+          <div class="modal-subtitle">Algorithm v0.1.2 — Trusted Relay Assertions</div>
+        </div>
+        <button class="modal-close" onclick="closeAlgoModal()">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="algo-section">
+          <h3>Overall Score Formula</h3>
+          <div class="algo-formula">
+            Trust Score = (<span class="weight">40%</span> × <span class="component">Reliability</span>) + (<span class="weight">35%</span> × <span class="component">Quality</span>) + (<span class="weight">25%</span> × <span class="component">Accessibility</span>)
+          </div>
+        </div>
+
+        <div class="algo-section">
+          <h3>Score Components</h3>
+          <div class="algo-grid">
+            <div class="algo-card reliability">
+              <div class="algo-card-header">
+                <span class="algo-card-title">Reliability</span>
+                <span class="algo-card-weight">40%</span>
+              </div>
+              <div class="algo-card-desc">Measures operational stability from probe data and NIP-66 monitor metrics.</div>
+              <div class="algo-sub-list">
+                <div class="algo-sub-item"><span class="algo-sub-name">Uptime</span><span class="algo-sub-weight">40%</span></div>
+                <div class="algo-sub-item"><span class="algo-sub-name">Recovery</span><span class="algo-sub-weight">20%</span></div>
+                <div class="algo-sub-item"><span class="algo-sub-name">Consistency</span><span class="algo-sub-weight">20%</span></div>
+                <div class="algo-sub-item"><span class="algo-sub-name">Latency</span><span class="algo-sub-weight">20%</span></div>
+              </div>
+            </div>
+
+            <div class="algo-card quality">
+              <div class="algo-card-header">
+                <span class="algo-card-title">Quality</span>
+                <span class="algo-card-weight">35%</span>
+              </div>
+              <div class="algo-card-desc">Evaluates relay professionalism, documentation, and operator accountability.</div>
+              <div class="algo-sub-list">
+                <div class="algo-sub-item"><span class="algo-sub-name">Policy docs</span><span class="algo-sub-weight">60%</span></div>
+                <div class="algo-sub-item"><span class="algo-sub-name">Security (TLS)</span><span class="algo-sub-weight">25%</span></div>
+                <div class="algo-sub-item"><span class="algo-sub-name">Operator trust</span><span class="algo-sub-weight">15%</span></div>
+              </div>
+            </div>
+
+            <div class="algo-card accessibility">
+              <div class="algo-card-header">
+                <span class="algo-card-title">Accessibility</span>
+                <span class="algo-card-weight">25%</span>
+              </div>
+              <div class="algo-card-desc">Assesses openness, access barriers, and jurisdiction characteristics.</div>
+              <div class="algo-sub-list">
+                <div class="algo-sub-item"><span class="algo-sub-name">Access barriers</span><span class="algo-sub-weight">40%</span></div>
+                <div class="algo-sub-item"><span class="algo-sub-name">Rate limits</span><span class="algo-sub-weight">20%</span></div>
+                <div class="algo-sub-item"><span class="algo-sub-name">Jurisdiction</span><span class="algo-sub-weight">20%</span></div>
+                <div class="algo-sub-item"><span class="algo-sub-name">Surveillance</span><span class="algo-sub-weight">20%</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="algo-section">
+          <h3>Confidence Levels</h3>
+          <table class="algo-conf-table">
+            <tr><th>Level</th><th>Threshold</th><th>Description</th></tr>
+            <tr><td><span class="conf-badge conf-high">high</span></td><td>≥500 observations</td><td>Reliable long-term data</td></tr>
+            <tr><td><span class="conf-badge conf-medium">medium</span></td><td>100–499 observations</td><td>Sufficient data for scoring</td></tr>
+            <tr><td><span class="conf-badge conf-low">low</span></td><td>&lt;100 observations</td><td>Limited data, scores may change</td></tr>
+          </table>
+        </div>
+
+        <div class="algo-section">
+          <h3>Data Sources</h3>
+          <div class="algo-note">
+            Scores are computed from multiple sources: <strong>Direct probes</strong> (WebSocket connectivity, latency measurement, NIP-11 metadata), <strong>NIP-66 monitors</strong> (uptime, RTT metrics from trusted monitoring services), and <strong>NIP-11 relay info</strong> (limitations, supported NIPs, operator identity). Data is weighted: 30% direct probes + 70% NIP-66 data when both are available.
+          </div>
+        </div>
+
+        <div class="algo-section">
+          <h3>Operator Verification</h3>
+          <div class="algo-note">
+            Operator identity is verified through multiple methods: <strong>DNS TXT records</strong>, <strong>.well-known/nostr.json</strong>, and <strong>NIP-11 pubkey</strong>. When multiple sources agree on the same pubkey, confidence increases (up to 95% with all three). Operator trust also factors in <strong>Web of Trust</strong> scores via NIP-85 assertions.
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let allRelays = [];
+    let sortCol = 'score';
+    let sortAsc = false;
+    let countries = [];
+    let lastFetch = 0;
+    let refreshInterval = null;
+
+    // Performance: cache filtered/sorted data
+    let cachedFiltered = null;
+    let cachedSorted = null;
+    let cacheKey = '';
+
+    // Performance: pre-computed stats
+    let stats = { high: 0, medium: 0, low: 0, unreachable: 0 };
+
+    // Pagination
+    const PAGE_SIZE = 50;
+    let currentPage = 1;
+
+    // URL state management
+    function readUrlState() {
+      const params = new URLSearchParams(window.location.search);
+
+      if (params.has('q')) document.getElementById('search').value = params.get('q');
+      if (params.has('policy')) document.getElementById('filter-policy').value = params.get('policy');
+      if (params.has('score')) document.getElementById('filter-score').value = params.get('score');
+      if (params.has('country')) document.getElementById('filter-country').value = params.get('country');
+      if (params.has('secure')) document.getElementById('filter-secure').value = params.get('secure');
+      if (params.has('sort')) sortCol = params.get('sort');
+      if (params.has('asc')) sortAsc = params.get('asc') === '1';
+
+      // Update sort header UI
+      document.querySelectorAll('th[data-sort]').forEach(th => {
+        th.classList.remove('sorted', 'asc');
+        if (th.dataset.sort === sortCol) {
+          th.classList.add('sorted');
+          if (sortAsc) th.classList.add('asc');
+        }
+      });
+    }
+
+    function updateUrlState() {
+      const params = new URLSearchParams();
+
+      const search = document.getElementById('search').value;
+      const policy = document.getElementById('filter-policy').value;
+      const score = document.getElementById('filter-score').value;
+      const country = document.getElementById('filter-country').value;
+      const secure = document.getElementById('filter-secure').value;
+
+      if (search) params.set('q', search);
+      if (policy) params.set('policy', policy);
+      if (score) params.set('score', score);
+      if (country) params.set('country', country);
+      if (secure) params.set('secure', secure);
+      if (sortCol !== 'score') params.set('sort', sortCol);
+      if (sortAsc) params.set('asc', '1');
+
+      const newUrl = params.toString() ? '?' + params.toString() : window.location.pathname;
+      window.history.replaceState({}, '', newUrl);
+    }
+
+    async function init() {
+      await fetchData();
+      readUrlState();
+      renderTable();
+      startAutoRefresh();
+    }
+
+    async function fetchData() {
+      const [relaysRes, countriesRes] = await Promise.all([
+        fetch('/api/relays').then(r => r.json()),
+        fetch('/api/countries').then(r => r.json())
+      ]);
+
+      if (relaysRes.success) {
+        allRelays = relaysRes.data;
+        lastFetch = Date.now();
+        invalidateCache();
+        updateStats();
+        renderTable();
+        updateFreshness();
+      }
+
+      if (countriesRes.success && countries.length === 0) {
+        countries = countriesRes.data;
+        populateCountryFilter();
+      }
+    }
+
+    function startAutoRefresh() {
+      refreshInterval = setInterval(() => {
+        fetchData();
+      }, 30000);
+      setInterval(updateFreshness, 5000);
+    }
+
+    function updateFreshness() {
+      const age = Math.floor((Date.now() - lastFetch) / 1000);
+      const dot = document.getElementById('freshness-dot');
+      let ageText;
+
+      if (age < 60) {
+        dot.className = 'freshness-dot';
+        ageText = age + 's ago';
+      } else if (age < 300) {
+        dot.className = 'freshness-dot stale';
+        ageText = Math.floor(age / 60) + 'm ago';
+      } else {
+        dot.className = 'freshness-dot old';
+        ageText = Math.floor(age / 60) + 'm ago';
+      }
+      dot.title = 'Data updated ' + ageText;
+    }
+
+    function updateStats() {
+      // Performance: single-pass stats calculation
+      stats = { high: 0, medium: 0, low: 0, unreachable: 0 };
+      for (let i = 0; i < allRelays.length; i++) {
+        const r = allRelays[i];
+        if (r.status === 'unreachable') stats.unreachable++;
+        else if (r.score >= 70) stats.high++;
+        else if (r.score >= 40) stats.medium++;
+        else if (r.score != null) stats.low++;
+      }
+      document.getElementById('foot-high').textContent = stats.high;
+      document.getElementById('foot-med').textContent = stats.medium;
+      document.getElementById('foot-low').textContent = stats.low;
+      document.getElementById('foot-unreach').textContent = stats.unreachable;
+    }
+
+    function updateColumnHeaders(filteredCount, totalCount, countryCount) {
+      const relayHeader = document.getElementById('th-relay');
+      const locationHeader = document.getElementById('th-location');
+
+      if (filteredCount === totalCount) {
+        relayHeader.innerHTML = 'Relay <span class="count">(' + totalCount + ')</span>';
+      } else {
+        relayHeader.innerHTML = 'Relay <span class="count">(' + filteredCount + '/' + totalCount + ')</span>';
+      }
+      locationHeader.innerHTML = 'Location <span class="count">(' + countryCount + ')</span>';
+    }
+
+    function populateCountryFilter() {
+      const sel = document.getElementById('filter-country');
+      countries.sort((a,b) => b.relayCount - a.relayCount).forEach(c => {
+        const opt = document.createElement('option');
+        opt.value = c.countryCode;
+        opt.textContent = c.countryCode + ' (' + c.relayCount + ')';
+        sel.appendChild(opt);
+      });
+    }
+
+    function getFilterKey() {
+      return [
+        document.getElementById('search').value,
+        document.getElementById('filter-policy').value,
+        document.getElementById('filter-score').value,
+        document.getElementById('filter-country').value,
+        document.getElementById('filter-secure').value,
+        sortCol,
+        sortAsc
+      ].join('|');
+    }
+
+    function getFiltered() {
+      const search = document.getElementById('search').value.toLowerCase();
+      const policy = document.getElementById('filter-policy').value;
+      const scoreFilter = document.getElementById('filter-score').value;
+      const country = document.getElementById('filter-country').value;
+      const secure = document.getElementById('filter-secure').value;
+
+      // Performance: use cached result if filters unchanged
+      const key = getFilterKey();
+      if (cachedFiltered && cacheKey === key) return cachedFiltered;
+
+      cachedFiltered = allRelays.filter(r => {
+        if (search && !r.url.toLowerCase().includes(search) && !(r.name && r.name.toLowerCase().includes(search))) return false;
+        if (policy && r.policy !== policy) return false;
+        if (country && r.countryCode !== country) return false;
+        if (secure === 'secure' && !r.isSecure) return false;
+        if (secure === 'insecure' && r.isSecure) return false;
+        if (scoreFilter === 'high' && (r.score == null || r.score < 70)) return false;
+        if (scoreFilter === 'medium' && (r.score == null || r.score < 40 || r.score >= 70)) return false;
+        if (scoreFilter === 'low' && (r.score == null || r.score >= 40)) return false;
+        return true;
+      });
+
+      // Sort in place for cache
+      cachedFiltered.sort((a, b) => {
+        let av = a[sortCol], bv = b[sortCol];
+        if (sortCol === 'name') { av = av || a.url; bv = bv || b.url; }
+        if (av == null) av = sortAsc ? Infinity : -Infinity;
+        if (bv == null) bv = sortAsc ? Infinity : -Infinity;
+        if (typeof av === 'string') return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
+        return sortAsc ? av - bv : bv - av;
+      });
+
+      cacheKey = key;
+      return cachedFiltered;
+    }
+
+    function invalidateCache() {
+      cachedFiltered = null;
+      cacheKey = '';
+      currentPage = 1;
+    }
+
+    // Convert country code to flag emoji (e.g., 'US' -> 🇺🇸) - hoisted for reuse
+    const toFlag = code => code ? String.fromCodePoint(...[...code.toUpperCase()].map(c => 0x1F1E6 + c.charCodeAt(0) - 65)) : '';
+
+    function renderRow(r) {
+      const scoreClass = r.score >= 80 ? 'score-excellent' : r.score >= 60 ? 'score-good' : r.score >= 40 ? 'score-fair' : 'score-poor';
+      const barColor = r.score >= 80 ? 'var(--green)' : r.score >= 60 ? 'var(--teal)' : r.score >= 40 ? 'var(--yellow)' : 'var(--red)';
+      const pct = r.score != null ? r.score : 0;
+      const trendIcon = r.trend === 'up' ? '↑' : r.trend === 'down' ? '↓' : r.trend === 'stable' ? '·' : '';
+      const trendClass = r.trend === 'up' ? 'trend-up' : r.trend === 'down' ? 'trend-down' : 'trend-stable';
+      const trendTitle = r.trend === 'up' ? 'Score trending up' : r.trend === 'down' ? 'Score trending down' : 'Score stable';
+      const confClass = r.confidence === 'high' ? 'conf-high' : r.confidence === 'medium' ? 'conf-medium' : 'conf-low';
+      const confTitle = r.confidence === 'high' ? '500+ observations' : r.confidence === 'medium' ? '100-499 observations' : 'Under 100 observations';
+      const displayUrl = r.url.replace('wss://', '').replace('ws://', '');
+      const insecureIcon = !r.isSecure ? '<span class="insecure-icon" title="Unencrypted connection (ws://) - traffic can be monitored">⚠</span> ' : '';
+      const policyTitle = r.policy === 'open' ? 'Accepts most events from anyone' : r.policy === 'moderated' ? 'Open but with content filtering' : r.policy === 'curated' ? 'Restricted access (auth/payment required)' : r.policy === 'specialized' ? 'Purpose-built for specific use case' : '';
+      const flag = r.countryCode ? '<span class="flag">' + toFlag(r.countryCode) + '</span>' : '';
+      const accessLevelText = r.accessLevel === 'open' ? '' : r.accessLevel === 'auth_required' ? ' (auth required)' : r.accessLevel === 'payment_required' ? ' (payment required)' : r.accessLevel === 'restricted' ? ' (restricted)' : '';
+      const statusTitle = r.isOnline ? 'Online' + accessLevelText + ' - Relay is currently reachable' : 'Offline - Relay is currently unreachable';
+      const statusDot = '<span class="status-dot ' + (r.isOnline ? 'online' : 'offline') + '" title="' + statusTitle + '"></span>';
+      const descLine = r.name ? '<div class="relay-desc">' + escHtml(r.name.length > 40 ? r.name.slice(0,40) + '…' : r.name) + '</div>' : '';
+
+      return '<tr class="clickable" data-url="' + escAttr(r.url) + '" title="Click for details">' +
+        '<td>' +
+          '<div class="relay-url-primary">' + statusDot + insecureIcon + escHtml(displayUrl) + '</div>' +
+          descLine +
+        '</td>' +
+        '<td class="hide-mobile">' + (r.policy ? '<span class="tag tag-' + r.policy + '" title="' + policyTitle + '">' + r.policy + '</span>' : '<span class="score-val dim">-</span>') + '</td>' +
+        '<td class="col-loc hide-mobile"><span class="loc" title="Server location">' + flag + (r.countryCode || '-') + '</span></td>' +
+        '<td class="col-conf hide-tablet"><span class="conf-badge ' + confClass + '" title="' + confTitle + '">' + r.confidence + '</span></td>' +
+        '<td class="col-score hide-tablet" title="Connection stability and response time"><span class="score-val">' + (r.reliability ?? '-') + '</span></td>' +
+        '<td class="col-score hide-tablet" title="Spam filtering, policy clarity, encryption"><span class="score-val">' + (r.quality ?? '-') + '</span></td>' +
+        '<td class="col-score hide-tablet" title="Access barriers, limits, jurisdiction"><span class="score-val">' + (r.accessibility ?? '-') + '</span></td>' +
+        '<td class="col-final ' + scoreClass + '" title="Overall trust score">' +
+          '<div class="final-score">' +
+            '<span class="trend ' + trendClass + '" title="' + trendTitle + '">' + trendIcon + '</span>' +
+            '<span class="final-num">' + (r.score != null ? r.score : '-') + '</span>' +
+            '<span class="score-bar"><span class="score-bar-fill" style="width:' + pct + '%;background-color:' + barColor + '"></span></span>' +
+          '</div>' +
+        '</td>' +
+      '</tr>';
+    }
+
+    let loadingMore = false;
+    let observer = null;
+
+    function renderTable() {
+      const data = getFiltered(); // Already sorted via cache
+      const filteredCount = data.length;
+      const displayCount = currentPage * PAGE_SIZE;
+      const displayData = data.slice(0, displayCount);
+      const hasMore = displayCount < filteredCount;
+
+      // Update column headers with counts
+      updateColumnHeaders(filteredCount, allRelays.length, countries.length);
+
+      const tbody = document.getElementById('relay-tbody');
+
+      if (filteredCount === 0) {
+        tbody.innerHTML = '<tr><td colspan="8" class="empty">No relays match filters</td></tr>';
+        return;
+      }
+
+      // Render rows + sentinel for infinite scroll
+      let html = displayData.map(renderRow).join('');
+      if (hasMore) {
+        html += '<tr id="scroll-sentinel"><td colspan="8"></td></tr>';
+      }
+
+      tbody.innerHTML = html;
+      setupInfiniteScroll();
+    }
+
+    function loadMore() {
+      if (loadingMore) return;
+      const data = getFiltered();
+      const currentCount = currentPage * PAGE_SIZE;
+      if (currentCount >= data.length) return;
+
+      loadingMore = true;
+      currentPage++;
+      const newCount = currentPage * PAGE_SIZE;
+      const newItems = data.slice(currentCount, newCount);
+      const hasMore = newCount < data.length;
+
+      const sentinel = document.getElementById('scroll-sentinel');
+      if (sentinel) {
+        // Insert new rows before sentinel using insertAdjacentHTML (handles <tr> correctly)
+        sentinel.insertAdjacentHTML('beforebegin', newItems.map(renderRow).join(''));
+        if (!hasMore) sentinel.remove();
+      }
+
+      loadingMore = false;
+    }
+
+    function setupInfiniteScroll() {
+      if (observer) observer.disconnect();
+      const sentinel = document.getElementById('scroll-sentinel');
+      if (!sentinel) return;
+
+      observer = new IntersectionObserver((entries) => {
+        if (entries[0].isIntersecting) loadMore();
+      }, { rootMargin: '200px' });
+      observer.observe(sentinel);
+    }
+
+    function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+    function escAttr(s) { return s.replace(/'/g, "\\\\'").replace(/"/g, '&quot;'); }
+
+    function copyUrl(url) {
+      navigator.clipboard.writeText(url);
+      showToast('Copied: ' + url);
+    }
+
+    function showToast(msg) {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.classList.add('show');
+      setTimeout(() => t.classList.remove('show'), 2000);
+    }
+
+    function exportCSV() {
+      const data = getFiltered(); // Already sorted via cache
+      const headers = ['url','name','score','reliability','quality','accessibility','policy','confidence','country','secure','observations'];
+      const rows = data.map(r => [r.url, r.name||'', r.score, r.reliability, r.quality, r.accessibility, r.policy||'', r.confidence, r.countryCode||'', r.isSecure, r.observations]);
+      const csv = [headers.join(','), ...rows.map(r => r.map(v => '"' + String(v).replace(/"/g,'""') + '"').join(','))].join('\\n');
+      downloadFile(csv, 'trustedrelays.csv', 'text/csv');
+    }
+
+    function exportJSON() {
+      const data = getFiltered(); // Already sorted via cache
+      downloadFile(JSON.stringify(data, null, 2), 'trustedrelays.json', 'application/json');
+    }
+
+    function downloadFile(content, filename, type) {
+      const blob = new Blob([content], { type });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename; a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    let currentRelayUrl = '';
+    async function viewRelay(url) {
+      currentRelayUrl = url;
+      const r = allRelays.find(x => x.url === url);
+      const isSecure = url.toLowerCase().startsWith('wss://');
+      const displayUrl = url.replace('wss://','').replace('ws://','');
+      const insecureIcon = !isSecure ? '<span class="insecure-icon" title="Unencrypted connection (ws://) - traffic can be monitored">⚠</span> ' : '';
+      document.getElementById('modal-title').innerHTML = insecureIcon + escHtml(displayUrl);
+      document.getElementById('modal-subtitle').textContent = r?.name || '';
+      // Update nostr.watch link
+      const relayHost = url.replace('wss://', '').replace('ws://', '').split('/')[0];
+      document.getElementById('modal-nostr-watch').href = 'https://nostr.watch/relay/' + encodeURIComponent(relayHost);
+      // Show skeleton loader while fetching
+      document.getElementById('modal-body').innerHTML =
+        '<div class="detail-grid">' +
+          '<div class="skeleton-card-hero">' +
+            '<div style="display:flex;align-items:center;gap:16px">' +
+              '<div class="skeleton skeleton-score hero"></div>' +
+              '<div class="skeleton skeleton-text" style="width:80px"></div>' +
+            '</div>' +
+            '<div class="skeleton skeleton-text" style="width:60px"></div>' +
+          '</div>' +
+          '<div class="skeleton-card"><div class="skeleton skeleton-text sm"></div><div class="skeleton skeleton-score"></div><div class="skeleton skeleton-text"></div><div class="skeleton skeleton-text"></div><div class="skeleton skeleton-text"></div><div class="skeleton skeleton-text"></div></div>' +
+          '<div class="skeleton-card"><div class="skeleton skeleton-text sm"></div><div class="skeleton skeleton-score"></div><div class="skeleton skeleton-text"></div><div class="skeleton skeleton-text"></div><div class="skeleton skeleton-text"></div></div>' +
+          '<div class="skeleton-card"><div class="skeleton skeleton-text sm"></div><div class="skeleton skeleton-score"></div><div class="skeleton skeleton-text"></div><div class="skeleton skeleton-text"></div><div class="skeleton skeleton-text"></div><div class="skeleton skeleton-text"></div></div>' +
+        '</div>' +
+        '<div class="detail-section">' +
+          '<div class="skeleton skeleton-text" style="width:60px;margin-bottom:12px"></div>' +
+          '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">' +
+            '<div class="skeleton skeleton-text"></div><div class="skeleton skeleton-text"></div>' +
+            '<div class="skeleton skeleton-text"></div><div class="skeleton skeleton-text"></div>' +
+            '<div class="skeleton skeleton-text"></div><div class="skeleton skeleton-text"></div>' +
+          '</div>' +
+        '</div>';
+      document.getElementById('modal').classList.add('open');
+
+      try {
+        const res = await fetch('/api/relay?url=' + encodeURIComponent(url));
+        const json = await res.json();
+        if (json.success) renderModal(json.data);
+        else document.getElementById('modal-body').innerHTML = '<div class="empty">Error: ' + json.error + '</div>';
+      } catch (e) {
+        document.getElementById('modal-body').innerHTML = '<div class="empty">Failed to load</div>';
+      }
+    }
+
+    // NIP title lookup
+    const NIP_TITLES = {
+      1: 'Basic protocol', 2: 'Follow list', 4: 'Encrypted DMs', 5: 'DNS-based names',
+      9: 'Event deletion', 10: 'Conventions', 11: 'Relay info', 13: 'PoW',
+      14: 'Subject tag', 15: 'Marketplace', 17: 'Private DMs', 18: 'Reposts',
+      19: 'bech32 identifiers', 21: 'URI scheme', 22: 'Event created_at limits',
+      23: 'Long-form content', 24: 'Extra metadata', 25: 'Reactions', 26: 'Delegated events',
+      27: 'Text note references', 28: 'Public chat', 29: 'Relay-based groups',
+      30: 'Custom emoji', 31: 'User statuses', 32: 'Labeling', 33: 'Parameterized replaceables',
+      34: 'Git patches', 35: 'Torrents', 36: 'Sensitive content', 38: 'User statuses',
+      39: 'External identities', 40: 'Expiration', 42: 'Authentication',
+      44: 'Versioned encryption', 45: 'Event counts', 46: 'Nostr Connect', 47: 'Wallet Connect',
+      48: 'Proxy tags', 50: 'Search', 51: 'Lists', 52: 'Calendar events', 53: 'Live activities',
+      54: 'Wiki', 55: 'Android signer', 56: 'Reporting', 57: 'Lightning zaps', 58: 'Badges',
+      59: 'Gift wrap', 64: 'Chess', 65: 'Relay list', 70: 'Protected events', 71: 'Video events',
+      72: 'Moderated communities', 73: 'Location', 75: 'Zap goals', 78: 'Arbitrary app data',
+      84: 'Highlights', 89: 'Recommended relays', 90: 'Data vending', 92: 'Media attachments',
+      94: 'File metadata', 96: 'HTTP file storage', 98: 'HTTP auth', 99: 'Classified listings'
+    };
+
+    function renderModal(d) {
+      const sc = d.scores;
+      const c = sc.components;
+      const scoreClass = n => n >= 80 ? 'score-excellent' : n >= 60 ? 'score-good' : n >= 40 ? 'score-fair' : 'score-poor';
+      const metricClass = n => n >= 80 ? 'excellent' : n >= 60 ? 'good' : n >= 40 ? 'fair' : 'poor';
+      const formatDate = ts => ts ? new Date(ts * 1000).toLocaleDateString() : '-';
+      const formatBytes = b => b >= 1048576 ? Math.round(b/1048576) + ' MB' : b >= 1024 ? Math.round(b/1024) + ' KB' : b + ' B';
+
+      // Trend display
+      const trendIcon = d.trend?.change > 3 ? '↑' : d.trend?.change < -3 ? '↓' : '↔';
+      const trendLabel = d.trend?.change > 3 ? 'Rising' : d.trend?.change < -3 ? 'Falling' : 'Stable';
+      const trendClass = d.trend?.change > 3 ? 'up' : d.trend?.change < -3 ? 'down' : 'stable';
+      const trendTooltip = d.trend?.change !== undefined
+        ? 'Score change over the last 7 days: ' + (d.trend.change > 0 ? '+' : '') + d.trend.change + ' points'
+        : 'Score change over the last 7 days';
+
+      // Helper to render a sub-metric row with colored dot
+      const metricRow = (label, value, tooltip) => {
+        const cls = metricClass(value);
+        const isProblem = value < 40;
+        return '<div class="score-row' + (isProblem ? ' problem' : '') + '" title="' + tooltip + '">' +
+          '<span class="metric-label"><span class="metric-dot ' + cls + '"></span>' + label + '</span>' +
+          '<span class="metric-value ' + cls + '">' + value + '</span></div>';
+      };
+
+      // Score cards with hero Trust Score and detailed breakdowns
+      // Build SVG area chart from history data
+      const SPARKLINE_DAYS = 30;
+      const svgWidth = 200;
+      const svgHeight = 32;
+      let sparklineHtml = '';
+
+      if (d.history && d.history.length > 0) {
+        const points = d.history;
+        const emptyDays = SPARKLINE_DAYS - points.length;
+        const xStep = svgWidth / (SPARKLINE_DAYS - 1);
+
+        // Build area path (filled region under the line)
+        let areaPath = '';
+        let linePath = '';
+
+        // Start area at bottom-left of data region
+        const startX = emptyDays * xStep;
+        areaPath = 'M ' + startX + ' ' + svgHeight;
+
+        // Draw through all points
+        points.forEach((h, i) => {
+          const score = h.score ?? 50;
+          const x = (emptyDays + i) * xStep;
+          const y = svgHeight - (score / 100) * svgHeight;
+          areaPath += ' L ' + x + ' ' + y;
+          linePath += (i === 0 ? 'M ' : ' L ') + x + ' ' + y;
+        });
+
+        // Close area path back to bottom
+        const endX = (emptyDays + points.length - 1) * xStep;
+        areaPath += ' L ' + endX + ' ' + svgHeight + ' Z';
+
+        // Determine color based on current score
+        const color = sc.overall >= 70 ? 'var(--green)' : sc.overall >= 40 ? 'var(--yellow)' : 'var(--red)';
+
+        sparklineHtml = '<svg class="hero-sparkline-svg" viewBox="0 0 ' + svgWidth + ' ' + svgHeight + '" preserveAspectRatio="none">' +
+          '<defs><linearGradient id="sparkGrad" x1="0%" y1="0%" x2="0%" y2="100%">' +
+          '<stop offset="0%" stop-color="' + color + '" stop-opacity="0.4"/>' +
+          '<stop offset="100%" stop-color="' + color + '" stop-opacity="0.1"/>' +
+          '</linearGradient></defs>' +
+          '<path d="' + areaPath + '" fill="url(#sparkGrad)"/>' +
+          '<path d="' + linePath + '" stroke="' + color + '" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>' +
+          '</svg>';
+      } else {
+        // No history - show flat placeholder line
+        const color = sc.overall >= 70 ? 'var(--green)' : sc.overall >= 40 ? 'var(--yellow)' : 'var(--red)';
+        sparklineHtml = '<svg class="hero-sparkline-svg" viewBox="0 0 ' + svgWidth + ' ' + svgHeight + '" preserveAspectRatio="none">' +
+          '<line x1="0" y1="' + (svgHeight - 2) + '" x2="' + svgWidth + '" y2="' + (svgHeight - 2) + '" stroke="' + color + '" stroke-width="2" stroke-opacity="0.3" stroke-dasharray="4 2"/>' +
+          '</svg>';
+      }
+
+      let html = '<div class="detail-grid">' +
+        // Hero Trust Score card (full width) with inline sparkline
+        '<div class="detail-card-hero ' + scoreClass(sc.overall) + '">' +
+          '<div class="hero-label">Trust Score</div>' +
+          '<div class="hero-row">' +
+            '<div class="hero-score">' + sc.overall + '</div>' +
+            '<div class="hero-sparkline" title="Score history (30 days)">' + sparklineHtml + '</div>' +
+          '</div>' +
+        '</div>' +
+        // Three component score cards below
+        '<div class="detail-card ' + scoreClass(sc.reliability) + '" title="Reliability: Uptime (40%), Recovery (20%), Consistency (20%), Latency (20%)">' +
+          '<div class="detail-card-label">Reliability</div>' +
+          '<div class="detail-card-value">' + sc.reliability + '</div>' +
+          '<div class="detail-card-scores">' +
+            metricRow('Uptime', c.uptimeScore, 'Percentage of probes where relay was reachable (40% weight)') +
+            metricRow('Recovery', c.recoveryScore, 'How quickly relay recovers from outages (20% weight)') +
+            metricRow('Consistency', c.consistencyScore, 'Response time stability - low variance = high score (20% weight)') +
+            metricRow('Latency', c.latencyScore, 'Latency rank vs other relays - removes geographic bias (20% weight)') +
+          '</div>' +
+        '</div>' +
+        '<div class="detail-card ' + scoreClass(sc.quality) + '" title="Quality: Policy documentation, security, and operator accountability">' +
+          '<div class="detail-card-label">Quality</div>' +
+          '<div class="detail-card-value">' + sc.quality + '</div>' +
+          '<div class="detail-card-scores">' +
+            metricRow('Policy', c.policyScore, 'NIP-11 documentation completeness (60% weight)') +
+            metricRow('Security', c.securityScore, 'Connection encryption (wss:// = 100, ws:// = 0) - 25% weight') +
+            metricRow('Operator', c.operatorScore, 'Operator verification and WoT trust (15% weight)') +
+          '</div>' +
+        '</div>' +
+        '<div class="detail-card ' + scoreClass(sc.accessibility) + '" title="Accessibility: Access barriers, limits, jurisdiction, and surveillance risk">' +
+          '<div class="detail-card-label">Accessibility</div>' +
+          '<div class="detail-card-value">' + sc.accessibility + '</div>' +
+          '<div class="detail-card-scores">' +
+            metricRow('Barriers', c.barrierScore, 'Access barriers (auth, payment, PoW) - 40% weight') +
+            metricRow('Limits', c.limitScore, 'How restrictive the relay limits are - 20% weight') +
+            metricRow('Jurisdiction', c.jurisdictionScore, 'Internet freedom rating (Freedom House) - 20% weight') +
+            metricRow('Surveillance', c.surveillanceScore, 'Intelligence alliance membership (Five/Nine/Fourteen Eyes) - 20% weight') +
+          '</div>' +
+        '</div>' +
+      '</div>';
+
+      // Details section - organized into grouped cards
+      html += '<div class="detail-groups">';
+
+      // Group 1: Relay Info
+      html += '<div class="detail-group">';
+      html += '<div class="detail-group-title">Relay Info</div>';
+      html += '<div class="detail-group-grid">';
+      html += '<div class="detail-row" title="Relay classification: general, nip46 (remote signing), or specialized"><span class="detail-key">Type</span><span class="detail-val">' + (d.relayType || '-') + '</span></div>';
+      html += '<div class="detail-row" title="Access policy: open, moderated, curated, or specialized"><span class="detail-key">Policy</span><span class="detail-val">' + (d.policy?.classification || '-') + '</span></div>';
+      if (d.nip11?.software) {
+        const sw = d.nip11.software.split('/').pop()?.split('#')[0] || d.nip11.software;
+        html += '<div class="detail-row" title="Relay software reported via NIP-11"><span class="detail-key">Software</span><span class="detail-val">' + escHtml(sw) + '</span></div>';
+      }
+      const accessLabel = d.accessLevel === 'open' ? '' : d.accessLevel === 'auth_required' ? ' (auth required)' : d.accessLevel === 'payment_required' ? ' (payment required)' : d.accessLevel === 'restricted' ? ' (restricted)' : '';
+      html += '<div class="detail-row" title="Current reachability status from most recent probe"><span class="detail-key">Status</span><span class="detail-val ' + (d.reachable ? 'online' : 'offline') + '">' + (d.reachable ? 'Online' + accessLabel : 'Offline') + '</span></div>';
+      if (d.operator?.pubkey) {
+        const opVal = '<span class="operator-pubkey" data-pubkey="' + d.operator.pubkey + '" title="Click to copy" style="cursor:pointer;border-bottom:1px dashed var(--text-muted)">' +
+          d.operator.pubkey.slice(0, 8) + '...' + d.operator.pubkey.slice(-8) + '</span>' +
+          (d.operator.verificationMethod ? ' <small style="color:var(--text-muted)">(' + d.operator.verificationMethod + ')</small>' : '');
+        html += '<div class="detail-row" title="Relay operator pubkey and verification method"><span class="detail-key">Operator</span><span class="detail-val">' + opVal + '</span></div>';
+      }
+      html += '<div class="detail-row" title="Number of data points used for scoring"><span class="detail-key">Observations</span><span class="detail-val">' + (d.observations?.probeCount || 0) + ' probes, ' + (d.observations?.nip66MetricCount || 0) + ' NIP-66</span></div>';
+      html += '</div></div>';
+
+      // Group 2: Location & Privacy
+      html += '<div class="detail-group">';
+      html += '<div class="detail-group-title">Location & Privacy</div>';
+      html += '<div class="detail-group-grid">';
+      if (d.jurisdiction) {
+        const loc = [d.jurisdiction.city, d.jurisdiction.countryCode].filter(Boolean).join(', ');
+        html += '<div class="detail-row" title="Server location determined via IP geolocation"><span class="detail-key">Location</span><span class="detail-val">' + escHtml(loc || 'Unknown') + '</span></div>';
+        html += '<div class="detail-row" title="Whether the relay is hosted in a datacenter"><span class="detail-key">Hosting</span><span class="detail-val">' + (d.jurisdiction.isHosting ? 'Datacenter' : 'Residential') + '</span></div>';
+        if (d.jurisdiction.eyesAlliance) {
+          const allianceLabels = { 'five_eyes': 'Five Eyes', 'nine_eyes': 'Nine Eyes', 'fourteen_eyes': 'Fourteen Eyes', 'privacy_friendly': 'Privacy-friendly', 'non_aligned': 'Non-aligned', 'unknown': 'Unknown' };
+          const allianceLabel = allianceLabels[d.jurisdiction.eyesAlliance] || d.jurisdiction.eyesAlliance;
+          const isEyes = ['five_eyes', 'nine_eyes', 'fourteen_eyes'].includes(d.jurisdiction.eyesAlliance);
+          html += '<div class="detail-row" title="Intelligence alliance membership"><span class="detail-key">Surveillance</span><span class="detail-val' + (isEyes ? ' warn' : '') + '">' + allianceLabel + '</span></div>';
+        }
+        html += '<div class="detail-row" title="Internet freedom rating from Freedom House"><span class="detail-key">Freedom</span><span class="detail-val">' + (c.jurisdictionScore >= 80 ? 'Free' : c.jurisdictionScore >= 50 ? 'Partly Free' : 'Not Free') + '</span></div>';
+      } else {
+        html += '<div class="detail-row"><span class="detail-key">Location</span><span class="detail-val">Unknown</span></div>';
+      }
+      html += '</div></div>';
+
+      // Group 3: Limits (from NIP-11)
+      const lim = d.nip11?.limitation || {};
+      html += '<div class="detail-group">';
+      html += '<div class="detail-group-title">Limits</div>';
+      html += '<div class="detail-group-grid">';
+      html += '<div class="detail-row" title="Maximum size of incoming events"><span class="detail-key">Max message</span><span class="detail-val">' + (lim.max_message_length ? formatBytes(lim.max_message_length) : '-') + '</span></div>';
+      html += '<div class="detail-row" title="Maximum concurrent subscriptions per connection"><span class="detail-key">Max subs</span><span class="detail-val">' + (lim.max_subscriptions || '-') + '</span></div>';
+      html += '<div class="detail-row" title="Maximum limit value in filters"><span class="detail-key">Max limit</span><span class="detail-val">' + (lim.max_limit || '-') + '</span></div>';
+      html += '<div class="detail-row" title="Maximum filters in a subscription"><span class="detail-key">Max filters</span><span class="detail-val">' + (lim.max_filters || '-') + '</span></div>';
+      if (lim.auth_required) html += '<div class="detail-row" title="NIP-42 authentication required"><span class="detail-key">Auth</span><span class="detail-val warn">Required</span></div>';
+      if (lim.payment_required) html += '<div class="detail-row" title="Payment required to use relay"><span class="detail-key">Payment</span><span class="detail-val warn">Required</span></div>';
+      html += '</div></div>';
+
+      html += '</div>'; // end detail-groups
+
+      // Supported NIPs with tooltips
+      if (d.nip11?.supported_nips && Array.isArray(d.nip11.supported_nips) && d.nip11.supported_nips.length > 0) {
+        html += '<div class="detail-section"><h3>Supported NIPs</h3><div class="nip-tags">';
+        d.nip11.supported_nips.sort((a,b) => a - b).forEach(nip => {
+          const title = NIP_TITLES[nip] || '';
+          html += '<span class="nip-tag" title="' + (title ? 'NIP-' + nip + ': ' + title : 'NIP-' + nip) + '">NIP-' + nip + '</span>';
+        });
+        html += '</div></div>';
+      }
+
+      // Description and Contact
+      if (d.nip11?.description || d.nip11?.contact) {
+        html += '<div class="detail-section"><h3>About</h3>';
+        if (d.nip11.description) {
+          html += '<div class="description-text">' + escHtml(d.nip11.description) + '</div>';
+        }
+        if (d.nip11.contact) {
+          const contact = d.nip11.contact;
+          const isEmail = contact.includes('@');
+          html += '<div class="contact-info">Contact: ';
+          html += isEmail ? '<a href="mailto:' + escHtml(contact) + '">' + escHtml(contact) + '</a>' : escHtml(contact);
+          html += '</div>';
+        }
+        html += '</div>';
+      }
+
+      // Raw NIP-11 (collapsible)
+      if (d.nip11) {
+        html += '<div class="detail-section">';
+        html += '<h3 class="collapsible-header" id="nip11-toggle">';
+        html += '<span class="arrow">▶</span> Raw NIP-11 JSON</h3>';
+        html += '<div class="collapsible-content" id="nip11-content"><pre class="nip11-json">' + escHtml(JSON.stringify(d.nip11, null, 2)) + '</pre></div>';
+        html += '</div>';
+      }
+
+      document.getElementById('modal-body').innerHTML = html;
+
+      // Add event handlers
+      const nip11Toggle = document.getElementById('nip11-toggle');
+      if (nip11Toggle) {
+        nip11Toggle.addEventListener('click', function() {
+          this.classList.toggle('open');
+          document.getElementById('nip11-content').classList.toggle('open');
+        });
+      }
+      const pubkeyEl = document.querySelector('.operator-pubkey');
+      if (pubkeyEl) {
+        pubkeyEl.addEventListener('click', function() {
+          navigator.clipboard.writeText(this.dataset.pubkey);
+          showToast('Copied pubkey');
+        });
+      }
+    }
+
+    function closeModal() {
+      document.getElementById('modal').classList.remove('open');
+      document.getElementById('open-dropdown-content').classList.remove('show');
+    }
+    function openAlgoModal() {
+      document.getElementById('algo-modal').classList.add('open');
+    }
+    function closeAlgoModal() {
+      document.getElementById('algo-modal').classList.remove('open');
+    }
+    document.getElementById('modal').addEventListener('click', e => { if (e.target.id === 'modal') closeModal(); });
+    document.getElementById('algo-modal').addEventListener('click', e => { if (e.target.id === 'algo-modal') closeAlgoModal(); });
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeModal(); closeAlgoModal(); } });
+    document.getElementById('algo-link').addEventListener('click', openAlgoModal);
+    document.getElementById('modal-copy').addEventListener('click', () => { copyUrl(currentRelayUrl); });
+
+    // Dropdown toggle
+    document.getElementById('modal-open-dropdown').addEventListener('click', (e) => {
+      e.stopPropagation();
+      document.getElementById('open-dropdown-content').classList.toggle('show');
+    });
+
+    // Close dropdown when clicking outside
+    document.addEventListener('click', () => {
+      document.getElementById('open-dropdown-content').classList.remove('show');
+    });
+
+    // Open relay button
+    document.getElementById('modal-open-relay').addEventListener('click', () => {
+      const httpUrl = currentRelayUrl.replace('wss://', 'https://').replace('ws://', 'http://');
+      window.open(httpUrl, '_blank');
+      document.getElementById('open-dropdown-content').classList.remove('show');
+    });
+
+    // Sorting
+    document.querySelectorAll('th[data-sort]').forEach(th => {
+      th.addEventListener('click', () => {
+        const col = th.dataset.sort;
+        if (sortCol === col) sortAsc = !sortAsc;
+        else { sortCol = col; sortAsc = false; }
+        document.querySelectorAll('th').forEach(t => t.classList.remove('sorted', 'asc'));
+        th.classList.add('sorted');
+        if (sortAsc) th.classList.add('asc');
+        invalidateCache();
+        renderTable();
+        updateUrlState();
+      });
+    });
+
+    // Filters
+    ['search', 'filter-policy', 'filter-score', 'filter-country', 'filter-secure'].forEach(id => {
+      document.getElementById(id).addEventListener(id === 'search' ? 'input' : 'change', () => {
+        invalidateCache();
+        renderTable();
+        updateUrlState();
+      });
+    });
+
+    // Event delegation for table row clicks
+    document.getElementById('relay-tbody').addEventListener('click', (e) => {
+      const row = e.target.closest('tr.clickable');
+      if (row) viewRelay(row.dataset.url);
+    });
+
+    // Buttons
+    document.getElementById('btn-refresh').addEventListener('click', () => { fetchData(); showToast('Refreshed'); });
+    document.getElementById('btn-export-csv').addEventListener('click', exportCSV);
+    document.getElementById('btn-export-json').addEventListener('click', exportJSON);
+
+    init();
+  </script>
+</body>
+</html>`;

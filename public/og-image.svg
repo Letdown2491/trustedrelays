@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#7C3AED"/>
+      <stop offset="100%" style="stop-color:#8B5CF6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="630" fill="url(#bg)"/>
+
+  <!-- Subtle grid pattern -->
+  <g opacity="0.1" stroke="white" stroke-width="1">
+    <line x1="0" y1="100" x2="1200" y2="100"/>
+    <line x1="0" y1="200" x2="1200" y2="200"/>
+    <line x1="0" y1="300" x2="1200" y2="300"/>
+    <line x1="0" y1="400" x2="1200" y2="400"/>
+    <line x1="0" y1="500" x2="1200" y2="500"/>
+    <line x1="200" y1="0" x2="200" y2="630"/>
+    <line x1="400" y1="0" x2="400" y2="630"/>
+    <line x1="600" y1="0" x2="600" y2="630"/>
+    <line x1="800" y1="0" x2="800" y2="630"/>
+    <line x1="1000" y1="0" x2="1000" y2="630"/>
+  </g>
+
+  <!-- Radio tower icon -->
+  <g transform="translate(600, 180)">
+    <!-- Signal waves -->
+    <path d="M-80 -60a100 100 0 0 1 160 0" stroke="white" stroke-width="6" stroke-linecap="round" fill="none" opacity="0.6"/>
+    <path d="M-55 -40a70 70 0 0 1 110 0" stroke="white" stroke-width="6" stroke-linecap="round" fill="none" opacity="0.8"/>
+    <path d="M-30 -20a40 40 0 0 1 60 0" stroke="white" stroke-width="6" stroke-linecap="round" fill="none"/>
+
+    <!-- Tower -->
+    <path d="M0 0v120M-30 120h60M-22 90h44M-15 40h30" stroke="white" stroke-width="8" stroke-linecap="round" fill="none"/>
+
+    <!-- Top beacon -->
+    <circle cx="0" cy="0" r="12" fill="white"/>
+  </g>
+
+  <!-- Title -->
+  <text x="600" y="380" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="72" font-weight="700" fill="white">Trusted Relays</text>
+
+  <!-- Tagline -->
+  <text x="600" y="440" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="28" fill="white" opacity="0.9">Trust scores for Nostr relays</text>
+
+  <!-- URL -->
+  <text x="600" y="580" text-anchor="middle" font-family="ui-monospace, monospace" font-size="24" fill="white" opacity="0.7">trustedrelays.xyz</text>
+</svg>

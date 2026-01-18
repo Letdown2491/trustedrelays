@@ -1,0 +1,13 @@
+{
+  "provider": {
+    "privateKey": "<your_private_key_goes_here_either_hex_or_nsec_format"
+  },
+  "publishing": {
+    "relays": [
+      "wss://relay.damus.io",
+      "wss://nos.lol",
+      "wss://relay.primal.net",
+      "wss://ditto.pub/relay"
+    ]
+  }
+}

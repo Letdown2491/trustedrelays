@@ -1,0 +1,37 @@
+# Dependencies (reinstalled in container)
+node_modules/
+
+# Data (mounted as volume)
+data/
+
+# Config (mounted as volume)
+config.json
+
+# Environment variables
+.env
+.env.*
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation (not needed in container)
+*.md
+LICENSE
+
+# Tests
+*.test.ts
+coverage/
+
+# Systemd service file
+trustedrelays.service
