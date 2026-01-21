@@ -9,5 +9,8 @@
       "wss://relay.primal.net",
       "wss://ditto.pub/relay"
     ]
-  }
+  },
+  "publishing": {                                                                                                                        
+    "enabled": false                                                                                                                     
+  } 
 }

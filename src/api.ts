@@ -6,7 +6,32 @@ import { computeAccessibilityScore, getEyesAlliance } from './accessibility-scor
 import { classifyPolicy } from './policy-classifier.js';
 import { resolveOperator } from './operator-resolver.js';
 import { DASHBOARD_HTML } from './dashboard-template.js';
-import type { RelayAssertion, OperatorResolution } from './types.js';
+import {
+  computeScoreConfidenceInterval,
+  computeUptimeConfidenceInterval,
+  computeTrendAnalysis,
+  detectAnomaly,
+  computeAllRankings,
+  formatTrend,
+  type RelayScoreData,
+} from './analytics.js';
+import type { RelayAssertion, OperatorResolution, UnsignedEvent, ScoreSnapshot, TrendAnalysis, RelayRanking, ConfidenceInterval, AnomalyResult } from './types.js';
+
+/**
+ * Normalize supported_nips to always be an array of numbers.
+ * Some relays return this as an object with numeric keys instead of an array.
+ */
+function normalizeNipArray(nips: unknown): number[] {
+  if (!nips) return [];
+  if (Array.isArray(nips)) {
+    return nips.filter((n): n is number => typeof n === 'number');
+  }
+  if (typeof nips === 'object') {
+    // Handle object with numeric keys like {0: 1, 1: 4, 2: 9, ...}
+    return Object.values(nips).filter((n): n is number => typeof n === 'number');
+  }
+  return [];
+}
 
 /**
  * API Server configuration
@@ -756,6 +781,62 @@ export function startApiServer(config: ApiConfig): { stop: () => void } {
           }
         }
 
+        // Get relay rankings (leaderboard)
+        if (path === '/api/rankings') {
+          const clientIp = getClientIp(req);
+          const expensiveRateCheck = expensiveRateLimiter.isAllowed(clientIp);
+          if (!expensiveRateCheck.allowed) {
+            return new Response(JSON.stringify({
+              success: false,
+              error: 'Rate limit exceeded for this endpoint. Try again later.',
+              meta: { resetIn: expensiveRateCheck.resetIn }
+            }), {
+              status: 429,
+              headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'X-RateLimit-Limit': '10',
+                'X-RateLimit-Remaining': '0',
+                'X-RateLimit-Reset': expensiveRateCheck.resetIn.toString(),
+                'Retry-After': expensiveRateCheck.resetIn.toString(),
+              },
+            });
+          }
+
+          try {
+            // Check cache first
+            const cacheKey = 'rankings';
+            let rankings = responseCache.get<object>(cacheKey);
+            if (!rankings) {
+              rankings = await getRelayRankings(db);
+              responseCache.set(cacheKey, rankings, CACHE_TTL.RELAY_LIST);
+            }
+            return addRateLimitHeaders(jsonResponse(rankings));
+          } catch (err) {
+            console.error('Failed to get rankings:', err);
+            return addRateLimitHeaders(errorResponse(sanitizeError(err), 500));
+          }
+        }
+
+        // Get detailed analytics for a relay
+        if (path === '/api/analytics') {
+          const validation = validateRelayUrl(url.searchParams.get('url'));
+          if (!validation.valid) {
+            return addRateLimitHeaders(errorResponse(validation.error));
+          }
+
+          try {
+            const analytics = await getRelayAnalytics(db, validation.url);
+            if (!analytics) {
+              return addRateLimitHeaders(errorResponse('Relay not found', 404));
+            }
+            return addRateLimitHeaders(jsonResponse(analytics));
+          } catch (err) {
+            console.error('Failed to get analytics:', err);
+            return addRateLimitHeaders(errorResponse(sanitizeError(err), 500));
+          }
+        }
+
         return addRateLimitHeaders(errorResponse('Not found', 404));
       }
 
@@ -891,8 +972,11 @@ async function getRelayList(db: DataStore): Promise<Array<{
   observations: number;
   confidence: 'low' | 'medium' | 'high';
   trend: 'up' | 'down' | 'stable' | null;
+  trendChange: number | null;
+  trendPeriod: number | null;
   isSecure: boolean;
   lastSeen: number | null;
+  supportedNips: number[];
 }>> {
   // Fetch all data in parallel using bulk queries
   const [
@@ -900,14 +984,12 @@ async function getRelayList(db: DataStore): Promise<Array<{
     nip66Stats,
     jurisdictions,
     operatorResolutions,
-    reportStats,
     scoreTrends,
   ] = await Promise.all([
     db.getAllProbes(30),
     db.getAllNip66Stats(365),
     db.getAllJurisdictions(),
     db.getAllOperatorResolutions(),
-    db.getAllReportStats(90),
     db.getAllScoreTrends(7),
   ]);
 
@@ -921,7 +1003,6 @@ async function getRelayList(db: DataStore): Promise<Array<{
     const nip66 = nip66Stats.get(url);
     const jurisdiction = jurisdictions.get(url);
     const operatorResolution = operatorResolutions.get(url);
-    const reports = reportStats.get(url);
     const trendData = scoreTrends.get(url);
 
     // Compute scores using the SAME algorithm as detail view
@@ -1000,8 +1081,11 @@ async function getRelayList(db: DataStore): Promise<Array<{
       observations: weightedObs,
       confidence,
       trend,
+      trendChange: trendData?.change ?? null,
+      trendPeriod: trendData?.periodDays ?? null,
       isSecure,
       lastSeen: latestProbe.timestamp ?? null,
+      supportedNips: normalizeNipArray(latestProbe.nip11?.supported_nips),
     });
   }
 
@@ -1009,74 +1093,6 @@ async function getRelayList(db: DataStore): Promise<Array<{
   results.sort((a, b) => (b.score ?? -1) - (a.score ?? -1));
 
   return results;
-}
-
-/**
- * Compute reliability score from pre-aggregated stats
- * Uses the same weighted formula as computeCombinedReliabilityScore:
- * - 40% uptime
- * - 20% recovery (default 80 when unknown from stats)
- * - 20% consistency (default 70 when unknown from stats)
- * - 20% latency percentile (computed from avgConnectTime)
- */
-function computeReliabilityFromStats(
-  isReachable: boolean,
-  uptimePercent: number,
-  avgConnectTime: number | null,
-  avgReadTime: number | null,
-  nip66Stats?: { avgRttOpen?: number | null; avgRttRead?: number | null } | null
-): number {
-  if (!isReachable) {
-    return Math.min(50, uptimePercent);
-  }
-
-  // Uptime score (40% weight)
-  const uptimeScore = uptimePercent;
-
-  // Recovery score (20% weight) - can't calculate from stats
-  // High uptime implies good recovery (or no outages to recover from)
-  // Scale: 100% uptime → 100 recovery, 90% → 90, etc.
-  const recoveryScore = Math.max(50, uptimePercent);
-
-  // Consistency score (20% weight) - can't calculate from stats
-  // Estimate based on uptime - stable relays tend to have consistent latency
-  // Slightly lower than recovery since latency variance is common
-  const consistencyScore = Math.max(50, Math.round(uptimePercent * 0.95));
-
-  // Latency score (20% weight) - tiered scoring for real-world usability
-  const connectTime = avgConnectTime ?? nip66Stats?.avgRttOpen ?? null;
-  let latencyScore: number;
-  if (connectTime === null) {
-    latencyScore = 0;
-  } else if (connectTime <= 50) {
-    latencyScore = 100;
-  } else if (connectTime <= 100) {
-    latencyScore = 95;
-  } else if (connectTime <= 150) {
-    latencyScore = 90;
-  } else if (connectTime <= 200) {
-    latencyScore = 85;
-  } else if (connectTime <= 300) {
-    latencyScore = 75;
-  } else if (connectTime <= 500) {
-    latencyScore = 60;
-  } else if (connectTime <= 750) {
-    latencyScore = 40;
-  } else if (connectTime <= 1000) {
-    latencyScore = 20;
-  } else {
-    latencyScore = 0;
-  }
-
-  // Apply weights: 40% uptime + 20% recovery + 20% consistency + 20% latency
-  const overall = Math.round(
-    uptimeScore * 0.40 +
-    recoveryScore * 0.20 +
-    consistencyScore * 0.20 +
-    latencyScore * 0.20
-  );
-
-  return Math.max(0, Math.min(100, overall));
 }
 
 /**
@@ -1100,11 +1116,15 @@ async function getRelayDetails(db: DataStore, url: string): Promise<object | nul
   const latestProbe = probes[probes.length - 1];
 
   // Get operator resolution from cache, or resolve on-demand if not cached
+  // WoT scores are refreshed daily by the service, so we just use cached data
   let operatorResolution: OperatorResolution | null = operatorResolutionCached;
   if (!operatorResolution && latestProbe.nip11?.pubkey) {
-    // Resolve operator on-demand and cache it
+    // Resolve operator on-demand with WoT lookup and cache it
     try {
-      operatorResolution = await resolveOperator(url, latestProbe.nip11);
+      operatorResolution = await resolveOperator(url, latestProbe.nip11, {
+        fetchTrustScore: true,
+        nip85Timeout: 10000,
+      });
       if (operatorResolution.operatorPubkey) {
         await db.storeOperatorResolution(operatorResolution);
       }
@@ -1112,6 +1132,7 @@ async function getRelayDetails(db: DataStore, url: string): Promise<object | nul
       // Resolution failed, continue with null
     }
   }
+  // Note: WoT scores for cached operators are refreshed daily by the service
 
   const score = computeCombinedReliabilityScore(probes, nip66Stats);
   const qualityScore = computeQualityScore(latestProbe.nip11, url, operatorResolution);
@@ -1176,6 +1197,8 @@ async function getRelayDetails(db: DataStore, url: string): Promise<object | nul
       verificationMethod: operatorResolution.verificationMethod,
       confidence: operatorResolution.confidence,
       trustScore: operatorResolution.trustScore,
+      trustConfidence: operatorResolution.trustConfidence,
+      trustProviderCount: operatorResolution.trustProviderCount,
     } : null,
     jurisdiction: jurisdiction ? {
       countryCode: jurisdiction.countryCode,
@@ -1202,7 +1225,7 @@ async function getRelayDetails(db: DataStore, url: string): Promise<object | nul
  * Get assertion event for a relay
  * Uses parallel queries for performance
  */
-async function getRelayAssertion(db: DataStore, url: string): Promise<object | null> {
+async function getRelayAssertion(db: DataStore, url: string): Promise<UnsignedEvent | null> {
   // Fetch all data in parallel
   const [probes, nip66Stats, reports, jurisdiction, operatorResolutionCached] = await Promise.all([
     db.getProbes(url, 30),
@@ -1233,7 +1256,7 @@ async function getRelayAssertion(db: DataStore, url: string): Promise<object | n
   const qualityScore = computeQualityScore(latestProbe.nip11, url, operatorResolution);
   const accessibilityScore = computeAccessibilityScore(latestProbe.nip11, jurisdiction?.countryCode);
 
-  const assertion = buildAssertion(
+  const assertion: RelayAssertion = buildAssertion(
     url,
     probes,
     score,
@@ -1244,4 +1267,214 @@ async function getRelayAssertion(db: DataStore, url: string): Promise<object | n
   );
 
   return assertionToEvent(assertion);
+}
+
+/**
+ * Get relay rankings (leaderboard)
+ * Computes rankings for all relays with efficient bulk queries
+ */
+async function getRelayRankings(db: DataStore): Promise<{
+  rankings: Array<{
+    rank: number;
+    url: string;
+    name: string | null;
+    score: number;
+    reliability: number;
+    quality: number;
+    accessibility: number;
+    percentile: number;
+    reliabilityRank: number;
+    qualityRank: number;
+    accessibilityRank: number;
+    trend: 'improving' | 'stable' | 'degrading' | null;
+    rankChange: number | null;
+  }>;
+  totalRelays: number;
+  generatedAt: number;
+}> {
+  // Fetch all necessary data in parallel
+  const [relayScores, previousRankings, trendData, latestProbes] = await Promise.all([
+    db.getAllRelayScoresForRanking(),
+    db.getPreviousRankings(7),
+    db.getAllTrendData(30),
+    db.getAllLatestProbes(),
+  ]);
+
+  // Build relay score data for ranking calculation
+  const scoreData: RelayScoreData[] = relayScores.map((r) => ({
+    url: r.url,
+    score: r.score,
+    reliability: r.reliability,
+    quality: r.quality,
+    accessibility: r.accessibility,
+  }));
+
+  // Compute rankings
+  const rankingsMap = computeAllRankings(scoreData, previousRankings);
+
+  // Build response
+  const rankings = relayScores
+    .filter((r) => r.score !== null)
+    .map((r) => {
+      const ranking = rankingsMap.get(r.url);
+      const trend = trendData.get(r.url);
+      const probe = latestProbes.get(r.url);
+
+      // Determine trend direction
+      let trendDirection: 'improving' | 'stable' | 'degrading' | null = null;
+      if (trend && trend.dataPoints >= 2) {
+        const change = (trend.lastScore ?? 0) - (trend.firstScore ?? 0);
+        if (change > 3) trendDirection = 'improving';
+        else if (change < -3) trendDirection = 'degrading';
+        else trendDirection = 'stable';
+      }
+
+      return {
+        rank: ranking?.rank ?? 0,
+        url: r.url,
+        name: probe?.nip11?.name ?? null,
+        score: r.score!,
+        reliability: r.reliability ?? 0,
+        quality: r.quality ?? 0,
+        accessibility: r.accessibility ?? 0,
+        percentile: ranking?.percentile ?? 0,
+        reliabilityRank: ranking?.reliabilityRank ?? 0,
+        qualityRank: ranking?.qualityRank ?? 0,
+        accessibilityRank: ranking?.accessibilityRank ?? 0,
+        trend: trendDirection,
+        rankChange: ranking?.rankChange ?? null,
+      };
+    })
+    .sort((a, b) => a.rank - b.rank);
+
+  return {
+    rankings,
+    totalRelays: rankings.length,
+    generatedAt: Math.floor(Date.now() / 1000),
+  };
+}
+
+/**
+ * Get detailed analytics for a single relay
+ * Includes confidence intervals, trend analysis, and ranking
+ */
+async function getRelayAnalytics(db: DataStore, url: string): Promise<{
+  url: string;
+  score: {
+    value: number;
+    confidence: ConfidenceInterval;
+  };
+  reliability: {
+    value: number;
+    confidence: ConfidenceInterval;
+  };
+  uptime: {
+    value: number;
+    confidence: ConfidenceInterval;
+  };
+  trend: TrendAnalysis;
+  anomaly: AnomalyResult;
+  ranking: RelayRanking | null;
+  history: {
+    scores: Array<{ timestamp: number; score: number | null }>;
+    rolling7d: number | null;
+    rolling30d: number | null;
+    rolling90d: number | null;
+  };
+} | null> {
+  // Fetch all data in parallel
+  const [
+    scoreHistory,
+    uptimeStats,
+    relayScores,
+    previousRankings,
+    rollingAverages,
+  ] = await Promise.all([
+    db.getFullScoreHistory(url, 90),
+    db.getUptimeStats(url, 30),
+    db.getAllRelayScoresForRanking(),
+    db.getPreviousRankings(7),
+    db.getAllRollingAverages(),
+  ]);
+
+  if (scoreHistory.length === 0) return null;
+
+  // Get the latest score
+  const latestScore = scoreHistory[scoreHistory.length - 1];
+
+  // Convert to ScoreSnapshot format for analytics functions
+  const snapshots: ScoreSnapshot[] = scoreHistory.map((h) => ({
+    relayUrl: url,
+    timestamp: h.timestamp,
+    score: h.score,
+    reliability: h.reliability,
+    quality: h.quality,
+    accessibility: h.accessibility,
+    observations: h.observations,
+    confidence: h.confidence as 'low' | 'medium' | 'high',
+  }));
+
+  // Compute confidence intervals
+  const scoreConfidence = computeScoreConfidenceInterval(
+    latestScore.score ?? 0,
+    latestScore.observations
+  );
+
+  const reliabilityConfidence = computeScoreConfidenceInterval(
+    latestScore.reliability ?? 0,
+    latestScore.observations
+  );
+
+  const uptimeConfidence = computeUptimeConfidenceInterval(
+    uptimeStats.reachableProbes,
+    uptimeStats.totalProbes
+  );
+
+  // Compute trend analysis
+  const trend = computeTrendAnalysis(snapshots, 30);
+
+  // Detect anomalies
+  const anomaly = detectAnomaly(snapshots, 30);
+
+  // Compute ranking
+  const scoreData: RelayScoreData[] = relayScores.map((r) => ({
+    url: r.url,
+    score: r.score,
+    reliability: r.reliability,
+    quality: r.quality,
+    accessibility: r.accessibility,
+  }));
+  const rankingsMap = computeAllRankings(scoreData, previousRankings);
+  const ranking = rankingsMap.get(url) ?? null;
+
+  // Get rolling averages
+  const rolling = rollingAverages.get(url);
+
+  return {
+    url,
+    score: {
+      value: latestScore.score ?? 0,
+      confidence: scoreConfidence,
+    },
+    reliability: {
+      value: latestScore.reliability ?? 0,
+      confidence: reliabilityConfidence,
+    },
+    uptime: {
+      value: uptimeStats.uptimePercent,
+      confidence: uptimeConfidence,
+    },
+    trend,
+    anomaly,
+    ranking,
+    history: {
+      scores: scoreHistory.map((h) => ({
+        timestamp: h.timestamp,
+        score: h.score,
+      })),
+      rolling7d: rolling?.rolling7d ?? null,
+      rolling30d: rolling?.rolling30d ?? null,
+      rolling90d: rolling?.rolling90d ?? null,
+    },
+  };
 }

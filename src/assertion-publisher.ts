@@ -3,7 +3,7 @@ import { finalizeEvent, getPublicKey, type Event, nip19 } from 'nostr-tools';
 import type { RelayAssertion, UnsignedEvent } from './types.js';
 import type { DataStore } from './database.js';
 import { assertionToEvent } from './assertion.js';
-import type { RelayPool, PoolPublishResult } from './relay-pool.js';
+import type { RelayPool } from './relay-pool.js';
 
 /**
  * Validate and normalize private key - accepts hex or nsec format, returns validated hex
@@ -89,7 +89,7 @@ export function hasMaterialChange(
     accessibility?: number;
     confidence: string;
   } | null,
-  threshold: number = 5
+  threshold: number = 3
 ): { changed: boolean; reason?: string } {
   // First time - always publish
   if (!previous) {
@@ -243,7 +243,7 @@ export class AssertionPublisher {
     this.config = {
       ...config,
       privateKey: normalizedKey,
-      materialChangeThreshold: config.materialChangeThreshold ?? 5,
+      materialChangeThreshold: config.materialChangeThreshold ?? 3,
     };
 
     // Derive public key from private key

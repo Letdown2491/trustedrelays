@@ -32,6 +32,8 @@ export interface ServiceConfig {
 
   // Publishing configuration
   publishing: {
+    // Enable/disable publishing (set to false for probe-only mode)
+    enabled: boolean;
     // Relays to publish assertions to
     relays: string[];
     // Minimum score change to trigger republish
@@ -122,13 +124,14 @@ export const DEFAULT_CONFIG: ServiceConfig = {
   },
 
   publishing: {
+    enabled: true,            // Set to false for probe-only mode
     relays: [
       'wss://relay.damus.io',
       'wss://nos.lol',
       'wss://relay.primal.net',
       'wss://ditto.pub/relay',
     ],
-    materialChangeThreshold: 5,
+    materialChangeThreshold: 3,
     minObservations: 10,
     minPublishDelayMs: 2000,  // 2 seconds between events
     useConnectionPool: true,  // Use persistent connections
@@ -240,12 +243,14 @@ export function generateSampleConfig(configPath: string): void {
 export function validateConfig(config: ServiceConfig): { valid: boolean; errors: string[] } {
   const errors: string[] = [];
 
-  // Check for private key (either in config or environment)
-  const privateKey = config.provider.privateKey || process.env.NOSTR_PRIVATE_KEY;
-  if (!privateKey) {
-    errors.push('No private key configured (set provider.privateKey or NOSTR_PRIVATE_KEY env)');
-  } else if (!isValidPrivateKey(privateKey)) {
-    errors.push('Private key must be 64-char hex or nsec format');
+  // Check for private key only if publishing is enabled
+  if (config.publishing.enabled) {
+    const privateKey = config.provider.privateKey || process.env.NOSTR_PRIVATE_KEY;
+    if (!privateKey) {
+      errors.push('No private key configured (set provider.privateKey or NOSTR_PRIVATE_KEY env)');
+    } else if (!isValidPrivateKey(privateKey)) {
+      errors.push('Private key must be 64-char hex or nsec format');
+    }
   }
 
   // Check targets

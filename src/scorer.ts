@@ -205,7 +205,6 @@ export function computeRecoveryScore(probes: ProbeResult[]): number {
 
   for (let i = 0; i < sortedProbes.length; i++) {
     const probe = sortedProbes[i];
-    const prevProbe = i > 0 ? sortedProbes[i - 1] : null;
 
     if (!probe.reachable && outageStart === null) {
       // Start of outage
@@ -299,17 +298,20 @@ export function computeLatencyPercentileScore(
  *
  * Reliability = 40% uptime + 20% recovery + 20% consistency + 20% latency percentile
  *
+ * For latency, we prefer the percentile-based score from NIP-66 monitors when available.
+ * This removes geographic bias by ranking relays relative to other relays from each
+ * monitor's perspective, rather than using raw latency values.
+ *
  * @param probes - Direct probe results
- * @param nip66Stats - Aggregated NIP-66 monitor data
- * @param allRelayLatencies - All relay latencies for percentile calculation (optional)
+ * @param nip66Stats - Aggregated NIP-66 monitor data (includes percentile-based latencyScore)
  */
 export function computeCombinedReliabilityScore(
   probes: ProbeResult[],
-  nip66Stats: Nip66Stats | null,
-  allRelayLatencies?: number[]
+  nip66Stats: Nip66Stats | null
 ): ReliabilityScore {
   const hasProbes = probes.length > 0;
   const hasNip66 = nip66Stats !== null && nip66Stats.metricCount > 0;
+  const hasPercentileScore = nip66Stats?.latencyScore !== null && nip66Stats?.latencyScore !== undefined;
 
   // Calculate uptime from probes
   const uptimeScore = hasProbes ? computeUptimeScore(probes) : (hasNip66 ? 95 : 50);
@@ -321,26 +323,38 @@ export function computeCombinedReliabilityScore(
   // Calculate consistency from probes
   const consistencyScore = hasProbes ? computeConsistencyScore(probes) : 70;
 
-  // Calculate average latency (combine probe and NIP-66 data)
+  // Calculate average latency for display (raw values)
   let avgLatencyMs: number | undefined;
   const probeLatency = hasProbes ? computeAverageLatency(probes) : undefined;
   const nip66Latency = hasNip66 && nip66Stats!.avgRttOpen !== null ? nip66Stats!.avgRttOpen : undefined;
 
   if (probeLatency !== undefined && nip66Latency !== undefined) {
-    // Average both sources
     avgLatencyMs = (probeLatency * 0.3 + nip66Latency * 0.7);
   } else {
     avgLatencyMs = probeLatency ?? nip66Latency;
   }
 
-  // Calculate latency score using tiered approach (reflects real-world usability)
-  const latencyScore = scoreLatency(avgLatencyMs);
+  // Calculate latency score:
+  // - Prefer percentile-based score from NIP-66 (removes geographic bias)
+  // - Fall back to raw latency scoring if no percentile available
+  let latencyScore: number;
+  if (hasPercentileScore) {
+    // Use percentile-based score directly (already 0-100)
+    latencyScore = nip66Stats!.latencyScore!;
+  } else {
+    // Fall back to tiered scoring based on raw latency
+    latencyScore = scoreLatency(avgLatencyMs);
+  }
 
   // Calculate raw latency scores for display
-  const connectScore = scoreLatency(probeLatency ?? nip66Latency);
-  const readScore = hasProbes
-    ? scoreLatency(probes.filter(p => p.reachable && p.readTime).map(p => p.readTime!).reduce((a, b) => a + b, 0) / probes.filter(p => p.readTime).length || undefined)
-    : scoreLatency(nip66Stats?.avgRttRead ?? undefined);
+  const connectScore = hasPercentileScore
+    ? (nip66Stats!.connectPercentile ?? scoreLatency(probeLatency ?? nip66Latency))
+    : scoreLatency(probeLatency ?? nip66Latency);
+  const readScore = hasPercentileScore
+    ? (nip66Stats!.readPercentile ?? scoreLatency(nip66Stats?.avgRttRead ?? undefined))
+    : (hasProbes
+      ? scoreLatency(probes.filter(p => p.reachable && p.readTime).map(p => p.readTime!).reduce((a, b) => a + b, 0) / probes.filter(p => p.readTime).length || undefined)
+      : scoreLatency(nip66Stats?.avgRttRead ?? undefined));
 
   // Compute overall reliability score using configured weights
   const overall = clampScore(

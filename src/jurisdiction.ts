@@ -61,14 +61,6 @@ export interface JurisdictionInfo {
 }
 
 /**
- * Known privacy/anonymity networks
- */
-const PRIVACY_NETWORKS = [
-  '.onion',
-  '.i2p',
-];
-
-/**
  * Extract hostname from relay URL
  */
 function extractHostname(relayUrl: string): string {

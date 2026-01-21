@@ -29,6 +29,13 @@ export interface NIP11Info {
     subscription?: { amount: number; unit: string; period?: number }[];
     publication?: { kinds: number[]; amount: number; unit: string }[];
   };
+  retention?: Array<{
+    kinds?: number[];
+    time?: number | null;  // seconds, null = forever
+    count?: number;
+  }>;
+  relay_countries?: string[];  // ISO 3166-1 alpha-2 country codes
+  payments_url?: string;
 }
 
 /**
@@ -112,9 +119,15 @@ export interface ReliabilityScore {
 export interface Nip66Stats {
   metricCount: number;
   monitorCount: number;
+  // Raw averages (kept for debugging/transparency)
   avgRttOpen: number | null;
   avgRttRead: number | null;
   avgRttWrite: number | null;
+  // Percentile-based scores (0-100, removes geographic bias)
+  latencyScore: number | null;       // Combined: 0.3 * connect + 0.7 * read
+  connectPercentile: number | null;  // % of relays slower than this one (per monitor, then averaged)
+  readPercentile: number | null;     // % of relays slower than this one (per monitor, then averaged)
+  qualifyingMonitorCount: number;    // Monitors with ≥20 relays tracked
   firstSeen: number | null;
   lastSeen: number | null;
 }
@@ -339,3 +352,115 @@ export interface AccessibilityScore {
  * Intelligence alliance classification for surveillance scoring
  */
 export type EyesAlliance = 'five_eyes' | 'nine_eyes' | 'fourteen_eyes' | 'non_aligned' | 'privacy_friendly' | 'unknown';
+
+// =============================================================================
+// Advanced Analytics Types
+// =============================================================================
+
+/**
+ * Statistical confidence interval
+ * Used for expressing uncertainty in scores
+ */
+export interface ConfidenceInterval {
+  value: number;       // Point estimate (0-100)
+  lower: number;       // Lower bound (0-100)
+  upper: number;       // Upper bound (0-100)
+  margin: number;      // Margin of error (value - lower)
+  sampleSize: number;  // Number of observations
+  level: 'low' | 'medium' | 'high';  // Qualitative confidence level
+}
+
+/**
+ * Score with statistical confidence bounds
+ */
+export interface ConfidentScore {
+  score: number;                    // Point estimate
+  confidence: ConfidenceInterval;   // Statistical confidence
+}
+
+/**
+ * Trend direction classification
+ */
+export type TrendDirection = 'improving' | 'stable' | 'degrading' | 'volatile' | 'insufficient_data';
+
+/**
+ * Time-series trend analysis
+ */
+export interface TrendAnalysis {
+  direction: TrendDirection;
+  magnitude: number;           // Absolute change over period
+  percentChange: number;       // Relative change as percentage
+  periodDays: number;          // Analysis period
+  dataPoints: number;          // Number of observations in period
+  // Rolling averages
+  rolling7d: number | null;    // 7-day rolling average
+  rolling30d: number | null;   // 30-day rolling average
+  rolling90d: number | null;   // 90-day rolling average
+  // Volatility (standard deviation of daily scores)
+  volatility: number | null;
+  // Linear regression slope (points per day)
+  slope: number | null;
+  // Is trend statistically significant?
+  significant: boolean;
+}
+
+/**
+ * Anomaly detection result
+ */
+export interface AnomalyResult {
+  detected: boolean;
+  type: 'spike' | 'drop' | 'outage' | 'recovery' | null;
+  magnitude: number | null;    // How many standard deviations from mean
+  timestamp: number | null;    // When anomaly was detected
+  description: string | null;
+}
+
+/**
+ * Relay ranking within the network
+ */
+export interface RelayRanking {
+  // Overall ranking
+  rank: number;                // Absolute rank (1 = best)
+  totalRelays: number;         // Total relays in ranking
+  percentile: number;          // Percentile (0-100, higher = better)
+  // Category rankings
+  reliabilityRank: number;
+  reliabilityPercentile: number;
+  qualityRank: number;
+  qualityPercentile: number;
+  accessibilityRank: number;
+  accessibilityPercentile: number;
+  // Peer comparison
+  betterThanPercent: number;   // "Better than X% of relays"
+  // Rank change
+  previousRank: number | null; // Rank in previous period
+  rankChange: number | null;   // Positive = improved, negative = dropped
+}
+
+/**
+ * Extended relay assertion with analytics
+ */
+export interface RelayAssertionWithAnalytics extends RelayAssertion {
+  // Statistical confidence
+  scoreConfidence?: ConfidenceInterval;
+  reliabilityConfidence?: ConfidenceInterval;
+  // Trend analysis
+  trend?: TrendAnalysis;
+  anomaly?: AnomalyResult;
+  // Network ranking
+  ranking?: RelayRanking;
+}
+
+/**
+ * Snapshot of relay scores for historical tracking
+ */
+export interface ScoreSnapshot {
+  relayUrl: string;
+  timestamp: number;
+  score: number | null;
+  reliability: number | null;
+  quality: number | null;
+  accessibility: number | null;
+  observations: number;
+  confidence: 'low' | 'medium' | 'high';
+}

@@ -1,7 +1,7 @@
 # Scoring Algorithm Specification
 
-**Algorithm Version:** v0.1.2
-**Last Updated:** 2026-01-17
+**Algorithm Version:** v0.2.0
+**Last Updated:** 2026-01-18
 
 This document describes the scoring methodology used to compute relay trust assertions.
 
@@ -122,7 +122,53 @@ Note: Only uses `connectTime` (not `readTime`) because they measure different op
 
 ### Latency Score (20%)
 
-Uses tiered scoring based on absolute latency to reflect real-world usability. Users can't perceive differences under ~100ms, and only >500ms starts feeling noticeably slow.
+Uses **percentile-based scoring** from NIP-66 monitor data to remove geographic bias. A well-run relay in Tokyo should score similarly to a well-run relay in Frankfurt, regardless of where monitors are located.
+
+#### The Problem with Raw Latency
+
+If Monitor A (Frankfurt) measures:
+- `relay.tokyo.jp` → 250ms
+- `relay.frankfurt.de` → 15ms
+
+Using raw latency would unfairly penalize the Tokyo relay, even if it's perfectly well-run. The high latency is due to geography, not relay quality.
+
+#### Percentile-Based Solution
+
+For each NIP-66 monitor:
+1. Get the **latest measurement** for each relay (not historical averages)
+2. Rank the target relay against all other relays that monitor tracks
+3. Calculate percentile: "This relay is faster than X% of relays from this monitor's perspective"
+
+Then average percentiles across all qualifying monitors.
+
+#### Qualifying Monitors
+
+Only monitors tracking **≥20 relays** contribute to percentile scores. This ensures the percentile ranking is meaningful (not just comparing against 2-3 relays).
+
+#### Connect vs Read Weighting
+
+Percentiles are calculated separately for connect time (`rtt_open`) and read time (`rtt_read`), then combined:
+
+```
+latency_score = connect_percentile * 0.30 + read_percentile * 0.70
+```
+
+**Rationale:** Users connect once but read many times. Read performance matters more for ongoing experience.
+
+#### Example
+
+| Monitor | Relay A Percentile | Relay B Percentile |
+|---------|-------------------|-------------------|
+| Frankfurt | 40th (slow from here) | 95th (fast from here) |
+| Tokyo | 95th (fast from here) | 40th (slow from here) |
+| New York | 60th | 60th |
+| **Average** | **65** | **65** |
+
+Both relays score equally despite being in different locations—because both are equally well-run relative to their peers.
+
+#### Fallback: Tiered Scoring
+
+When percentile data is unavailable (no qualifying monitors), falls back to tiered scoring based on absolute latency:
 
 | Latency | Score | Rating |
 |---------|-------|--------|
@@ -136,7 +182,7 @@ Uses tiered scoring based on absolute latency to reflect real-world usability. U
 | ≤1000ms | 20 | Very slow |
 | >1000ms | 0 | Unusable |
 
-**Why tiered instead of linear:** A linear scale (e.g., 0ms=100, 1000ms=0) would unfairly penalize relays with 150-300ms latency, which is perfectly usable for most applications. The tiered approach reflects actual user experience.
+This tiered approach (rather than linear) reflects actual user experience—users can't perceive differences under ~100ms.
 
 ### Example Calculations
 
@@ -507,13 +553,17 @@ weightedObservations = probes + nip66Contribution
 Assertions are only republished when scores change materially:
 
 ```
-threshold = 5 points
+threshold = 3 points (default)
 
 republish if:
   - First assertion for this relay
   - |current_score - previous_score| >= threshold
+  - |component_score - previous_component| >= threshold (reliability, quality, accessibility)
   - confidence level changed
+  - status changed
 ```
+
+The threshold of 3 balances responsiveness (catching degradation within ~2 hours) against filtering measurement noise.
 
 ---
 

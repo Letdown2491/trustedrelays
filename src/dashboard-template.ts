@@ -37,7 +37,9 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       <h1>Trusted Relays</h1>
     </div>
     <div class="header-right">
-      <span class="freshness-dot" id="freshness-dot" title="Data freshness"></span>
+      <button class="freshness-btn" id="freshness-btn" title="Auto-refresh enabled - click to pause">
+        <span class="freshness-dot" id="freshness-dot"></span>
+      </button>
       <button class="btn btn-icon" id="algo-link" title="How trust scores are calculated">?</button>
       <a href="https://github.com/Letdown2491/trustedrelays" target="_blank" rel="noopener" class="btn btn-icon" title="View on GitHub">
         <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
@@ -47,41 +49,85 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
 
   <div class="toolbar">
     <input type="text" class="search-input" id="search" placeholder="Search relays..." title="Search by relay name or URL">
-    <div class="filter-group" title="Filter by access policy">
-      <span class="filter-label">Policy</span>
-      <select id="filter-policy">
-        <option value="">All</option>
-        <option value="open">Open</option>
-        <option value="moderated">Moderated</option>
-        <option value="curated">Curated</option>
-        <option value="specialized">Specialized</option>
-      </select>
-    </div>
-    <div class="filter-group" title="Filter by overall trust score">
-      <span class="filter-label">Score</span>
-      <select id="filter-score">
-        <option value="">All</option>
-        <option value="high">70+ Good</option>
-        <option value="medium">40-69 Fair</option>
-        <option value="low">&lt;40 Poor</option>
-      </select>
-    </div>
-    <div class="filter-group hide-mobile" title="Filter by server location">
-      <span class="filter-label">Country</span>
-      <select id="filter-country"><option value="">All</option></select>
-    </div>
-    <div class="filter-group hide-mobile" title="Filter by connection security">
-      <span class="filter-label">Security</span>
-      <select id="filter-secure">
-        <option value="">All</option>
-        <option value="secure">Encrypted (wss)</option>
-        <option value="insecure">Unencrypted (ws)</option>
-      </select>
-    </div>
     <div class="toolbar-right">
-      <button class="btn" id="btn-refresh" title="Refresh data from server">↻</button>
-      <button class="btn" id="btn-export-csv" title="Download filtered results as CSV">CSV</button>
-      <button class="btn" id="btn-export-json" title="Download filtered results as JSON">JSON</button>
+      <button class="btn btn-filters" id="btn-filters" title="Open filters">
+        <span class="filters-icon">⚙</span>
+        <span class="filters-label">Filters</span>
+        <span class="filters-count" id="filters-count"></span>
+      </button>
+      <div class="dropdown" id="export-dropdown">
+        <button class="btn btn-export" id="btn-export" title="Export data">
+          Export <span class="dropdown-arrow">▼</span>
+        </button>
+        <div class="dropdown-menu" id="export-menu">
+          <button class="dropdown-item" id="btn-export-csv">Download CSV</button>
+          <button class="dropdown-item" id="btn-export-json">Download JSON</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="active-filters" id="active-filters"></div>
+
+  <!-- Filter Drawer -->
+  <div class="filter-drawer-overlay" id="filter-drawer-overlay"></div>
+  <div class="filter-drawer" id="filter-drawer">
+    <div class="filter-drawer-header">
+      <h3>Filters</h3>
+      <button class="btn btn-icon filter-drawer-close" id="filter-drawer-close">×</button>
+    </div>
+    <div class="filter-drawer-content">
+      <div class="filter-section">
+        <div class="filter-section-title">Access</div>
+        <div class="filter-group-drawer">
+          <label class="filter-label-drawer">Policy</label>
+          <select id="filter-policy">
+            <option value="">All</option>
+            <option value="open">Open</option>
+            <option value="moderated">Moderated</option>
+            <option value="curated">Curated</option>
+            <option value="specialized">Specialized</option>
+          </select>
+        </div>
+        <div class="filter-group-drawer">
+          <label class="filter-label-drawer">Security</label>
+          <select id="filter-secure">
+            <option value="">All</option>
+            <option value="secure">Encrypted (wss)</option>
+            <option value="insecure">Unencrypted (ws)</option>
+          </select>
+        </div>
+      </div>
+      <div class="filter-section">
+        <div class="filter-section-title">Location</div>
+        <div class="filter-group-drawer">
+          <label class="filter-label-drawer">Country</label>
+          <select id="filter-country"><option value="">All</option></select>
+        </div>
+      </div>
+      <div class="filter-section">
+        <div class="filter-section-title">Technical</div>
+        <div class="filter-group-drawer">
+          <label class="filter-label-drawer">Supported NIPs</label>
+          <div class="nip-filter-container" id="nip-filter-container">
+            <button class="btn btn-nip-select" id="btn-nip-select">Select NIPs...</button>
+            <div class="nip-dropdown" id="nip-dropdown"></div>
+          </div>
+        </div>
+        <div class="filter-group-drawer">
+          <label class="filter-label-drawer">Score</label>
+          <select id="filter-score">
+            <option value="">All</option>
+            <option value="high">70+ Good</option>
+            <option value="medium">40-69 Fair</option>
+            <option value="low">&lt;40 Poor</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div class="filter-drawer-footer">
+      <button class="btn btn-clear" id="btn-clear-filters">Clear all</button>
+      <button class="btn btn-primary" id="btn-apply-filters">Show <span id="filter-result-count">0</span> relays</button>
     </div>
   </div>
 
@@ -93,34 +139,25 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
           <th data-sort="policy" class="col-policy hide-mobile" title="Access policy: Open, Moderated, Curated, or Specialized">Policy</th>
           <th data-sort="countryCode" class="col-loc center hide-mobile" title="Server location (country code)" id="th-location">Location</th>
           <th data-sort="confidence" class="col-conf center hide-tablet" title="Data confidence based on observation count">Confidence</th>
-          <th data-sort="reliability" class="col-score right hide-tablet" title="Reliability score: Connection stability and latency">Reliability</th>
-          <th data-sort="quality" class="col-score right hide-tablet" title="Quality score: Spam filtering, policy clarity, security">Quality</th>
-          <th data-sort="accessibility" class="col-score right hide-tablet" title="Accessibility score: Access barriers, limits, jurisdiction">Accessibility</th>
-          <th data-sort="score" class="col-final right sorted" title="Overall trust score (0-100)"><span class="hide-mobile">Trust </span>Score</th>
+          <th data-sort="reliability" class="col-score center hide-tablet" title="Reliability score: Connection stability and latency">Reliability</th>
+          <th data-sort="quality" class="col-score center hide-tablet" title="Quality score: Spam filtering, policy clarity, security">Quality</th>
+          <th data-sort="accessibility" class="col-score center hide-tablet" title="Accessibility score: Access barriers, limits, jurisdiction">Accessibility</th>
+          <th data-sort="score" class="col-final center sorted" title="Overall trust score (0-100)">Score</th>
+          <th data-sort="trendChange" class="col-trend center hide-tablet" title="Score trend over last 7 days">Trend</th>
         </tr>
       </thead>
       <tbody id="relay-tbody">
         <!-- Skeleton rows while loading -->
-        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton-score-bar"><div class="skeleton skeleton-text skeleton-num"></div><div class="skeleton skeleton-bar"></div></div></td></tr>
-        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton-score-bar"><div class="skeleton skeleton-text skeleton-num"></div><div class="skeleton skeleton-bar"></div></div></td></tr>
-        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton-score-bar"><div class="skeleton skeleton-text skeleton-num"></div><div class="skeleton skeleton-bar"></div></div></td></tr>
-        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton-score-bar"><div class="skeleton skeleton-text skeleton-num"></div><div class="skeleton skeleton-bar"></div></div></td></tr>
-        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton-score-bar"><div class="skeleton skeleton-text skeleton-num"></div><div class="skeleton skeleton-bar"></div></div></td></tr>
-        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton-score-bar"><div class="skeleton skeleton-text skeleton-num"></div><div class="skeleton skeleton-bar"></div></div></td></tr>
-        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton-score-bar"><div class="skeleton skeleton-text skeleton-num"></div><div class="skeleton skeleton-bar"></div></div></td></tr>
-        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton-score-bar"><div class="skeleton skeleton-text skeleton-num"></div><div class="skeleton skeleton-bar"></div></div></td></tr>
+        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-trend hide-tablet"><div class="skeleton skeleton-text" style="width:40px"></div></td></tr>
+        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-trend hide-tablet"><div class="skeleton skeleton-text" style="width:40px"></div></td></tr>
+        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-trend hide-tablet"><div class="skeleton skeleton-text" style="width:40px"></div></td></tr>
+        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-trend hide-tablet"><div class="skeleton skeleton-text" style="width:40px"></div></td></tr>
+        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-trend hide-tablet"><div class="skeleton skeleton-text" style="width:40px"></div></td></tr>
+        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-trend hide-tablet"><div class="skeleton skeleton-text" style="width:40px"></div></td></tr>
+        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-trend hide-tablet"><div class="skeleton skeleton-text" style="width:40px"></div></td></tr>
+        <tr class="skeleton-row"><td><div class="skeleton-relay"><div class="skeleton skeleton-dot"></div><div class="skeleton skeleton-text skeleton-url"></div></div><div class="skeleton skeleton-text skeleton-desc"></div></td><td class="hide-mobile"><div class="skeleton skeleton-text" style="width:55px"></div></td><td class="col-loc hide-mobile"><div class="skeleton skeleton-text" style="width:28px"></div></td><td class="col-conf hide-tablet"><div class="skeleton skeleton-text" style="width:50px"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-score hide-tablet"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-final"><div class="skeleton skeleton-text skeleton-num"></div></td><td class="col-trend hide-tablet"><div class="skeleton skeleton-text" style="width:40px"></div></td></tr>
       </tbody>
     </table>
-  </div>
-
-  <div class="footer">
-    <div class="footer-stats">
-      <div>High: <span id="foot-high">-</span></div>
-      <div>Medium: <span id="foot-med">-</span></div>
-      <div>Low: <span id="foot-low">-</span></div>
-      <div>Unreachable: <span id="foot-unreach">-</span></div>
-    </div>
-    <div>Auto-refresh: <span id="auto-refresh-status">30s</span></div>
   </div>
 
   <div class="toast" id="toast"></div>
@@ -243,8 +280,10 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
     let sortCol = 'score';
     let sortAsc = false;
     let countries = [];
+    let selectedNips = [];
     let lastFetch = 0;
     let refreshInterval = null;
+    let autoRefreshEnabled = true;
 
     // Performance: cache filtered/sorted data
     let cachedFiltered = null;
@@ -330,17 +369,36 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
     }
 
     function startAutoRefresh() {
+      if (refreshInterval) clearInterval(refreshInterval);
       refreshInterval = setInterval(() => {
-        fetchData();
+        if (autoRefreshEnabled) fetchData();
       }, 30000);
       setInterval(updateFreshness, 5000);
     }
 
+    function toggleAutoRefresh() {
+      autoRefreshEnabled = !autoRefreshEnabled;
+      updateFreshness();
+      if (autoRefreshEnabled) {
+        fetchData();
+        showToast('Auto-refresh enabled');
+      } else {
+        showToast('Auto-refresh paused');
+      }
+    }
+
     function updateFreshness() {
       const age = Math.floor((Date.now() - lastFetch) / 1000);
+      const btn = document.getElementById('freshness-btn');
       const dot = document.getElementById('freshness-dot');
-      let ageText;
 
+      if (!autoRefreshEnabled) {
+        dot.className = 'freshness-dot paused';
+        btn.title = 'Auto-refresh paused - click to resume';
+        return;
+      }
+
+      let ageText;
       if (age < 60) {
         dot.className = 'freshness-dot';
         ageText = age + 's ago';
@@ -351,7 +409,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
         dot.className = 'freshness-dot old';
         ageText = Math.floor(age / 60) + 'm ago';
       }
-      dot.title = 'Data updated ' + ageText;
+      btn.title = 'Updated ' + ageText + ' - click to pause';
     }
 
     function updateStats() {
@@ -364,10 +422,6 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
         else if (r.score >= 40) stats.medium++;
         else if (r.score != null) stats.low++;
       }
-      document.getElementById('foot-high').textContent = stats.high;
-      document.getElementById('foot-med').textContent = stats.medium;
-      document.getElementById('foot-low').textContent = stats.low;
-      document.getElementById('foot-unreach').textContent = stats.unreachable;
     }
 
     function updateColumnHeaders(filteredCount, totalCount, countryCount) {
@@ -399,6 +453,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
         document.getElementById('filter-score').value,
         document.getElementById('filter-country').value,
         document.getElementById('filter-secure').value,
+        selectedNips.sort().join(','),
         sortCol,
         sortAsc
       ].join('|');
@@ -424,6 +479,15 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
         if (scoreFilter === 'high' && (r.score == null || r.score < 70)) return false;
         if (scoreFilter === 'medium' && (r.score == null || r.score < 40 || r.score >= 70)) return false;
         if (scoreFilter === 'low' && (r.score == null || r.score >= 40)) return false;
+        if (selectedNips.length > 0) {
+          const relayNips = r.supportedNips || [];
+          const numericNips = selectedNips.filter(n => n !== 'unknown');
+          const wantsUnknown = selectedNips.includes('unknown');
+          // Must have all selected numeric NIPs
+          if (numericNips.length > 0 && !numericNips.every(n => relayNips.includes(n))) return false;
+          // If "unknown" selected, must have at least one unknown NIP
+          if (wantsUnknown && !relayNips.some(n => !NIP_LABELS[n])) return false;
+        }
         return true;
       });
 
@@ -452,11 +516,6 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
 
     function renderRow(r) {
       const scoreClass = r.score >= 80 ? 'score-excellent' : r.score >= 60 ? 'score-good' : r.score >= 40 ? 'score-fair' : 'score-poor';
-      const barColor = r.score >= 80 ? 'var(--green)' : r.score >= 60 ? 'var(--teal)' : r.score >= 40 ? 'var(--yellow)' : 'var(--red)';
-      const pct = r.score != null ? r.score : 0;
-      const trendIcon = r.trend === 'up' ? '↑' : r.trend === 'down' ? '↓' : r.trend === 'stable' ? '·' : '';
-      const trendClass = r.trend === 'up' ? 'trend-up' : r.trend === 'down' ? 'trend-down' : 'trend-stable';
-      const trendTitle = r.trend === 'up' ? 'Score trending up' : r.trend === 'down' ? 'Score trending down' : 'Score stable';
       const confClass = r.confidence === 'high' ? 'conf-high' : r.confidence === 'medium' ? 'conf-medium' : 'conf-low';
       const confTitle = r.confidence === 'high' ? '500+ observations' : r.confidence === 'medium' ? '100-499 observations' : 'Under 100 observations';
       const displayUrl = r.url.replace('wss://', '').replace('ws://', '');
@@ -467,6 +526,20 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       const statusTitle = r.isOnline ? 'Online' + accessLevelText + ' - Relay is currently reachable' : 'Offline - Relay is currently unreachable';
       const statusDot = '<span class="status-dot ' + (r.isOnline ? 'online' : 'offline') + '" title="' + statusTitle + '"></span>';
       const descLine = r.name ? '<div class="relay-desc">' + escHtml(r.name.length > 40 ? r.name.slice(0,40) + '…' : r.name) + '</div>' : '';
+
+      // Trend display with magnitude and dynamic period
+      let trendHtml = '<span class="trend-cell trend-none">-</span>';
+      if (r.trend && r.trendChange != null && r.trendPeriod != null) {
+        const absChange = Math.abs(Math.round(r.trendChange));
+        const periodLabel = r.trendPeriod + ' day' + (r.trendPeriod !== 1 ? 's' : '');
+        if (r.trend === 'up') {
+          trendHtml = '<span class="trend-cell trend-up" title="Improving: +' + absChange + ' over ' + periodLabel + '">↑ +' + absChange + '</span>';
+        } else if (r.trend === 'down') {
+          trendHtml = '<span class="trend-cell trend-down" title="Degrading: -' + absChange + ' over ' + periodLabel + '">↓ -' + absChange + '</span>';
+        } else {
+          trendHtml = '<span class="trend-cell trend-stable" title="Stable: ±' + absChange + ' over ' + periodLabel + '">→ ±' + absChange + '</span>';
+        }
+      }
 
       return '<tr class="clickable" data-url="' + escAttr(r.url) + '" title="Click for details">' +
         '<td>' +
@@ -479,13 +552,8 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
         '<td class="col-score hide-tablet" title="Connection stability and response time"><span class="score-val">' + (r.reliability ?? '-') + '</span></td>' +
         '<td class="col-score hide-tablet" title="Spam filtering, policy clarity, encryption"><span class="score-val">' + (r.quality ?? '-') + '</span></td>' +
         '<td class="col-score hide-tablet" title="Access barriers, limits, jurisdiction"><span class="score-val">' + (r.accessibility ?? '-') + '</span></td>' +
-        '<td class="col-final ' + scoreClass + '" title="Overall trust score">' +
-          '<div class="final-score">' +
-            '<span class="trend ' + trendClass + '" title="' + trendTitle + '">' + trendIcon + '</span>' +
-            '<span class="final-num">' + (r.score != null ? r.score : '-') + '</span>' +
-            '<span class="score-bar"><span class="score-bar-fill" style="width:' + pct + '%;background-color:' + barColor + '"></span></span>' +
-          '</div>' +
-        '</td>' +
+        '<td class="col-final ' + scoreClass + '" title="Overall trust score"><span class="final-num">' + (r.score != null ? r.score : '-') + '</span></td>' +
+        '<td class="col-trend hide-tablet">' + trendHtml + '</td>' +
       '</tr>';
     }
 
@@ -505,14 +573,14 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       const tbody = document.getElementById('relay-tbody');
 
       if (filteredCount === 0) {
-        tbody.innerHTML = '<tr><td colspan="8" class="empty">No relays match filters</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="9" class="empty">No relays match filters</td></tr>';
         return;
       }
 
       // Render rows + sentinel for infinite scroll
       let html = displayData.map(renderRow).join('');
       if (hasMore) {
-        html += '<tr id="scroll-sentinel"><td colspan="8"></td></tr>';
+        html += '<tr id="scroll-sentinel"><td colspan="9"></td></tr>';
       }
 
       tbody.innerHTML = html;
@@ -554,6 +622,123 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
 
     function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
     function escAttr(s) { return s.replace(/'/g, "\\\\'").replace(/"/g, '&quot;'); }
+
+    // Generate natural language insights about a relay
+    function generateInsights(d, scores) {
+      const insights = [];
+      const nips = d.nip11?.supported_nips || [];
+      const lim = d.nip11?.limitation || {};
+      const hasPaymentsUrl = !!d.nip11?.payments_url;
+      const paymentRequired = lim.payment_required;
+      const authRequired = lim.auth_required;
+      const policy = d.policy?.classification || 'open';
+      const retention = d.nip11?.retention;
+      const relayCountries = d.nip11?.relay_countries;
+
+      // Determine NIP specializations
+      const isNip46 = nips.includes(46) || d.relayType === 'nip46';
+      const isNip29 = nips.includes(29);
+      const isNip90 = nips.includes(90);
+      const isNip96 = nips.includes(96);
+      const isNip23 = nips.includes(23);
+
+      // Primary framing based on Policy classification
+      if (policy === 'specialized') {
+        // Specialized relays - describe the specific purpose
+        if (isNip46) {
+          insights.push('A specialized relay for remote signing services. Designed for secure key management and signing requests. Best used with remote signer applications.');
+        } else if (isNip29) {
+          insights.push('A specialized relay for group chats. Supports group creation and moderated discussions.');
+        } else if (isNip90) {
+          insights.push('A specialized relay for data vending and job requests. Used for decentralized computation and AI services.');
+        } else if (isNip96) {
+          insights.push('A specialized relay for media hosting and file uploads.');
+        } else {
+          insights.push('A specialized relay designed for specific use cases rather than general messaging.');
+        }
+      } else if (policy === 'curated') {
+        // Curated relays - emphasize selective access
+        if (paymentRequired) {
+          insights.push('A curated relay with paid access. Typically offers better spam filtering and message retention than free alternatives.');
+        } else {
+          insights.push('A curated relay with selective access. Membership may require approval or invitation.');
+        }
+      } else if (policy === 'moderated') {
+        // Moderated relays - describe the moderation model
+        if (authRequired) {
+          insights.push('A moderated relay that requires authentication to write. Access may be limited to specific users or communities.');
+        } else {
+          insights.push('A moderated relay with some access restrictions. May have specific content or user policies.');
+        }
+      } else {
+        // Open relays - general purpose
+        const reliability = scores.reliability >= 80 ? 'reliable ' : '';
+        insights.push('An open ' + reliability + 'relay for general use. Accepts events from any user without restrictions.');
+      }
+
+      // Restricted writes (but not specialized/curated/moderated which already cover this)
+      if (lim.restricted_writes && policy === 'open') {
+        insights.push('Write access may be limited to certain users.');
+      }
+
+      // Content capabilities
+      if (isNip23 && policy !== 'specialized') {
+        insights.push('Supports long-form content and articles.');
+      }
+
+      // Large message support
+      const maxMsg = lim.max_message_length || lim.max_content_length;
+      if (maxMsg && maxMsg >= 100000) {
+        const sizeKb = Math.round(maxMsg / 1024);
+        insights.push('Supports large messages up to ' + sizeKb + ' KB.');
+      }
+
+      // Geographic restrictions
+      if (relayCountries && relayCountries.length > 0) {
+        if (relayCountries.length <= 3) {
+          insights.push('Geographic access limited to: ' + relayCountries.join(', ') + '.');
+        } else {
+          insights.push('Geographic access limited to ' + relayCountries.length + ' countries.');
+        }
+      }
+
+      // Data retention warning
+      if (retention && retention.length > 0) {
+        const generalRetention = retention.find(r => !r.kinds || r.kinds.length === 0);
+        if (generalRetention && generalRetention.time !== null && generalRetention.time !== undefined) {
+          const days = Math.round(generalRetention.time / 86400);
+          if (days > 0 && days < 365) {
+            insights.push('Events may be deleted after ' + days + ' days.');
+          }
+        }
+      }
+
+      // Add payment info if not already covered
+      if (hasPaymentsUrl && !paymentRequired) {
+        insights.push('Accepts optional payments for additional features or higher limits.');
+      }
+
+      // Operator trust insight
+      if (d.operator?.pubkey) {
+        const wotScore = d.operator.trustScore;
+        if (wotScore >= 70) {
+          insights.push('Operated by a highly trusted entity.');
+        } else if (wotScore >= 50) {
+          insights.push('Operated by a verified entity with good reputation.');
+        }
+      } else {
+        if (d.observations?.probeCount < 10) {
+          insights.push('Recently discovered with limited track record.');
+        }
+      }
+
+      // Reliability concern
+      if (scores.reliability < 50 && d.observations?.probeCount >= 10) {
+        insights.push('Reliability concerns observed. Frequent downtime or connectivity issues detected.');
+      }
+
+      return insights.join(' ');
+    }
 
     function copyUrl(url) {
       navigator.clipboard.writeText(url);
@@ -634,26 +819,6 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       }
     }
 
-    // NIP title lookup
-    const NIP_TITLES = {
-      1: 'Basic protocol', 2: 'Follow list', 4: 'Encrypted DMs', 5: 'DNS-based names',
-      9: 'Event deletion', 10: 'Conventions', 11: 'Relay info', 13: 'PoW',
-      14: 'Subject tag', 15: 'Marketplace', 17: 'Private DMs', 18: 'Reposts',
-      19: 'bech32 identifiers', 21: 'URI scheme', 22: 'Event created_at limits',
-      23: 'Long-form content', 24: 'Extra metadata', 25: 'Reactions', 26: 'Delegated events',
-      27: 'Text note references', 28: 'Public chat', 29: 'Relay-based groups',
-      30: 'Custom emoji', 31: 'User statuses', 32: 'Labeling', 33: 'Parameterized replaceables',
-      34: 'Git patches', 35: 'Torrents', 36: 'Sensitive content', 38: 'User statuses',
-      39: 'External identities', 40: 'Expiration', 42: 'Authentication',
-      44: 'Versioned encryption', 45: 'Event counts', 46: 'Nostr Connect', 47: 'Wallet Connect',
-      48: 'Proxy tags', 50: 'Search', 51: 'Lists', 52: 'Calendar events', 53: 'Live activities',
-      54: 'Wiki', 55: 'Android signer', 56: 'Reporting', 57: 'Lightning zaps', 58: 'Badges',
-      59: 'Gift wrap', 64: 'Chess', 65: 'Relay list', 70: 'Protected events', 71: 'Video events',
-      72: 'Moderated communities', 73: 'Location', 75: 'Zap goals', 78: 'Arbitrary app data',
-      84: 'Highlights', 89: 'Recommended relays', 90: 'Data vending', 92: 'Media attachments',
-      94: 'File metadata', 96: 'HTTP file storage', 98: 'HTTP auth', 99: 'Classified listings'
-    };
-
     function renderModal(d) {
       const sc = d.scores;
       const c = sc.components;
@@ -666,9 +831,10 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       const trendIcon = d.trend?.change > 3 ? '↑' : d.trend?.change < -3 ? '↓' : '↔';
       const trendLabel = d.trend?.change > 3 ? 'Rising' : d.trend?.change < -3 ? 'Falling' : 'Stable';
       const trendClass = d.trend?.change > 3 ? 'up' : d.trend?.change < -3 ? 'down' : 'stable';
+      const trendPeriod = d.trend?.periodDays || 7;
       const trendTooltip = d.trend?.change !== undefined
-        ? 'Score change over the last 7 days: ' + (d.trend.change > 0 ? '+' : '') + d.trend.change + ' points'
-        : 'Score change over the last 7 days';
+        ? 'Score change over ' + trendPeriod + ' days: ' + (d.trend.change > 0 ? '+' : '') + d.trend.change + ' points'
+        : 'Insufficient trend data';
 
       // Helper to render a sub-metric row with colored dot
       const metricRow = (label, value, tooltip) => {
@@ -772,6 +938,15 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
         '</div>' +
       '</div>';
 
+      // Insights section - natural language summary
+      const insightText = generateInsights(d, sc);
+      if (insightText) {
+        html += '<div class="insights-section">';
+        html += '<div class="detail-group-title">Insights</div>';
+        html += '<p class="insights-text">' + escHtml(insightText) + '</p>';
+        html += '</div>';
+      }
+
       // Details section - organized into grouped cards
       html += '<div class="detail-groups">';
 
@@ -787,14 +962,26 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       }
       const accessLabel = d.accessLevel === 'open' ? '' : d.accessLevel === 'auth_required' ? ' (auth required)' : d.accessLevel === 'payment_required' ? ' (payment required)' : d.accessLevel === 'restricted' ? ' (restricted)' : '';
       html += '<div class="detail-row" title="Current reachability status from most recent probe"><span class="detail-key">Status</span><span class="detail-val ' + (d.reachable ? 'online' : 'offline') + '">' + (d.reachable ? 'Online' + accessLabel : 'Offline') + '</span></div>';
-      if (d.operator?.pubkey) {
-        const opVal = '<span class="operator-pubkey" data-pubkey="' + d.operator.pubkey + '" title="Click to copy" style="cursor:pointer;border-bottom:1px dashed var(--text-muted)">' +
-          d.operator.pubkey.slice(0, 8) + '...' + d.operator.pubkey.slice(-8) + '</span>' +
-          (d.operator.verificationMethod ? ' <small style="color:var(--text-muted)">(' + d.operator.verificationMethod + ')</small>' : '');
-        html += '<div class="detail-row" title="Relay operator pubkey and verification method"><span class="detail-key">Operator</span><span class="detail-val">' + opVal + '</span></div>';
-      }
-      html += '<div class="detail-row" title="Number of data points used for scoring"><span class="detail-key">Observations</span><span class="detail-val">' + (d.observations?.probeCount || 0) + ' probes, ' + (d.observations?.nip66MetricCount || 0) + ' NIP-66</span></div>';
       html += '</div></div>';
+
+      // Group 2: Operator
+      if (d.operator?.pubkey) {
+        html += '<div class="detail-group">';
+        html += '<div class="detail-group-title">Operator</div>';
+        html += '<div class="detail-group-grid">';
+        html += '<div class="detail-row" title="Relay operator pubkey (click to copy)"><span class="detail-key">Pubkey</span><span class="detail-val"><span class="operator-pubkey" data-pubkey="' + d.operator.pubkey + '" title="Click to copy">' + d.operator.pubkey.slice(0, 8) + '...' + d.operator.pubkey.slice(-8) + '</span></span></div>';
+        const verifyMethod = d.operator.verificationMethod === 'nip11' ? 'NIP-11' : d.operator.verificationMethod === 'dns' ? 'DNS TXT' : d.operator.verificationMethod === 'wellknown' ? '.well-known' : d.operator.verificationMethod || '-';
+        html += '<div class="detail-row" title="How the operator pubkey was verified"><span class="detail-key">Verified via</span><span class="detail-val">' + verifyMethod + '</span></div>';
+        if (d.operator.trustScore != null) {
+          const wotClass = d.operator.trustScore >= 70 ? 'excellent' : d.operator.trustScore >= 50 ? 'good' : d.operator.trustScore >= 30 ? 'fair' : 'poor';
+          html += '<div class="detail-row" title="Web of Trust score from NIP-85 assertions"><span class="detail-key">WoT Score</span><span class="detail-val"><span class="wot-score ' + wotClass + '">' + d.operator.trustScore + '</span></span></div>';
+          const confidenceLabel = d.operator.trustConfidence || 'unknown';
+          const providerCount = d.operator.trustProviderCount || 0;
+          const providerText = providerCount > 0 ? ' (' + providerCount + ' provider' + (providerCount !== 1 ? 's' : '') + ')' : '';
+          html += '<div class="detail-row" title="Confidence level based on number of assertion providers"><span class="detail-key">WoT Confidence</span><span class="detail-val">' + confidenceLabel + providerText + '</span></div>';
+        }
+        html += '</div></div>';
+      }
 
       // Group 2: Location & Privacy
       html += '<div class="detail-group">';
@@ -829,53 +1016,24 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       if (lim.payment_required) html += '<div class="detail-row" title="Payment required to use relay"><span class="detail-key">Payment</span><span class="detail-val warn">Required</span></div>';
       html += '</div></div>';
 
+      // Group 5: Data
+      html += '<div class="detail-group">';
+      html += '<div class="detail-group-title">Data</div>';
+      html += '<div class="detail-group-grid">';
+      if (d.observations?.firstSeen) {
+        html += '<div class="detail-row" title="First time this relay was observed"><span class="detail-key">First seen</span><span class="detail-val">' + formatDate(d.observations.firstSeen) + '</span></div>';
+      }
+      if (d.observations?.lastSeen) {
+        html += '<div class="detail-row" title="Most recent observation of this relay"><span class="detail-key">Last seen</span><span class="detail-val">' + formatDate(d.observations.lastSeen) + '</span></div>';
+      }
+      html += '<div class="detail-row" title="Number of data points used for scoring"><span class="detail-key">Observations</span><span class="detail-val">' + (d.observations?.probeCount || 0) + ' probes, ' + (d.observations?.nip66MetricCount || 0) + ' NIP-66</span></div>';
+      html += '</div></div>';
+
       html += '</div>'; // end detail-groups
-
-      // Supported NIPs with tooltips
-      if (d.nip11?.supported_nips && Array.isArray(d.nip11.supported_nips) && d.nip11.supported_nips.length > 0) {
-        html += '<div class="detail-section"><h3>Supported NIPs</h3><div class="nip-tags">';
-        d.nip11.supported_nips.sort((a,b) => a - b).forEach(nip => {
-          const title = NIP_TITLES[nip] || '';
-          html += '<span class="nip-tag" title="' + (title ? 'NIP-' + nip + ': ' + title : 'NIP-' + nip) + '">NIP-' + nip + '</span>';
-        });
-        html += '</div></div>';
-      }
-
-      // Description and Contact
-      if (d.nip11?.description || d.nip11?.contact) {
-        html += '<div class="detail-section"><h3>About</h3>';
-        if (d.nip11.description) {
-          html += '<div class="description-text">' + escHtml(d.nip11.description) + '</div>';
-        }
-        if (d.nip11.contact) {
-          const contact = d.nip11.contact;
-          const isEmail = contact.includes('@');
-          html += '<div class="contact-info">Contact: ';
-          html += isEmail ? '<a href="mailto:' + escHtml(contact) + '">' + escHtml(contact) + '</a>' : escHtml(contact);
-          html += '</div>';
-        }
-        html += '</div>';
-      }
-
-      // Raw NIP-11 (collapsible)
-      if (d.nip11) {
-        html += '<div class="detail-section">';
-        html += '<h3 class="collapsible-header" id="nip11-toggle">';
-        html += '<span class="arrow">▶</span> Raw NIP-11 JSON</h3>';
-        html += '<div class="collapsible-content" id="nip11-content"><pre class="nip11-json">' + escHtml(JSON.stringify(d.nip11, null, 2)) + '</pre></div>';
-        html += '</div>';
-      }
 
       document.getElementById('modal-body').innerHTML = html;
 
       // Add event handlers
-      const nip11Toggle = document.getElementById('nip11-toggle');
-      if (nip11Toggle) {
-        nip11Toggle.addEventListener('click', function() {
-          this.classList.toggle('open');
-          document.getElementById('nip11-content').classList.toggle('open');
-        });
-      }
       const pubkeyEl = document.querySelector('.operator-pubkey');
       if (pubkeyEl) {
         pubkeyEl.addEventListener('click', function() {
@@ -934,13 +1092,349 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       });
     });
 
-    // Filters
-    ['search', 'filter-policy', 'filter-score', 'filter-country', 'filter-secure'].forEach(id => {
-      document.getElementById(id).addEventListener(id === 'search' ? 'input' : 'change', () => {
+    // Filter Drawer
+    const drawer = document.getElementById('filter-drawer');
+    const overlay = document.getElementById('filter-drawer-overlay');
+    const btnFilters = document.getElementById('btn-filters');
+    const btnClose = document.getElementById('filter-drawer-close');
+    const btnApply = document.getElementById('btn-apply-filters');
+    const btnClear = document.getElementById('btn-clear-filters');
+
+    function openDrawer() {
+      drawer.classList.add('open');
+      overlay.classList.add('open');
+      document.body.style.overflow = 'hidden';
+      updateFilterResultCount();
+    }
+    function closeDrawer() {
+      drawer.classList.remove('open');
+      overlay.classList.remove('open');
+      document.body.style.overflow = '';
+    }
+
+    btnFilters.addEventListener('click', openDrawer);
+    btnClose.addEventListener('click', closeDrawer);
+    overlay.addEventListener('click', closeDrawer);
+    btnApply.addEventListener('click', () => {
+      closeDrawer();
+      invalidateCache();
+      renderTable();
+      updateUrlState();
+      updateActiveFilters();
+    });
+    btnClear.addEventListener('click', () => {
+      document.getElementById('filter-policy').value = '';
+      document.getElementById('filter-score').value = '';
+      document.getElementById('filter-country').value = '';
+      document.getElementById('filter-secure').value = '';
+      selectedNips = [];
+      updateNipButtonText();
+      updateFilterResultCount();
+    });
+
+    // Live update count as filters change in drawer
+    function updateFilterResultCount() {
+      const count = getFilteredCount();
+      document.getElementById('filter-result-count').textContent = count;
+    }
+
+    function getFilteredCount() {
+      const search = document.getElementById('search').value.toLowerCase();
+      const policy = document.getElementById('filter-policy').value;
+      const scoreFilter = document.getElementById('filter-score').value;
+      const country = document.getElementById('filter-country').value;
+      const secure = document.getElementById('filter-secure').value;
+
+      return allRelays.filter(r => {
+        if (search && !r.url.toLowerCase().includes(search) && !(r.name && r.name.toLowerCase().includes(search))) return false;
+        if (policy && r.policy !== policy) return false;
+        if (country && r.countryCode !== country) return false;
+        if (secure === 'secure' && !r.isSecure) return false;
+        if (secure === 'insecure' && r.isSecure) return false;
+        if (scoreFilter === 'high' && (r.score == null || r.score < 70)) return false;
+        if (scoreFilter === 'medium' && (r.score == null || r.score < 40 || r.score >= 70)) return false;
+        if (scoreFilter === 'low' && (r.score == null || r.score >= 40)) return false;
+        if (selectedNips.length > 0) {
+          const relayNips = r.supportedNips || [];
+          const numericNips = selectedNips.filter(n => n !== 'unknown');
+          const wantsUnknown = selectedNips.includes('unknown');
+          if (numericNips.length > 0 && !numericNips.every(n => relayNips.includes(n))) return false;
+          if (wantsUnknown && !relayNips.some(n => !NIP_LABELS[n])) return false;
+        }
+        return true;
+      }).length;
+    }
+
+    // Active filter chips
+    function updateActiveFilters() {
+      const container = document.getElementById('active-filters');
+      const chips = [];
+      let count = 0;
+
+      const policy = document.getElementById('filter-policy').value;
+      const score = document.getElementById('filter-score').value;
+      const country = document.getElementById('filter-country').value;
+      const secure = document.getElementById('filter-secure').value;
+
+      if (policy) {
+        chips.push(createChip('Policy', policy, 'filter-policy'));
+        count++;
+      }
+      if (score) {
+        const scoreLabels = { high: '70+ Good', medium: '40-69 Fair', low: '<40 Poor' };
+        chips.push(createChip('Score', scoreLabels[score] || score, 'filter-score'));
+        count++;
+      }
+      if (country) {
+        chips.push(createChip('Country', country, 'filter-country'));
+        count++;
+      }
+      if (secure) {
+        chips.push(createChip('Security', secure === 'secure' ? 'Encrypted' : 'Unencrypted', 'filter-secure'));
+        count++;
+      }
+      if (selectedNips.length > 0) {
+        const numericNips = selectedNips.filter(n => n !== 'unknown');
+        const hasUnknown = selectedNips.includes('unknown');
+        let nipText = numericNips.map(n => 'NIP-' + n).join(', ');
+        if (hasUnknown) nipText += (nipText ? ', ' : '') + 'Unknown';
+        chips.push(createChip('NIPs', nipText, 'nips'));
+        count++;
+      }
+
+      container.innerHTML = chips.join('');
+      const countEl = document.getElementById('filters-count');
+      if (count > 0) {
+        countEl.textContent = count;
+        countEl.classList.add('visible');
+      } else {
+        countEl.classList.remove('visible');
+      }
+    }
+
+    function createChip(label, value, filterId) {
+      return '<span class="filter-chip">' +
+        '<span class="filter-chip-label">' + escHtml(label) + ':</span> ' +
+        '<span>' + escHtml(value) + '</span>' +
+        '<button class="filter-chip-remove" data-filter="' + filterId + '" title="Remove filter">×</button>' +
+      '</span>';
+    }
+
+    document.getElementById('active-filters').addEventListener('click', (e) => {
+      if (e.target.classList.contains('filter-chip-remove')) {
+        const filterId = e.target.dataset.filter;
+        if (filterId === 'nips') {
+          selectedNips = [];
+          updateNipButtonText();
+        } else {
+          document.getElementById(filterId).value = '';
+        }
         invalidateCache();
         renderTable();
         updateUrlState();
+        updateActiveFilters();
+      }
+    });
+
+    // NIP multi-select filter
+    const nipDropdown = document.getElementById('nip-dropdown');
+    const btnNipSelect = document.getElementById('btn-nip-select');
+
+    // Official NIPs from https://github.com/nostr-protocol/nips
+    const NIP_LABELS = {
+      1: 'Basic protocol',
+      2: 'Follow list',
+      3: 'OpenTimestamps',
+      4: 'Encrypted DMs (deprecated)',
+      5: 'DNS identifiers',
+      6: 'Key derivation',
+      7: 'Browser extension',
+      8: 'Mentions (deprecated)',
+      9: 'Event deletion',
+      10: 'Text notes',
+      11: 'Relay info',
+      13: 'Proof of Work',
+      14: 'Subject tag',
+      15: 'Marketplace',
+      17: 'Private DMs',
+      18: 'Reposts',
+      19: 'bech32 encoding',
+      21: 'nostr: URI',
+      22: 'Comments',
+      23: 'Long-form content',
+      24: 'Extra metadata',
+      25: 'Reactions',
+      26: 'Delegated signing',
+      27: 'Text references',
+      28: 'Public chat',
+      29: 'Groups',
+      30: 'Custom emoji',
+      31: 'Unknown events',
+      32: 'Labeling',
+      34: 'Git stuff',
+      35: 'Torrents',
+      36: 'Sensitive content',
+      37: 'Drafts',
+      38: 'User statuses',
+      39: 'External identities',
+      40: 'Expiration',
+      42: 'Auth',
+      44: 'Encrypted payloads',
+      45: 'Counting',
+      46: 'Remote signing',
+      47: 'Wallet Connect',
+      48: 'Proxy tags',
+      49: 'Key encryption',
+      50: 'Search',
+      51: 'Lists',
+      52: 'Calendar',
+      53: 'Live activities',
+      54: 'Wiki',
+      55: 'Android signer',
+      56: 'Reporting',
+      57: 'Zaps',
+      58: 'Badges',
+      59: 'Gift wrap',
+      60: 'Cashu wallet',
+      61: 'Nutzaps',
+      62: 'Vanish request',
+      64: 'Chess',
+      65: 'Relay list',
+      66: 'Relay monitoring',
+      68: 'Picture feeds',
+      69: 'P2P orders',
+      70: 'Protected events',
+      71: 'Video events',
+      72: 'Communities',
+      73: 'External content IDs',
+      75: 'Zap goals',
+      77: 'Negentropy sync',
+      78: 'App-specific data',
+      84: 'Highlights',
+      86: 'Relay management',
+      87: 'Ecash mint discovery',
+      88: 'Polls',
+      89: 'App handlers',
+      90: 'Data vending',
+      92: 'Media attachments',
+      94: 'File metadata',
+      96: 'File storage',
+      98: 'HTTP auth',
+      99: 'Classifieds',
+      // Hex-based NIPs (reported as decimal)
+      125: 'Threads',       // 7D
+      160: 'Voice messages', // A0
+      164: 'Public messages', // A4
+      176: 'Web bookmarks',  // B0
+      183: 'Blossom',        // B7
+      190: 'BLE comms',      // BE
+      192: 'Code snippets',  // C0
+      199: 'Chats',          // C7
+      238: 'E2EE MLS',       // EE
+    };
+
+    function populateNipFilter() {
+      // Collect all NIPs from relays and count occurrences
+      const nipCounts = {};
+      let unknownCount = 0;
+      const unknownNipSet = new Set();
+      allRelays.forEach(r => {
+        (r.supportedNips || []).forEach(n => {
+          nipCounts[n] = (nipCounts[n] || 0) + 1;
+          if (!NIP_LABELS[n]) {
+            unknownNipSet.add(n);
+          }
+        });
       });
+
+      // Count relays with any unknown NIP
+      allRelays.forEach(r => {
+        const nips = r.supportedNips || [];
+        if (nips.some(n => !NIP_LABELS[n])) unknownCount++;
+      });
+
+      // Get official NIPs and sort by NIP number
+      const officialNips = Object.keys(nipCounts)
+        .map(Number)
+        .filter(n => NIP_LABELS[n])
+        .sort((a, b) => a - b);
+
+      // Build dropdown HTML - official NIPs sorted by number
+      let html = officialNips.map(n => {
+        return '<label class="nip-option">' +
+          '<input type="checkbox" value="' + n + '"' + (selectedNips.includes(n) ? ' checked' : '') + '>' +
+          '<span class="nip-option-label">NIP-' + n + ' (' + NIP_LABELS[n] + ')</span>' +
+          '<span class="nip-option-count">' + nipCounts[n] + '</span>' +
+        '</label>';
+      }).join('');
+
+      // Add single "Unknown" option at the bottom
+      if (unknownNipSet.size > 0) {
+        const unknownList = Array.from(unknownNipSet).sort((a, b) => a - b).join(', ');
+        html += '<div class="nip-separator"></div>';
+        html += '<label class="nip-option nip-unknown" title="NIPs: ' + unknownList + '">' +
+          '<input type="checkbox" value="unknown"' + (selectedNips.includes('unknown') ? ' checked' : '') + '>' +
+          '<span class="nip-option-label">Unknown (' + unknownNipSet.size + ' NIPs)</span>' +
+          '<span class="nip-option-count">' + unknownCount + '</span>' +
+        '</label>';
+      }
+
+      nipDropdown.innerHTML = html;
+    }
+
+    btnNipSelect.addEventListener('click', (e) => {
+      e.stopPropagation();
+      nipDropdown.classList.toggle('open');
+      if (nipDropdown.classList.contains('open')) {
+        populateNipFilter();
+      }
+    });
+
+    nipDropdown.addEventListener('change', (e) => {
+      if (e.target.type === 'checkbox') {
+        const val = e.target.value;
+        const nip = val === 'unknown' ? 'unknown' : parseInt(val);
+        if (e.target.checked) {
+          if (!selectedNips.includes(nip)) selectedNips.push(nip);
+        } else {
+          selectedNips = selectedNips.filter(n => n !== nip);
+        }
+        updateNipButtonText();
+        updateFilterResultCount();
+      }
+    });
+
+    function updateNipButtonText() {
+      if (selectedNips.length === 0) {
+        btnNipSelect.innerHTML = 'Select NIPs...';
+      } else {
+        const hasUnknown = selectedNips.includes('unknown');
+        const nipCount = selectedNips.filter(n => n !== 'unknown').length;
+        let text = '';
+        if (nipCount > 0) text += nipCount + ' NIP' + (nipCount > 1 ? 's' : '');
+        if (hasUnknown) text += (text ? ' + ' : '') + 'Unknown';
+        btnNipSelect.innerHTML = text + ' selected';
+      }
+    }
+
+    // Close NIP dropdown when clicking outside
+    document.addEventListener('click', (e) => {
+      if (!e.target.closest('.nip-filter-container')) {
+        nipDropdown.classList.remove('open');
+      }
+    });
+
+    // Update filter count when drawer inputs change
+    ['filter-policy', 'filter-score', 'filter-country', 'filter-secure'].forEach(id => {
+      document.getElementById(id).addEventListener('change', updateFilterResultCount);
+    });
+
+    // Filters (main table filtering on search)
+    document.getElementById('search').addEventListener('input', () => {
+      invalidateCache();
+      renderTable();
+      updateUrlState();
+      updateFilterResultCount();
     });
 
     // Event delegation for table row clicks
@@ -949,10 +1443,24 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       if (row) viewRelay(row.dataset.url);
     });
 
-    // Buttons
-    document.getElementById('btn-refresh').addEventListener('click', () => { fetchData(); showToast('Refreshed'); });
-    document.getElementById('btn-export-csv').addEventListener('click', exportCSV);
-    document.getElementById('btn-export-json').addEventListener('click', exportJSON);
+    // Freshness button toggles auto-refresh
+    document.getElementById('freshness-btn').addEventListener('click', toggleAutoRefresh);
+
+    // Export dropdown
+    const exportMenu = document.getElementById('export-menu');
+    document.getElementById('btn-export').addEventListener('click', (e) => {
+      e.stopPropagation();
+      exportMenu.classList.toggle('open');
+    });
+    document.getElementById('btn-export-csv').addEventListener('click', () => {
+      exportCSV();
+      exportMenu.classList.remove('open');
+    });
+    document.getElementById('btn-export-json').addEventListener('click', () => {
+      exportJSON();
+      exportMenu.classList.remove('open');
+    });
+    document.addEventListener('click', () => exportMenu.classList.remove('open'));
 
     init();
   </script>

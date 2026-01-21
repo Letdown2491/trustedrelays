@@ -1,5 +1,5 @@
 import { Database } from 'duckdb-async';
-import type { ProbeResult, RelayType, AccessLevel, OperatorResolution, VerificationMethod, RelayReport, ReportType, RelayReportStats, RelayAssertion } from './types.js';
+import type { ProbeResult, RelayType, OperatorResolution, VerificationMethod, RelayReport, ReportType, RelayReportStats, RelayAssertion } from './types.js';
 import type { JurisdictionInfo } from './jurisdiction.js';
 import { normalizeRelayUrl } from './prober.js';
 
@@ -257,6 +257,22 @@ export class DataStore {
     } catch {
       // Column doesn't exist or table doesn't exist - no migration needed
     }
+
+    // Add WoT fields to operator_mappings if they don't exist
+    try {
+      await this.db.all(`SELECT wot_score FROM operator_mappings LIMIT 1`);
+      // Column exists, no migration needed
+    } catch {
+      // Columns don't exist, add them
+      try {
+        await this.db.exec(`ALTER TABLE operator_mappings ADD COLUMN wot_score INTEGER`);
+        await this.db.exec(`ALTER TABLE operator_mappings ADD COLUMN wot_confidence VARCHAR`);
+        await this.db.exec(`ALTER TABLE operator_mappings ADD COLUMN wot_provider_count INTEGER`);
+        await this.db.exec(`ALTER TABLE operator_mappings ADD COLUMN wot_updated_at BIGINT`);
+      } catch {
+        // Ignore errors if columns already exist
+      }
+    }
   }
 
   private async ensureReady(): Promise<Database> {
@@ -512,7 +528,11 @@ export class DataStore {
   }
 
   /**
-   * Get aggregated NIP-66 stats for a relay
+   * Get aggregated NIP-66 stats for a relay with percentile-based scoring.
+   *
+   * Percentile scoring removes geographic bias by ranking each relay relative
+   * to other relays from each monitor's perspective, then averaging across monitors.
+   * Only monitors tracking ≥20 relays contribute to percentile scores.
    */
   async getNip66Stats(relayUrl: string, sinceDays: number = 30): Promise<{
     metricCount: number;
@@ -520,13 +540,18 @@ export class DataStore {
     avgRttOpen: number | null;
     avgRttRead: number | null;
     avgRttWrite: number | null;
+    latencyScore: number | null;
+    connectPercentile: number | null;
+    readPercentile: number | null;
+    qualifyingMonitorCount: number;
     firstSeen: number | null;
     lastSeen: number | null;
   }> {
     const db = await this.ensureReady();
     const sinceTimestamp = Math.floor(Date.now() / 1000) - (sinceDays * 86400);
 
-    const rows = await db.all(
+    // Basic aggregation for raw metrics
+    const basicRows = await db.all(
       `SELECT
         COUNT(*) as metric_count,
         COUNT(DISTINCT monitor_pubkey) as monitor_count,
@@ -541,15 +566,78 @@ export class DataStore {
       sinceTimestamp
     );
 
-    const row = (rows[0] as any) || {};
+    const basicRow = (basicRows[0] as any) || {};
+
+    // Percentile calculation using latest metrics only
+    // Uses ROW_NUMBER to get most recent metric per monitor per relay
+    const percentileRows = await db.all(
+      `WITH latest_metrics AS (
+        -- Get most recent metric from each monitor for each relay
+        SELECT
+          monitor_pubkey,
+          relay_url,
+          rtt_open,
+          rtt_read,
+          ROW_NUMBER() OVER (
+            PARTITION BY monitor_pubkey, relay_url
+            ORDER BY timestamp DESC
+          ) as rn
+        FROM nip66_metrics
+        WHERE timestamp >= ?
+      ),
+      latest_only AS (
+        SELECT monitor_pubkey, relay_url, rtt_open, rtt_read
+        FROM latest_metrics
+        WHERE rn = 1
+      ),
+      qualifying_monitors AS (
+        -- Only monitors tracking ≥20 relays
+        SELECT monitor_pubkey
+        FROM latest_only
+        GROUP BY monitor_pubkey
+        HAVING COUNT(DISTINCT relay_url) >= 20
+      ),
+      monitor_percentiles AS (
+        -- For each qualifying monitor, calculate percentile for target relay
+        SELECT
+          target.monitor_pubkey,
+          target.rtt_open as target_rtt_open,
+          target.rtt_read as target_rtt_read,
+          -- Count relays with HIGHER rtt (slower) as percentage
+          (SUM(CASE WHEN other.rtt_open > target.rtt_open THEN 1 ELSE 0 END) * 100.0 / COUNT(*)) as connect_pct,
+          (SUM(CASE WHEN other.rtt_read > target.rtt_read THEN 1 ELSE 0 END) * 100.0 / COUNT(*)) as read_pct
+        FROM latest_only target
+        JOIN latest_only other ON other.monitor_pubkey = target.monitor_pubkey
+        WHERE target.relay_url = ?
+          AND target.monitor_pubkey IN (SELECT monitor_pubkey FROM qualifying_monitors)
+          AND target.rtt_open IS NOT NULL
+          AND other.rtt_open IS NOT NULL
+        GROUP BY target.monitor_pubkey, target.rtt_open, target.rtt_read
+      )
+      SELECT
+        AVG(connect_pct) as connect_percentile,
+        AVG(read_pct) as read_percentile,
+        AVG(connect_pct * 0.3 + read_pct * 0.7) as latency_score,
+        COUNT(*) as qualifying_monitor_count
+      FROM monitor_percentiles`,
+      sinceTimestamp,
+      relayUrl
+    );
+
+    const percentileRow = (percentileRows[0] as any) || {};
+
     return {
-      metricCount: Number(row.metric_count ?? 0),
-      monitorCount: Number(row.monitor_count ?? 0),
-      avgRttOpen: row.avg_rtt_open ?? null,
-      avgRttRead: row.avg_rtt_read ?? null,
-      avgRttWrite: row.avg_rtt_write ?? null,
-      firstSeen: row.first_seen ? Number(row.first_seen) : null,
-      lastSeen: row.last_seen ? Number(row.last_seen) : null,
+      metricCount: Number(basicRow.metric_count ?? 0),
+      monitorCount: Number(basicRow.monitor_count ?? 0),
+      avgRttOpen: basicRow.avg_rtt_open ?? null,
+      avgRttRead: basicRow.avg_rtt_read ?? null,
+      avgRttWrite: basicRow.avg_rtt_write ?? null,
+      latencyScore: percentileRow.latency_score != null ? Math.round(percentileRow.latency_score) : null,
+      connectPercentile: percentileRow.connect_percentile != null ? Math.round(percentileRow.connect_percentile) : null,
+      readPercentile: percentileRow.read_percentile != null ? Math.round(percentileRow.read_percentile) : null,
+      qualifyingMonitorCount: Number(percentileRow.qualifying_monitor_count ?? 0),
+      firstSeen: basicRow.first_seen ? Number(basicRow.first_seen) : null,
+      lastSeen: basicRow.last_seen ? Number(basicRow.last_seen) : null,
     };
   }
 
@@ -747,8 +835,8 @@ export class DataStore {
     const db = await this.ensureReady();
     await db.run(
       `INSERT INTO operator_mappings
-       (relay_url, operator_pubkey, verification_method, verified_at, confidence, nip11_pubkey, dns_pubkey, wellknown_pubkey)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       (relay_url, operator_pubkey, verification_method, verified_at, confidence, nip11_pubkey, dns_pubkey, wellknown_pubkey, wot_score, wot_confidence, wot_provider_count, wot_updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (relay_url) DO UPDATE SET
          operator_pubkey = excluded.operator_pubkey,
          verification_method = excluded.verification_method,
@@ -756,7 +844,11 @@ export class DataStore {
          confidence = excluded.confidence,
          nip11_pubkey = excluded.nip11_pubkey,
          dns_pubkey = excluded.dns_pubkey,
-         wellknown_pubkey = excluded.wellknown_pubkey`,
+         wellknown_pubkey = excluded.wellknown_pubkey,
+         wot_score = excluded.wot_score,
+         wot_confidence = excluded.wot_confidence,
+         wot_provider_count = excluded.wot_provider_count,
+         wot_updated_at = excluded.wot_updated_at`,
       resolution.relayUrl,
       resolution.operatorPubkey,
       resolution.verificationMethod,
@@ -764,7 +856,11 @@ export class DataStore {
       resolution.confidence,
       resolution.nip11Pubkey ?? null,
       resolution.dnsPubkey ?? null,
-      resolution.wellknownPubkey ?? null
+      resolution.wellknownPubkey ?? null,
+      resolution.trustScore ?? null,
+      resolution.trustConfidence ?? null,
+      resolution.trustProviderCount ?? null,
+      resolution.trustScore != null ? Math.floor(Date.now() / 1000) : null
     );
   }
 
@@ -782,7 +878,7 @@ export class DataStore {
     if (rows.length === 0) return null;
 
     const row = rows[0] as any;
-    return {
+    const resolution: OperatorResolution = {
       relayUrl: row.relay_url,
       operatorPubkey: row.operator_pubkey,
       verificationMethod: row.verification_method as VerificationMethod | null,
@@ -792,6 +888,45 @@ export class DataStore {
       dnsPubkey: row.dns_pubkey ?? undefined,
       wellknownPubkey: row.wellknown_pubkey ?? undefined,
     };
+
+    // Add WoT fields if present
+    if (row.wot_score != null) {
+      resolution.trustScore = Number(row.wot_score);
+      resolution.trustConfidence = row.wot_confidence as 'low' | 'medium' | 'high';
+      resolution.trustProviderCount = Number(row.wot_provider_count);
+    }
+
+    return resolution;
+  }
+
+  /**
+   * Get operator resolutions that need WoT score refresh
+   * Returns operators with pubkey where wot_updated_at is null or older than maxAgeDays
+   */
+  async getOperatorsNeedingWotRefresh(maxAgeDays: number = 1): Promise<OperatorResolution[]> {
+    const db = await this.ensureReady();
+    const cutoff = Math.floor(Date.now() / 1000) - (maxAgeDays * 86400);
+
+    const rows = await db.all(
+      `SELECT * FROM operator_mappings
+       WHERE operator_pubkey IS NOT NULL
+       AND (wot_updated_at IS NULL OR wot_updated_at < ?)`,
+      cutoff
+    );
+
+    return rows.map((row: any) => ({
+      relayUrl: row.relay_url,
+      operatorPubkey: row.operator_pubkey,
+      verificationMethod: row.verification_method as VerificationMethod | null,
+      verifiedAt: Number(row.verified_at),
+      confidence: Number(row.confidence),
+      nip11Pubkey: row.nip11_pubkey ?? undefined,
+      dnsPubkey: row.dns_pubkey ?? undefined,
+      wellknownPubkey: row.wellknown_pubkey ?? undefined,
+      trustScore: row.wot_score != null ? Number(row.wot_score) : undefined,
+      trustConfidence: row.wot_confidence as 'low' | 'medium' | 'high' | undefined,
+      trustProviderCount: row.wot_provider_count != null ? Number(row.wot_provider_count) : undefined,
+    }));
   }
 
   /**
@@ -1177,42 +1312,65 @@ export class DataStore {
   /**
    * Get score trend (change over time)
    */
-  async getScoreTrend(relayUrl: string, periodDays: number = 30): Promise<{
+  async getScoreTrend(relayUrl: string, preferredPeriodDays: number = 30): Promise<{
     currentScore?: number;
     previousScore?: number;
     change?: number;
+    periodDays?: number;
     trend: 'improving' | 'declining' | 'stable' | 'unknown';
   }> {
     const db = await this.ensureReady();
     const now = Math.floor(Date.now() / 1000);
-    const periodStart = now - (periodDays * 86400);
+    const preferredStart = now - (preferredPeriodDays * 86400);
+    const minPeriodDays = 3;
 
-    // Get most recent score
+    // Get most recent score with timestamp
     const recentRows = await db.all(
-      `SELECT score FROM score_history
-       WHERE relay_url = ? AND timestamp >= ?
+      `SELECT score, timestamp FROM score_history
+       WHERE relay_url = ?
        ORDER BY timestamp DESC LIMIT 1`,
-      relayUrl,
-      periodStart
+      relayUrl
     );
 
-    // Get score from start of period
+    // Get oldest score within preferred period, or absolute oldest if no data before period
     const oldRows = await db.all(
-      `SELECT score FROM score_history
+      `SELECT score, timestamp FROM score_history
        WHERE relay_url = ? AND timestamp < ?
        ORDER BY timestamp DESC LIMIT 1`,
       relayUrl,
-      periodStart
+      preferredStart
     );
 
-    const currentScore = recentRows.length > 0 ? (recentRows[0] as any).score : undefined;
-    const previousScore = oldRows.length > 0 ? (oldRows[0] as any).score : undefined;
+    // If no old data before preferred period, get the absolute oldest
+    let oldestRow = oldRows.length > 0 ? oldRows[0] as any : null;
+    if (!oldestRow) {
+      const absoluteOldest = await db.all(
+        `SELECT score, timestamp FROM score_history
+         WHERE relay_url = ?
+         ORDER BY timestamp ASC LIMIT 1`,
+        relayUrl
+      );
+      oldestRow = absoluteOldest.length > 0 ? absoluteOldest[0] as any : null;
+    }
 
-    if (currentScore === undefined || previousScore === undefined) {
+    const currentScore = recentRows.length > 0 ? (recentRows[0] as any).score : undefined;
+    // Convert BigInt to Number if needed
+    const currentTs = recentRows.length > 0 ? Number((recentRows[0] as any).timestamp) : undefined;
+    const previousScore = oldestRow?.score;
+    const previousTs = oldestRow?.timestamp != null ? Number(oldestRow.timestamp) : undefined;
+
+    if (currentScore === undefined || previousScore === undefined || currentTs === previousTs) {
+      return { currentScore, previousScore, trend: 'unknown' };
+    }
+
+    // Calculate actual span in days
+    const spanDays = Math.round((currentTs! - previousTs!) / 86400);
+    if (spanDays < minPeriodDays) {
       return { currentScore, previousScore, trend: 'unknown' };
     }
 
     const change = currentScore - previousScore;
+    const periodDays = Math.min(spanDays, preferredPeriodDays);
 
     let trend: 'improving' | 'declining' | 'stable';
     if (change >= 5) {
@@ -1223,7 +1381,7 @@ export class DataStore {
       trend = 'stable';
     }
 
-    return { currentScore, previousScore, change, trend };
+    return { currentScore, previousScore, change, periodDays, trend };
   }
 
   // ============================================================================
@@ -1453,7 +1611,7 @@ export class DataStore {
   }
 
   /**
-   * Get NIP-66 stats for ALL relays in a single query
+   * Get NIP-66 stats for ALL relays in a single query with percentile-based scoring.
    */
   async getAllNip66Stats(sinceDays: number = 365): Promise<Map<string, {
     metricCount: number;
@@ -1461,13 +1619,18 @@ export class DataStore {
     avgRttOpen: number | null;
     avgRttRead: number | null;
     avgRttWrite: number | null;
+    latencyScore: number | null;
+    connectPercentile: number | null;
+    readPercentile: number | null;
+    qualifyingMonitorCount: number;
     firstSeen: number | null;
     lastSeen: number | null;
   }>> {
     const db = await this.ensureReady();
     const sinceTimestamp = Math.floor(Date.now() / 1000) - (sinceDays * 86400);
 
-    const rows = await db.all(`
+    // Basic aggregation for raw metrics
+    const basicRows = await db.all(`
       SELECT
         relay_url,
         COUNT(*) as metric_count,
@@ -1482,18 +1645,98 @@ export class DataStore {
       GROUP BY relay_url
     `, sinceTimestamp);
 
-    const result = new Map();
-    for (const row of rows as any[]) {
+    // Build map with basic stats first
+    const result = new Map<string, {
+      metricCount: number;
+      monitorCount: number;
+      avgRttOpen: number | null;
+      avgRttRead: number | null;
+      avgRttWrite: number | null;
+      latencyScore: number | null;
+      connectPercentile: number | null;
+      readPercentile: number | null;
+      qualifyingMonitorCount: number;
+      firstSeen: number | null;
+      lastSeen: number | null;
+    }>();
+
+    for (const row of basicRows as any[]) {
       result.set(row.relay_url, {
         metricCount: Number(row.metric_count ?? 0),
         monitorCount: Number(row.monitor_count ?? 0),
         avgRttOpen: row.avg_rtt_open ?? null,
         avgRttRead: row.avg_rtt_read ?? null,
         avgRttWrite: row.avg_rtt_write ?? null,
+        latencyScore: null,
+        connectPercentile: null,
+        readPercentile: null,
+        qualifyingMonitorCount: 0,
         firstSeen: row.first_seen ? Number(row.first_seen) : null,
         lastSeen: row.last_seen ? Number(row.last_seen) : null,
       });
     }
+
+    // Percentile calculation for ALL relays in a single query
+    const percentileRows = await db.all(`
+      WITH latest_metrics AS (
+        SELECT
+          monitor_pubkey,
+          relay_url,
+          rtt_open,
+          rtt_read,
+          ROW_NUMBER() OVER (
+            PARTITION BY monitor_pubkey, relay_url
+            ORDER BY timestamp DESC
+          ) as rn
+        FROM nip66_metrics
+        WHERE timestamp >= ?
+      ),
+      latest_only AS (
+        SELECT monitor_pubkey, relay_url, rtt_open, rtt_read
+        FROM latest_metrics
+        WHERE rn = 1
+      ),
+      qualifying_monitors AS (
+        SELECT monitor_pubkey
+        FROM latest_only
+        GROUP BY monitor_pubkey
+        HAVING COUNT(DISTINCT relay_url) >= 20
+      ),
+      relay_percentiles_per_monitor AS (
+        -- For each relay and qualifying monitor, calculate percentile
+        SELECT
+          target.relay_url,
+          target.monitor_pubkey,
+          (SUM(CASE WHEN other.rtt_open > target.rtt_open THEN 1 ELSE 0 END) * 100.0 / COUNT(*)) as connect_pct,
+          (SUM(CASE WHEN other.rtt_read > target.rtt_read THEN 1 ELSE 0 END) * 100.0 / COUNT(*)) as read_pct
+        FROM latest_only target
+        JOIN latest_only other ON other.monitor_pubkey = target.monitor_pubkey
+        WHERE target.monitor_pubkey IN (SELECT monitor_pubkey FROM qualifying_monitors)
+          AND target.rtt_open IS NOT NULL
+          AND other.rtt_open IS NOT NULL
+        GROUP BY target.relay_url, target.monitor_pubkey, target.rtt_open, target.rtt_read
+      )
+      SELECT
+        relay_url,
+        AVG(connect_pct) as connect_percentile,
+        AVG(read_pct) as read_percentile,
+        AVG(connect_pct * 0.3 + read_pct * 0.7) as latency_score,
+        COUNT(*) as qualifying_monitor_count
+      FROM relay_percentiles_per_monitor
+      GROUP BY relay_url
+    `, sinceTimestamp);
+
+    // Merge percentile data into results (rounded to whole numbers)
+    for (const row of percentileRows as any[]) {
+      const existing = result.get(row.relay_url);
+      if (existing) {
+        existing.latencyScore = row.latency_score != null ? Math.round(row.latency_score) : null;
+        existing.connectPercentile = row.connect_percentile != null ? Math.round(row.connect_percentile) : null;
+        existing.readPercentile = row.read_percentile != null ? Math.round(row.read_percentile) : null;
+        existing.qualifyingMonitorCount = Number(row.qualifying_monitor_count ?? 0);
+      }
+    }
+
     return result;
   }
 
@@ -1533,7 +1776,7 @@ export class DataStore {
 
     const result = new Map<string, OperatorResolution>();
     for (const row of rows as any[]) {
-      result.set(row.relay_url, {
+      const resolution: OperatorResolution = {
         relayUrl: row.relay_url,
         operatorPubkey: row.operator_pubkey,
         verificationMethod: row.verification_method as VerificationMethod | null,
@@ -1542,7 +1785,16 @@ export class DataStore {
         nip11Pubkey: row.nip11_pubkey ?? undefined,
         dnsPubkey: row.dns_pubkey ?? undefined,
         wellknownPubkey: row.wellknown_pubkey ?? undefined,
-      });
+      };
+
+      // Add WoT fields if present
+      if (row.wot_score != null) {
+        resolution.trustScore = Number(row.wot_score);
+        resolution.trustConfidence = row.wot_confidence as 'low' | 'medium' | 'high';
+        resolution.trustProviderCount = Number(row.wot_provider_count);
+      }
+
+      result.set(row.relay_url, resolution);
     }
     return result;
   }
@@ -1638,44 +1890,89 @@ export class DataStore {
 
   /**
    * Get score trends for ALL relays in a single query
+   * Uses dynamic period - prefers 7 days but falls back to available data (min 3 days)
    */
-  async getAllScoreTrends(periodDays: number = 7): Promise<Map<string, {
+  async getAllScoreTrends(preferredPeriodDays: number = 7): Promise<Map<string, {
     currentScore: number | null;
     previousScore: number | null;
     change: number | null;
+    periodDays: number | null;
   }>> {
     const db = await this.ensureReady();
     const now = Math.floor(Date.now() / 1000);
-    const periodStart = now - (periodDays * 86400);
+    const preferredStart = now - (preferredPeriodDays * 86400);
+    const minPeriodDays = 3;
 
-    // Get latest scores and scores from before the period in one query using window functions
+    // Get latest score, oldest score, and timestamps for each relay
     const rows = await db.all(`
-      WITH ranked AS (
+      WITH bounds AS (
         SELECT
           relay_url,
-          score,
-          timestamp,
-          CASE WHEN timestamp >= ? THEN 'recent' ELSE 'old' END as period,
-          ROW_NUMBER() OVER (PARTITION BY relay_url, CASE WHEN timestamp >= ? THEN 'recent' ELSE 'old' END ORDER BY timestamp DESC) as rn
+          MIN(timestamp) as oldest_ts,
+          MAX(timestamp) as newest_ts
         FROM score_history
+        GROUP BY relay_url
+      ),
+      latest AS (
+        SELECT
+          s.relay_url,
+          s.score as current_score,
+          s.timestamp as current_ts
+        FROM score_history s
+        INNER JOIN bounds b ON s.relay_url = b.relay_url AND s.timestamp = b.newest_ts
+      ),
+      oldest_in_period AS (
+        SELECT
+          s.relay_url,
+          s.score as previous_score,
+          s.timestamp as previous_ts,
+          ROW_NUMBER() OVER (PARTITION BY s.relay_url ORDER BY s.timestamp ASC) as rn
+        FROM score_history s
+        WHERE s.timestamp <= ?
       )
       SELECT
-        r.relay_url,
-        MAX(CASE WHEN r.period = 'recent' AND r.rn = 1 THEN r.score END) as current_score,
-        MAX(CASE WHEN r.period = 'old' AND r.rn = 1 THEN r.score END) as previous_score
-      FROM ranked r
-      WHERE r.rn = 1
-      GROUP BY r.relay_url
-    `, periodStart, periodStart);
+        l.relay_url,
+        l.current_score,
+        l.current_ts,
+        COALESCE(o.previous_score, (
+          SELECT score FROM score_history
+          WHERE relay_url = l.relay_url
+          ORDER BY timestamp ASC LIMIT 1
+        )) as previous_score,
+        COALESCE(o.previous_ts, (
+          SELECT timestamp FROM score_history
+          WHERE relay_url = l.relay_url
+          ORDER BY timestamp ASC LIMIT 1
+        )) as previous_ts
+      FROM latest l
+      LEFT JOIN oldest_in_period o ON l.relay_url = o.relay_url AND o.rn = 1
+    `, preferredStart);
 
     const result = new Map();
     for (const row of rows as any[]) {
       const current = row.current_score ?? null;
       const previous = row.previous_score ?? null;
+      // Convert BigInt to Number if needed
+      const currentTs = row.current_ts != null ? Number(row.current_ts) : null;
+      const previousTs = row.previous_ts != null ? Number(row.previous_ts) : null;
+
+      // Calculate actual span in days
+      let periodDays: number | null = null;
+      let change: number | null = null;
+
+      if (currentTs && previousTs && currentTs !== previousTs) {
+        const spanDays = Math.round((currentTs - previousTs) / 86400);
+        if (spanDays >= minPeriodDays && current !== null && previous !== null) {
+          periodDays = Math.min(spanDays, preferredPeriodDays);
+          change = current - previous;
+        }
+      }
+
       result.set(row.relay_url, {
         currentScore: current,
         previousScore: previous,
-        change: current !== null && previous !== null ? current - previous : null,
+        change,
+        periodDays,
       });
     }
     return result;
@@ -1715,8 +2012,338 @@ export class DataStore {
     };
   }
 
+  // ============================================================================
+  // ANALYTICS METHODS - Advanced analytics queries using DuckDB features
+  // ============================================================================
+
+  /**
+   * Get complete score history for a relay (for trend analysis)
+   */
+  async getFullScoreHistory(relayUrl: string, sinceDays: number = 90): Promise<Array<{
+    timestamp: number;
+    score: number | null;
+    reliability: number | null;
+    quality: number | null;
+    accessibility: number | null;
+    observations: number;
+    confidence: string;
+  }>> {
+    const db = await this.ensureReady();
+    const sinceTimestamp = Math.floor(Date.now() / 1000) - (sinceDays * 86400);
+
+    const rows = await db.all(
+      `SELECT timestamp, score, reliability, quality, accessibility, observations, confidence
+       FROM score_history
+       WHERE relay_url = ? AND timestamp >= ?
+       ORDER BY timestamp ASC`,
+      relayUrl,
+      sinceTimestamp
+    );
+
+    return rows.map((row: any) => ({
+      timestamp: Number(row.timestamp),
+      score: row.score ?? null,
+      reliability: row.reliability ?? null,
+      quality: row.quality ?? null,
+      accessibility: row.accessibility ?? null,
+      observations: Number(row.observations ?? 0),
+      confidence: row.confidence,
+    }));
+  }
+
+  /**
+   * Get all relay scores for ranking calculations
+   * Returns the most recent score for each relay
+   */
+  async getAllRelayScoresForRanking(): Promise<Array<{
+    url: string;
+    score: number | null;
+    reliability: number | null;
+    quality: number | null;
+    accessibility: number | null;
+    observations: number;
+    lastUpdated: number;
+  }>> {
+    const db = await this.ensureReady();
+
+    // Get the most recent score snapshot for each relay
+    const rows = await db.all(`
+      WITH ranked AS (
+        SELECT
+          relay_url,
+          score,
+          reliability,
+          quality,
+          accessibility,
+          observations,
+          timestamp,
+          ROW_NUMBER() OVER (PARTITION BY relay_url ORDER BY timestamp DESC) as rn
+        FROM score_history
+      )
+      SELECT relay_url as url, score, reliability, quality, accessibility, observations, timestamp as last_updated
+      FROM ranked
+      WHERE rn = 1
+      ORDER BY score DESC NULLS LAST
+    `);
+
+    return rows.map((row: any) => ({
+      url: row.url,
+      score: row.score ?? null,
+      reliability: row.reliability ?? null,
+      quality: row.quality ?? null,
+      accessibility: row.accessibility ?? null,
+      observations: Number(row.observations ?? 0),
+      lastUpdated: Number(row.last_updated),
+    }));
+  }
+
+  /**
+   * Get previous rankings from a specific time period
+   * Used for calculating rank changes
+   */
+  async getPreviousRankings(daysAgo: number = 7): Promise<Map<string, number>> {
+    const db = await this.ensureReady();
+    const targetTime = Math.floor(Date.now() / 1000) - (daysAgo * 86400);
+    const windowStart = targetTime - 86400; // 1-day window around target
+
+    // Get scores from the target period, then rank them
+    const rows = await db.all(`
+      WITH period_scores AS (
+        SELECT
+          relay_url,
+          score,
+          ROW_NUMBER() OVER (PARTITION BY relay_url ORDER BY ABS(timestamp - ?) ASC) as rn
+        FROM score_history
+        WHERE timestamp BETWEEN ? AND ?
+          AND score IS NOT NULL
+      ),
+      best_scores AS (
+        SELECT relay_url, score
+        FROM period_scores
+        WHERE rn = 1
+      )
+      SELECT
+        relay_url,
+        RANK() OVER (ORDER BY score DESC) as rank
+      FROM best_scores
+    `, targetTime, windowStart, targetTime + 86400);
+
+    const result = new Map<string, number>();
+    for (const row of rows as any[]) {
+      result.set(row.relay_url, Number(row.rank));
+    }
+    return result;
+  }
+
+  /**
+   * Get rolling averages for all relays using DuckDB window functions
+   * More efficient than computing in JavaScript for large datasets
+   */
+  async getAllRollingAverages(): Promise<Map<string, {
+    rolling7d: number | null;
+    rolling30d: number | null;
+    rolling90d: number | null;
+    volatility: number | null;
+  }>> {
+    const db = await this.ensureReady();
+    const now = Math.floor(Date.now() / 1000);
+    const days7 = now - 7 * 86400;
+    const days30 = now - 30 * 86400;
+    const days90 = now - 90 * 86400;
+
+    const rows = await db.all(`
+      WITH base AS (
+        SELECT
+          relay_url,
+          score,
+          timestamp
+        FROM score_history
+        WHERE score IS NOT NULL AND timestamp >= ?
+      )
+      SELECT
+        relay_url,
+        AVG(CASE WHEN timestamp >= ? THEN score END) as rolling_7d,
+        AVG(CASE WHEN timestamp >= ? THEN score END) as rolling_30d,
+        AVG(score) as rolling_90d,
+        STDDEV_SAMP(CASE WHEN timestamp >= ? THEN score END) as volatility
+      FROM base
+      GROUP BY relay_url
+    `, days90, days7, days30, days30);
+
+    const result = new Map();
+    for (const row of rows as any[]) {
+      result.set(row.relay_url, {
+        rolling7d: row.rolling_7d !== null ? Math.round(row.rolling_7d) : null,
+        rolling30d: row.rolling_30d !== null ? Math.round(row.rolling_30d) : null,
+        rolling90d: row.rolling_90d !== null ? Math.round(row.rolling_90d) : null,
+        volatility: row.volatility !== null ? Math.round(row.volatility * 10) / 10 : null,
+      });
+    }
+    return result;
+  }
+
+  /**
+   * Get trend analysis data for all relays using DuckDB
+   * Returns first/last scores and slope for trend detection
+   */
+  async getAllTrendData(periodDays: number = 30): Promise<Map<string, {
+    firstScore: number | null;
+    lastScore: number | null;
+    firstTimestamp: number;
+    lastTimestamp: number;
+    dataPoints: number;
+    slope: number | null;
+  }>> {
+    const db = await this.ensureReady();
+    const periodStart = Math.floor(Date.now() / 1000) - (periodDays * 86400);
+
+    // Get first and last scores, plus compute linear regression slope
+    const rows = await db.all(`
+      WITH period_data AS (
+        SELECT
+          relay_url,
+          score,
+          timestamp,
+          ROW_NUMBER() OVER (PARTITION BY relay_url ORDER BY timestamp ASC) as rn_asc,
+          ROW_NUMBER() OVER (PARTITION BY relay_url ORDER BY timestamp DESC) as rn_desc,
+          COUNT(*) OVER (PARTITION BY relay_url) as total_count
+        FROM score_history
+        WHERE timestamp >= ? AND score IS NOT NULL
+      ),
+      first_last AS (
+        SELECT
+          relay_url,
+          MAX(CASE WHEN rn_asc = 1 THEN score END) as first_score,
+          MAX(CASE WHEN rn_desc = 1 THEN score END) as last_score,
+          MAX(CASE WHEN rn_asc = 1 THEN timestamp END) as first_timestamp,
+          MAX(CASE WHEN rn_desc = 1 THEN timestamp END) as last_timestamp,
+          MAX(total_count) as data_points
+        FROM period_data
+        GROUP BY relay_url
+      ),
+      regression AS (
+        SELECT
+          relay_url,
+          REGR_SLOPE(score, (timestamp - ?) / 86400.0) as slope
+        FROM score_history
+        WHERE timestamp >= ? AND score IS NOT NULL
+        GROUP BY relay_url
+        HAVING COUNT(*) >= 2
+      )
+      SELECT
+        fl.relay_url,
+        fl.first_score,
+        fl.last_score,
+        fl.first_timestamp,
+        fl.last_timestamp,
+        fl.data_points,
+        r.slope
+      FROM first_last fl
+      LEFT JOIN regression r ON fl.relay_url = r.relay_url
+    `, periodStart, periodStart, periodStart);
+
+    const result = new Map();
+    for (const row of rows as any[]) {
+      result.set(row.relay_url, {
+        firstScore: row.first_score ?? null,
+        lastScore: row.last_score ?? null,
+        firstTimestamp: Number(row.first_timestamp ?? 0),
+        lastTimestamp: Number(row.last_timestamp ?? 0),
+        dataPoints: Number(row.data_points ?? 0),
+        slope: row.slope !== null ? Math.round(row.slope * 100) / 100 : null,
+      });
+    }
+    return result;
+  }
+
+  /**
+   * Get uptime statistics for confidence interval calculation
+   */
+  async getUptimeStats(relayUrl: string, sinceDays: number = 30): Promise<{
+    totalProbes: number;
+    reachableProbes: number;
+    uptimePercent: number;
+  }> {
+    const db = await this.ensureReady();
+    const sinceTimestamp = Math.floor(Date.now() / 1000) - (sinceDays * 86400);
+
+    const rows = await db.all(
+      `SELECT
+        COUNT(*) as total,
+        SUM(CASE WHEN reachable THEN 1 ELSE 0 END) as reachable
+      FROM probes
+      WHERE url = ? AND timestamp >= ?`,
+      relayUrl,
+      sinceTimestamp
+    );
+
+    const row = (rows[0] as any) || {};
+    const total = Number(row.total ?? 0);
+    const reachable = Number(row.reachable ?? 0);
+
+    return {
+      totalProbes: total,
+      reachableProbes: reachable,
+      uptimePercent: total > 0 ? Math.round((reachable / total) * 100) : 0,
+    };
+  }
+
+  /**
+   * Get uptime stats for all relays in a single query
+   */
+  async getAllUptimeStats(sinceDays: number = 30): Promise<Map<string, {
+    totalProbes: number;
+    reachableProbes: number;
+    uptimePercent: number;
+  }>> {
+    const db = await this.ensureReady();
+    const sinceTimestamp = Math.floor(Date.now() / 1000) - (sinceDays * 86400);
+
+    const rows = await db.all(`
+      SELECT
+        url,
+        COUNT(*) as total,
+        SUM(CASE WHEN reachable THEN 1 ELSE 0 END) as reachable
+      FROM probes
+      WHERE timestamp >= ?
+      GROUP BY url
+    `, sinceTimestamp);
+
+    const result = new Map();
+    for (const row of rows as any[]) {
+      const total = Number(row.total ?? 0);
+      const reachable = Number(row.reachable ?? 0);
+      result.set(row.url, {
+        totalProbes: total,
+        reachableProbes: reachable,
+        uptimePercent: total > 0 ? Math.round((reachable / total) * 100) : 0,
+      });
+    }
+    return result;
+  }
+
+  /**
+   * Checkpoint the WAL file to prevent stale WAL issues
+   * Should be called periodically and before shutdown
+   */
+  async checkpoint(): Promise<void> {
+    const db = await this.ensureReady();
+    try {
+      await db.run('CHECKPOINT');
+    } catch (err) {
+      // Ignore checkpoint errors - not critical
+      console.error('Checkpoint failed:', err);
+    }
+  }
+
   async close(): Promise<void> {
     if (this.db) {
+      // Checkpoint before closing to flush WAL
+      try {
+        await this.db.run('CHECKPOINT');
+      } catch {
+        // Ignore checkpoint errors during close
+      }
       await this.db.close();
       this.db = null;
     }

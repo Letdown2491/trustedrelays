@@ -8,14 +8,15 @@ import { buildAssertion } from './assertion.js';
 import { resolveOperator } from './operator-resolver.js';
 import { computeQualityScore } from './quality-scorer.js';
 import { computeAccessibilityScore } from './accessibility-scorer.js';
-import { classifyPolicy } from './policy-classifier.js';
 import { resolveJurisdiction } from './jurisdiction.js';
 import { MonitorIngestor, discoverMonitors } from './ingestor.js';
-import { ReportIngestor, queryRelayReports } from './report-ingestor.js';
-import { AssertionPublisher, formatPublishResult } from './assertion-publisher.js';
+import { ReportIngestor } from './report-ingestor.js';
+import { AssertionPublisher } from './assertion-publisher.js';
 import { normalizePrivateKey } from './key-utils.js';
 import { startApiServer } from './api.js';
 import { RelayPool } from './relay-pool.js';
+import { getTrustScore } from './wot-client.js';
+import type { OperatorResolution } from './types.js';
 
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
@@ -54,6 +55,7 @@ export class RelayTrustService {
   private running = false;
   private cycleTimer: ReturnType<typeof setInterval> | null = null;
   private lastCleanupAt: number = 0;
+  private lastCheckpointAt: number = 0;
 
   private stats: ServiceStats = {
     startedAt: 0,
@@ -95,35 +97,41 @@ export class RelayTrustService {
     this.log('info', 'Starting Relay Trust Service');
     this.log('info', '='.repeat(60));
 
-    // Get private key (accepts hex or nsec format)
-    const rawKey = this.config.provider.privateKey || process.env.NOSTR_PRIVATE_KEY;
-    if (!rawKey) {
-      throw new Error('No private key configured');
-    }
-    const privateKey = normalizePrivateKey(rawKey);
+    // Initialize publisher only if publishing is enabled
+    if (this.config.publishing.enabled) {
+      // Get private key (accepts hex or nsec format)
+      const rawKey = this.config.provider.privateKey || process.env.NOSTR_PRIVATE_KEY;
+      if (!rawKey) {
+        throw new Error('No private key configured');
+      }
+      const privateKey = normalizePrivateKey(rawKey);
 
-    // Initialize connection pool if enabled
-    if (this.config.publishing.useConnectionPool) {
-      this.log('info', 'Initializing persistent connection pool...');
-      this.publishPool = new RelayPool(this.config.publishing.relays, {
-        verbose: this.logLevel === 'debug',
+      // Initialize connection pool if enabled
+      if (this.config.publishing.useConnectionPool) {
+        this.log('info', 'Initializing persistent connection pool...');
+        this.publishPool = new RelayPool(this.config.publishing.relays, {
+          verbose: this.logLevel === 'debug',
+        });
+        await this.publishPool.connect();
+        this.log('info', `Connection pool ready: ${this.publishPool.getConnectedCount()}/${this.config.publishing.relays.length} relays connected`);
+      }
+
+      // Initialize publisher
+      this.publisher = new AssertionPublisher({
+        privateKey,
+        publishRelays: this.config.publishing.relays,
+        materialChangeThreshold: this.config.publishing.materialChangeThreshold,
+        db: this.db,
+        pool: this.publishPool ?? undefined,
       });
-      await this.publishPool.connect();
-      this.log('info', `Connection pool ready: ${this.publishPool.getConnectedCount()}/${this.config.publishing.relays.length} relays connected`);
+
+      this.log('info', `Publisher pubkey: ${this.publisher.getPublicKey()}`);
+      this.log('info', `Publish relays: ${this.config.publishing.relays.join(', ')}`);
+    } else {
+      this.log('info', 'Publishing disabled - running in probe-only mode');
     }
 
-    // Initialize publisher
-    this.publisher = new AssertionPublisher({
-      privateKey,
-      publishRelays: this.config.publishing.relays,
-      materialChangeThreshold: this.config.publishing.materialChangeThreshold,
-      db: this.db,
-      pool: this.publishPool ?? undefined,
-    });
-
-    this.log('info', `Publisher pubkey: ${this.publisher.getPublicKey()}`);
     this.log('info', `Target relays: ${this.config.targets.relays.length}`);
-    this.log('info', `Publish relays: ${this.config.publishing.relays.join(', ')}`);
 
     // Start API server early so dashboard is available during startup
     if (this.config.api?.enabled) {
@@ -316,23 +324,35 @@ export class RelayTrustService {
   }
 
   /**
-   * Run a complete cycle: probe all relays, then publish assertions
+   * Run a complete cycle: probe all relays, then publish assertions (if enabled)
    */
   private async runCycle(): Promise<void> {
-    this.log('info', 'Starting cycle: probe → publish');
+    const mode = this.config.publishing.enabled ? 'probe → publish' : 'probe only';
+    this.log('info', `Starting cycle: ${mode}`);
 
     // Probe all relays
     this.log('info', 'Probing relays...');
     await this.probeAllRelays();
 
-    // Publish assertions for relays with material changes
-    this.log('info', 'Publishing assertions...');
-    await this.publishAllAssertions();
+    // Refresh stale WoT scores (runs regardless of publishing mode)
+    await this.refreshStaleWotScoresStandalone();
+
+    // Publish assertions for relays with material changes (if publishing enabled)
+    if (this.config.publishing.enabled) {
+      this.log('info', 'Publishing assertions...');
+      await this.publishAllAssertions();
+    }
 
     // Run database cleanup once per day
     const oneDayMs = 24 * 60 * 60 * 1000;
     if (Date.now() - this.lastCleanupAt > oneDayMs) {
       await this.cleanupOldData();
+    }
+
+    // Checkpoint WAL every hour to prevent stale WAL issues on restart
+    const oneHourMs = 60 * 60 * 1000;
+    if (Date.now() - this.lastCheckpointAt > oneHourMs) {
+      await this.checkpointDatabase();
     }
 
     this.log('info', 'Cycle complete');
@@ -356,8 +376,25 @@ export class RelayTrustService {
       }
 
       this.lastCleanupAt = Date.now();
+
+      // Checkpoint after cleanup to flush deleted data
+      await this.checkpointDatabase();
     } catch (err) {
       this.log('warn', `Database cleanup failed: ${err}`);
+    }
+  }
+
+  /**
+   * Checkpoint the database WAL to prevent stale WAL issues
+   * DuckDB can hang on startup if there's a large uncommitted WAL file
+   */
+  private async checkpointDatabase(): Promise<void> {
+    try {
+      await this.db.checkpoint();
+      this.lastCheckpointAt = Date.now();
+      this.log('debug', 'Database checkpoint completed');
+    } catch (err) {
+      this.log('warn', `Database checkpoint failed: ${err}`);
     }
   }
 
@@ -506,6 +543,8 @@ export class RelayTrustService {
       this.db.getAllReportStats(90),
     ]);
 
+    // Note: WoT scores are refreshed in runCycle() before this method is called
+
     let publishCount = 0;
     let skipCount = 0;
 
@@ -559,6 +598,10 @@ export class RelayTrustService {
           avgRttOpen: nip66Stats.avgRttOpen,
           avgRttRead: nip66Stats.avgRttRead,
           avgRttWrite: nip66Stats.avgRttWrite,
+          latencyScore: nip66Stats.latencyScore,
+          connectPercentile: nip66Stats.connectPercentile,
+          readPercentile: nip66Stats.readPercentile,
+          qualifyingMonitorCount: nip66Stats.qualifyingMonitorCount,
           firstSeen: nip66Stats.firstSeen,
           lastSeen: nip66Stats.lastSeen,
         } : null;
@@ -647,6 +690,77 @@ export class RelayTrustService {
     this.log('info', `Relays tracked: ${this.stats.relaysTracked}`);
     this.log('info', `Probes: ${this.stats.probeCount} (${this.stats.probeErrorCount} errors)`);
     this.log('info', `Published: ${this.stats.publishCount} (${this.stats.publishSkipCount} skipped)`);
+  }
+
+  /**
+   * Standalone WoT refresh (called from runCycle, doesn't need in-memory cache)
+   * Uses parallel lookups with concurrency limit for efficiency
+   */
+  private async refreshStaleWotScoresStandalone(): Promise<void> {
+    const staleOperators = await this.db.getOperatorsNeedingWotRefresh(1); // 1 day max age
+    if (staleOperators.length === 0) {
+      this.log('debug', 'No stale WoT scores to refresh');
+      return;
+    }
+
+    // Dedupe by operator pubkey to avoid redundant lookups
+    const uniquePubkeys = new Map<string, OperatorResolution[]>();
+    for (const op of staleOperators) {
+      if (!op.operatorPubkey) continue;
+      const existing = uniquePubkeys.get(op.operatorPubkey) || [];
+      existing.push(op);
+      uniquePubkeys.set(op.operatorPubkey, existing);
+    }
+
+    const pubkeyList = Array.from(uniquePubkeys.entries());
+    this.log('info', `Refreshing WoT scores for ${pubkeyList.length} unique operators...`);
+
+    let refreshed = 0;
+    let failed = 0;
+    const concurrency = 20; // Process 20 pubkeys in parallel
+
+    // Process in batches for parallel lookups
+    for (let i = 0; i < pubkeyList.length; i += concurrency) {
+      const batch = pubkeyList.slice(i, i + concurrency);
+
+      const results = await Promise.allSettled(
+        batch.map(async ([pubkey, resolutions]) => {
+          const trustScore = await getTrustScore(pubkey, { timeout: 10000 });
+
+          // Update all resolutions for this operator
+          for (const resolution of resolutions) {
+            if (trustScore) {
+              resolution.trustScore = trustScore.score;
+              resolution.trustConfidence = trustScore.confidence;
+              resolution.trustProviderCount = trustScore.providers.length;
+            }
+            // Store with updated wot_updated_at timestamp (even if no score found)
+            await this.db.storeOperatorResolution(resolution);
+          }
+          return true;
+        })
+      );
+
+      for (const result of results) {
+        if (result.status === 'fulfilled') {
+          refreshed++;
+        } else {
+          failed++;
+        }
+      }
+
+      // Progress logging every 100 operators
+      if ((i + concurrency) % 100 < concurrency && i + concurrency < pubkeyList.length) {
+        this.log('info', `WoT refresh progress: ${Math.min(i + concurrency, pubkeyList.length)}/${pubkeyList.length}`);
+      }
+
+      // Small delay between batches to be nice to NIP-85 relays
+      if (i + concurrency < pubkeyList.length) {
+        await sleep(500);
+      }
+    }
+
+    this.log('info', `WoT refresh complete: ${refreshed} updated, ${failed} failed`);
   }
 }
 

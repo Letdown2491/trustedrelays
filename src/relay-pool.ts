@@ -123,7 +123,7 @@ class RelayConnection {
           this.lastError = null; // Clear after use
 
           // Reject all pending events
-          for (const [eventId, pending] of this.pendingEvents) {
+          for (const [_eventId, pending] of this.pendingEvents) {
             clearTimeout(pending.timeout);
             pending.resolve({
               relay: this.url,
@@ -215,7 +215,7 @@ class RelayConnection {
     }
 
     // Reject all pending events
-    for (const [eventId, pending] of this.pendingEvents) {
+    for (const [_eventId, pending] of this.pendingEvents) {
       clearTimeout(pending.timeout);
       pending.resolve({
         relay: this.url,
@@ -323,11 +323,9 @@ export interface PoolPublishResult {
  */
 export class RelayPool {
   private connections: Map<string, RelayConnection> = new Map();
-  private relayUrls: string[];
   private verbose: boolean;
 
   constructor(relayUrls: string[], options?: { verbose?: boolean }) {
-    this.relayUrls = relayUrls;
     this.verbose = options?.verbose ?? false;
 
     for (const url of relayUrls) {

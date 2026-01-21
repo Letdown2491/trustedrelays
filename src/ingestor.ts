@@ -245,7 +245,7 @@ export class MonitorIngestor {
     }
   }
 
-  private async handleEvent(relayUrl: string, event: Event): Promise<void> {
+  private async handleEvent(_relayUrl: string, event: Event): Promise<void> {
     // Verify event signature
     if (!verifyEvent(event)) {
       if (this.verbose) console.warn(`Invalid event signature: ${event.id}`);

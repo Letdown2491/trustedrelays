@@ -161,13 +161,17 @@ CREATE TABLE trusted_monitors (
   event_count INTEGER DEFAULT 0
 );
 
--- Operator pubkey mappings
+-- Operator pubkey mappings (with WoT scores from NIP-85)
 CREATE TABLE operator_mappings (
   relay_url TEXT PRIMARY KEY,
   operator_pubkey TEXT,
   verification_method TEXT,
   verified_at INTEGER,
-  confidence INTEGER
+  confidence INTEGER,
+  wot_score INTEGER,           -- NIP-85 trust score (0-100)
+  wot_confidence TEXT,         -- 'low', 'medium', 'high'
+  wot_provider_count INTEGER,  -- Number of assertion providers
+  wot_updated_at INTEGER       -- Last WoT refresh timestamp
 );
 
 -- User reports (kind 1985)
@@ -376,6 +380,15 @@ Multi-method verification with confidence scores. When multiple independent sour
 | All three | 95% | Maximum confidence without cryptographic proof |
 
 When sources disagree (different pubkeys found), the system uses the highest-confidence source but flags the disagreement for review.
+
+### WoT Score Refresh
+
+Operator WoT scores are fetched from NIP-85 assertion providers and cached in the database. Scores are refreshed daily during the probe cycle:
+
+- Queries relays: `wss://nip85.nostr.band`, `wss://relay.damus.io`, `wss://nos.lol`
+- Parallel lookups with concurrency limit (20) to avoid rate limiting
+- Scores older than 24 hours are refreshed
+- Results cached in `operator_mappings` table
 
 ## Report Processing
 

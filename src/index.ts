@@ -1,18 +1,17 @@
 import { mkdirSync, existsSync } from 'fs';
 import { probeRelay } from './prober.js';
-import { computeReliabilityScore, aggregateReliabilityScores, computeCombinedReliabilityScore } from './scorer.js';
+import { computeCombinedReliabilityScore } from './scorer.js';
 import { buildAssertion, assertionToEvent, formatAssertion } from './assertion.js';
 import { DataStore } from './database.js';
 import { MonitorIngestor, discoverMonitors } from './ingestor.js';
-import { resolveOperator, formatOperatorResolution } from './operator-resolver.js';
-import { ReportIngestor, queryRelayReports, formatReport } from './report-ingestor.js';
+import { resolveOperator } from './operator-resolver.js';
+import { ReportIngestor, queryRelayReports } from './report-ingestor.js';
 import { computeQualityScore, formatQualityScore } from './quality-scorer.js';
 import { computeAccessibilityScore, formatAccessibilityScore } from './accessibility-scorer.js';
 import { AssertionPublisher, formatPublishResult, generatePrivateKey } from './assertion-publisher.js';
-import { classifyPolicy, describePolicyClassification } from './policy-classifier.js';
 import { resolveJurisdiction, formatJurisdiction, getCountryFlag } from './jurisdiction.js';
 import { queryRelayAppeals, formatAppeal } from './appeal-processor.js';
-import { loadConfig, validateConfig, generateSampleConfig, DEFAULT_CONFIG } from './config.js';
+import { loadConfig, validateConfig, generateSampleConfig } from './config.js';
 import { RelayTrustService } from './service.js';
 import { startApiServer } from './api.js';
 import { normalizePrivateKey, isValidPrivateKey } from './key-utils.js';
@@ -183,9 +182,6 @@ async function probeCommand(relayUrls: string[], options: { store?: boolean } = 
 
       console.log('\n--- Accessibility Score ---');
       console.log(formatAccessibilityScore(accessibilityScore));
-
-      // Policy classification
-      const policyClassification = classifyPolicy(probe.nip11, probe.relayType, reports);
 
       // Build assertion with all Phase 4 data
       const assertion = buildAssertion(url, probes, score, operatorResolution, qualityScore, accessibilityScore, {
@@ -553,7 +549,7 @@ async function publishCommand(relayUrls: string[], options: { force?: boolean } 
   const publisher = new AssertionPublisher({
     privateKey,
     publishRelays,
-    materialChangeThreshold: 5,
+    materialChangeThreshold: 3,
     db,
   });
 
@@ -603,7 +599,7 @@ async function publishCommand(relayUrls: string[], options: { force?: boolean } 
       const accessibilityScore = computeAccessibilityScore(probe.nip11, jurisdiction?.countryCode);
 
       // Build assertion
-      const assertion = buildAssertion(url, probes.length > 0 ? probes : [probe], score, operatorResolution, qualityScore, accessibilityScore, { jurisdiction });
+      const assertion = buildAssertion(url, probes.length > 0 ? probes : [probe], score, operatorResolution, qualityScore, accessibilityScore, { reports, jurisdiction });
 
       console.log('\n--- Assertion ---');
       console.log(formatAssertion(assertion));
@@ -802,7 +798,7 @@ async function jurisdictionCommand(relayUrls: string[], options: { refresh?: boo
   }
 }
 
-async function appealsCommand(relayUrls: string[], options: { query?: boolean } = {}) {
+async function appealsCommand(relayUrls: string[]) {
   const db = new DataStore(DB_PATH);
 
   try {
