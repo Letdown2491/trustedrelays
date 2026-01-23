@@ -25,6 +25,13 @@ const BARRIER_PENALTIES = {
   MAX_POW_PENALTY: 15,    // Maximum PoW difficulty penalty
 } as const;
 
+/**
+ * Diminishing returns multipliers for stacking barriers.
+ * First barrier applies at full value, subsequent ones have reduced impact.
+ * This prevents unrealistic scores when multiple barriers overlap.
+ */
+const BARRIER_DIMINISHING_RETURNS = [1.0, 0.5, 0.3, 0.2] as const;
+
 // =============================================================================
 // Helper Functions
 // =============================================================================
@@ -105,11 +112,14 @@ const SURVEILLANCE_SCORES: Record<EyesAlliance, number> = {
 /**
  * Score access barriers from NIP-11 document
  *
- * Evaluates barriers to entry:
- * - auth_required: Significant barrier (-30)
+ * Evaluates barriers to entry with diminishing returns:
  * - payment_required: Major barrier (-40)
- * - restricted_writes: Minor barrier (-10)
+ * - auth_required: Significant barrier (-30)
  * - min_pow_difficulty: Minor barrier (-5 to -15)
+ * - restricted_writes: Minor barrier (-10)
+ *
+ * Uses diminishing returns so stacked barriers don't over-penalize:
+ * First barrier at 100%, second at 50%, third at 30%, rest at 20%
  *
  * Returns 0-100 (100 = fully open, 0 = heavily restricted)
  */
@@ -118,34 +128,44 @@ export function scoreAccessBarriers(nip11?: NIP11Info): number {
     return 70; // Unknown - assume somewhat open
   }
 
-  let score = 100;
+  // Collect all applicable penalties
+  const penalties: number[] = [];
 
   if (nip11.limitation) {
     const lim = nip11.limitation;
 
-    // Authentication required is a significant barrier
-    if (lim.auth_required) {
-      score -= BARRIER_PENALTIES.AUTH_REQUIRED;
-    }
-
     // Payment required is the biggest barrier
     if (lim.payment_required) {
-      score -= BARRIER_PENALTIES.PAYMENT_REQUIRED;
+      penalties.push(BARRIER_PENALTIES.PAYMENT_REQUIRED);
+    }
+
+    // Authentication required is a significant barrier
+    if (lim.auth_required) {
+      penalties.push(BARRIER_PENALTIES.AUTH_REQUIRED);
+    }
+
+    // PoW requirement (scaled by difficulty)
+    if (lim.min_pow_difficulty !== undefined && lim.min_pow_difficulty > 0) {
+      const powPenalty = Math.min(BARRIER_PENALTIES.MAX_POW_PENALTY, lim.min_pow_difficulty);
+      penalties.push(powPenalty);
     }
 
     // Restricted writes is a minor barrier
     if (lim.restricted_writes) {
-      score -= BARRIER_PENALTIES.RESTRICTED_WRITES;
-    }
-
-    // PoW requirement is a minor barrier (scaled by difficulty)
-    if (lim.min_pow_difficulty !== undefined && lim.min_pow_difficulty > 0) {
-      const powPenalty = Math.min(BARRIER_PENALTIES.MAX_POW_PENALTY, lim.min_pow_difficulty);
-      score -= powPenalty;
+      penalties.push(BARRIER_PENALTIES.RESTRICTED_WRITES);
     }
   }
 
-  return clampScore(score);
+  // Apply diminishing returns: sort descending, apply multipliers
+  penalties.sort((a, b) => b - a);
+
+  let totalPenalty = 0;
+  for (let i = 0; i < penalties.length; i++) {
+    const multiplier = BARRIER_DIMINISHING_RETURNS[Math.min(i, BARRIER_DIMINISHING_RETURNS.length - 1)];
+    totalPenalty += penalties[i] * multiplier;
+  }
+
+  return clampScore(100 - totalPenalty);
 }
 
 /**

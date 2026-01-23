@@ -1246,6 +1246,31 @@ tr:hover .actions { opacity: 1; }
   border-color: #7c5ce0;
 }
 
+/* Favorites */
+.favorite-star {
+  color: var(--yellow);
+  font-size: 14px;
+  margin-left: 6px;
+}
+.btn-favorite {
+  font-size: 16px;
+  color: var(--text-muted);
+  transition: color 0.15s, transform 0.15s;
+}
+.btn-favorite:hover {
+  color: var(--yellow);
+  transform: scale(1.1);
+}
+.btn-favorite.active {
+  color: var(--yellow);
+}
+.favorites-separator td {
+  height: 1px;
+  padding: 0;
+  background: var(--border);
+  border: none;
+}
+
 /* Mobile filter drawer - full screen */
 @media (max-width: 480px) {
   .filter-drawer {

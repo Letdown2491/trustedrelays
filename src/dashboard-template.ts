@@ -2,6 +2,10 @@
  * Dashboard HTML template
  * Extracted from api.ts for better code organization
  */
+
+// Cache-busting timestamp - set when server starts
+const BUILD_TIME = Date.now();
+
 export const DASHBOARD_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -27,9 +31,9 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
   <meta name="twitter:image" content="https://trustedrelays.xyz/og-image.svg">
 
   <link rel="canonical" href="https://trustedrelays.xyz">
-  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=${BUILD_TIME}">
   <title>Trusted Relays - Nostr Relay Trust Scores</title>
-  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/styles.css?v=${BUILD_TIME}">
 </head>
 <body>
   <div class="header">
@@ -170,12 +174,13 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
           <div class="modal-subtitle" id="modal-subtitle"></div>
         </div>
         <div class="modal-actions">
-          <button class="btn" id="modal-copy">Copy<span class="hide-mobile"> URL</span></button>
+          <button class="btn btn-icon btn-favorite" id="modal-favorite" title="Add to favorites">☆</button>
+          <button class="btn" id="modal-copy">Copy</button>
           <div class="dropdown">
             <button class="dropdown-btn" id="modal-open-dropdown">Open ▾</button>
             <div class="dropdown-content" id="open-dropdown-content">
               <button class="dropdown-item" id="modal-open-relay">Open relay</button>
-              <a class="dropdown-item" id="modal-nostr-watch" href="#" target="_blank" rel="noopener">View on nostr.watch</a>
+              <a class="dropdown-item" id="modal-nostr-watch" href="#" target="_blank" rel="noopener">Open nostr.watch</a>
             </div>
           </div>
           <button class="modal-close" onclick="closeModal()">×</button>
@@ -296,6 +301,77 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
     // Pagination
     const PAGE_SIZE = 50;
     let currentPage = 1;
+
+    // Favorites
+    const FAVORITES_KEY = 'trustedrelays_favorites';
+    let favorites = new Set(JSON.parse(localStorage.getItem(FAVORITES_KEY) || '[]'));
+
+    function saveFavorites() {
+      localStorage.setItem(FAVORITES_KEY, JSON.stringify([...favorites]));
+    }
+
+    function toggleFavorite(url) {
+      if (favorites.has(url)) {
+        favorites.delete(url);
+      } else {
+        favorites.add(url);
+      }
+      saveFavorites();
+      invalidateCache();
+      renderTable();
+      return favorites.has(url);
+    }
+
+    function isFavorite(url) {
+      return favorites.has(url);
+    }
+
+    // Compute aggregate stats for comparative insights
+    function computeAggregateStats() {
+      const stats = {
+        reliability: { values: [], byPolicy: {} },
+        quality: { values: [], byPolicy: {} },
+        count: allRelays.length
+      };
+
+      for (const r of allRelays) {
+        if (r.reliability != null) {
+          stats.reliability.values.push(r.reliability);
+          const p = r.policy || 'open';
+          if (!stats.reliability.byPolicy[p]) stats.reliability.byPolicy[p] = [];
+          stats.reliability.byPolicy[p].push(r.reliability);
+        }
+        if (r.quality != null) {
+          stats.quality.values.push(r.quality);
+          const p = r.policy || 'open';
+          if (!stats.quality.byPolicy[p]) stats.quality.byPolicy[p] = [];
+          stats.quality.byPolicy[p].push(r.quality);
+        }
+      }
+
+      // Sort for percentile calculations
+      stats.reliability.values.sort((a, b) => a - b);
+      stats.quality.values.sort((a, b) => a - b);
+      for (const p in stats.reliability.byPolicy) {
+        stats.reliability.byPolicy[p].sort((a, b) => a - b);
+      }
+      for (const p in stats.quality.byPolicy) {
+        stats.quality.byPolicy[p].sort((a, b) => a - b);
+      }
+
+      return stats;
+    }
+
+    // Get percentile rank (0-100) for a value in a sorted array
+    function getPercentile(value, sortedArray) {
+      if (!sortedArray || sortedArray.length === 0) return 50;
+      let count = 0;
+      for (const v of sortedArray) {
+        if (v < value) count++;
+        else break;
+      }
+      return Math.round((count / sortedArray.length) * 100);
+    }
 
     // URL state management
     function readUrlState() {
@@ -455,7 +531,8 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
         document.getElementById('filter-secure').value,
         selectedNips.sort().join(','),
         sortCol,
-        sortAsc
+        sortAsc,
+        [...favorites].sort().join(',')
       ].join('|');
     }
 
@@ -493,6 +570,13 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
 
       // Sort in place for cache
       cachedFiltered.sort((a, b) => {
+        // Favorites always bubble to top
+        const aFav = isFavorite(a.url);
+        const bFav = isFavorite(b.url);
+        if (aFav && !bFav) return -1;
+        if (!aFav && bFav) return 1;
+
+        // Then sort by selected column
         let av = a[sortCol], bv = b[sortCol];
         if (sortCol === 'name') { av = av || a.url; bv = bv || b.url; }
         if (av == null) av = sortAsc ? Infinity : -Infinity;
@@ -525,6 +609,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       const accessLevelText = r.accessLevel === 'open' ? '' : r.accessLevel === 'auth_required' ? ' (auth required)' : r.accessLevel === 'payment_required' ? ' (payment required)' : r.accessLevel === 'restricted' ? ' (restricted)' : '';
       const statusTitle = r.isOnline ? 'Online' + accessLevelText + ' - Relay is currently reachable' : 'Offline - Relay is currently unreachable';
       const statusDot = '<span class="status-dot ' + (r.isOnline ? 'online' : 'offline') + '" title="' + statusTitle + '"></span>';
+      const favoriteStar = isFavorite(r.url) ? '<span class="favorite-star" title="Favorite">★</span>' : '';
       const descLine = r.name ? '<div class="relay-desc">' + escHtml(r.name.length > 40 ? r.name.slice(0,40) + '…' : r.name) + '</div>' : '';
 
       // Trend display with magnitude and dynamic period
@@ -543,7 +628,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
 
       return '<tr class="clickable" data-url="' + escAttr(r.url) + '" title="Click for details">' +
         '<td>' +
-          '<div class="relay-url-primary">' + statusDot + insecureIcon + escHtml(displayUrl) + '</div>' +
+          '<div class="relay-url-primary">' + statusDot + insecureIcon + escHtml(displayUrl) + favoriteStar + '</div>' +
           descLine +
         '</td>' +
         '<td class="hide-mobile">' + (r.policy ? '<span class="tag tag-' + r.policy + '" title="' + policyTitle + '">' + r.policy + '</span>' : '<span class="score-val dim">-</span>') + '</td>' +
@@ -577,8 +662,20 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
         return;
       }
 
-      // Render rows + sentinel for infinite scroll
-      let html = displayData.map(renderRow).join('');
+      // Find where favorites end
+      const lastFavIndex = displayData.findIndex((r, i) =>
+        isFavorite(r.url) && (i === displayData.length - 1 || !isFavorite(displayData[i + 1].url))
+      );
+      const hasFavorites = lastFavIndex >= 0 && lastFavIndex < displayData.length - 1;
+
+      // Render rows with separator after favorites
+      let html = displayData.map((r, i) => {
+        let row = renderRow(r);
+        if (hasFavorites && i === lastFavIndex) {
+          row += '<tr class="favorites-separator"><td colspan="9"></td></tr>';
+        }
+        return row;
+      }).join('');
       if (hasMore) {
         html += '<tr id="scroll-sentinel"><td colspan="9"></td></tr>';
       }
@@ -624,117 +721,178 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
     function escAttr(s) { return s.replace(/'/g, "\\\\'").replace(/"/g, '&quot;'); }
 
     // Generate natural language insights about a relay
-    function generateInsights(d, scores) {
+    function generateInsights(d, scores, aggregates) {
       const insights = [];
       const nips = d.nip11?.supported_nips || [];
       const lim = d.nip11?.limitation || {};
-      const hasPaymentsUrl = !!d.nip11?.payments_url;
       const paymentRequired = lim.payment_required;
       const authRequired = lim.auth_required;
       const policy = d.policy?.classification || 'open';
       const retention = d.nip11?.retention;
-      const relayCountries = d.nip11?.relay_countries;
+      const components = scores.components || {};
+      const probeCount = d.observations?.probeCount || 0;
+      const hasSufficientData = probeCount >= 10;
 
-      // Determine NIP specializations
+      // Determine use-case specializations
       const isNip46 = nips.includes(46) || d.relayType === 'nip46';
       const isNip29 = nips.includes(29);
       const isNip90 = nips.includes(90);
       const isNip96 = nips.includes(96);
       const isNip23 = nips.includes(23);
 
-      // Primary framing based on Policy classification
+      // Get percentiles for comparative context
+      const reliabilityPct = aggregates ? getPercentile(scores.reliability, aggregates.reliability.values) : 50;
+      const qualityPct = aggregates ? getPercentile(scores.quality, aggregates.quality.values) : 50;
+      const policyRelays = aggregates?.reliability.byPolicy[policy] || [];
+      const reliabilityInPolicyPct = getPercentile(scores.reliability, policyRelays);
+
+      // Helper for retention days
+      const getRetentionDays = () => {
+        if (!retention || retention.length === 0) return null;
+        const general = retention.find(r => !r.kinds || r.kinds.length === 0);
+        if (general && general.time != null) return Math.round(general.time / 86400);
+        return null;
+      };
+      const retentionDays = getRetentionDays();
+
+      // 1. PRIMARY FRAMING - What is this relay good for?
       if (policy === 'specialized') {
-        // Specialized relays - describe the specific purpose
         if (isNip46) {
-          insights.push('A specialized relay for remote signing services. Designed for secure key management and signing requests. Best used with remote signer applications.');
+          insights.push('Designed for remote signing apps like Amber or Signet. Not for general-purpose messaging.');
         } else if (isNip29) {
-          insights.push('A specialized relay for group chats. Supports group creation and moderated discussions.');
+          insights.push('Built for group chats and communities. Use with clients that support group messaging.');
         } else if (isNip90) {
-          insights.push('A specialized relay for data vending and job requests. Used for decentralized computation and AI services.');
+          insights.push('Handles data vending and AI/compute job requests. Not for typical social posting.');
         } else if (isNip96) {
-          insights.push('A specialized relay for media hosting and file uploads.');
+          insights.push('Designed for media hosting and file uploads.');
         } else {
-          insights.push('A specialized relay designed for specific use cases rather than general messaging.');
+          insights.push('A specialized relay for specific use cases rather than general messaging.');
         }
       } else if (policy === 'curated') {
-        // Curated relays - emphasize selective access
         if (paymentRequired) {
-          insights.push('A curated relay with paid access. Typically offers better spam filtering and message retention than free alternatives.');
+          insights.push('A curated relay with paid access, which typically means less spam.');
         } else {
-          insights.push('A curated relay with selective access. Membership may require approval or invitation.');
+          insights.push('A curated relay with selective membership. May require approval or invitation.');
         }
       } else if (policy === 'moderated') {
-        // Moderated relays - describe the moderation model
         if (authRequired) {
-          insights.push('A moderated relay that requires authentication to write. Access may be limited to specific users or communities.');
+          insights.push('Requires authentication to write. Check with the operator for access.');
         } else {
-          insights.push('A moderated relay with some access restrictions. May have specific content or user policies.');
+          insights.push('A moderated relay with content or user policies in place.');
         }
       } else {
-        // Open relays - general purpose
-        const reliability = scores.reliability >= 80 ? 'reliable ' : '';
-        insights.push('An open ' + reliability + 'relay for general use. Accepts events from any user without restrictions.');
-      }
-
-      // Restricted writes (but not specialized/curated/moderated which already cover this)
-      if (lim.restricted_writes && policy === 'open') {
-        insights.push('Write access may be limited to certain users.');
-      }
-
-      // Content capabilities
-      if (isNip23 && policy !== 'specialized') {
-        insights.push('Supports long-form content and articles.');
-      }
-
-      // Large message support
-      const maxMsg = lim.max_message_length || lim.max_content_length;
-      if (maxMsg && maxMsg >= 100000) {
-        const sizeKb = Math.round(maxMsg / 1024);
-        insights.push('Supports large messages up to ' + sizeKb + ' KB.');
-      }
-
-      // Geographic restrictions
-      if (relayCountries && relayCountries.length > 0) {
-        if (relayCountries.length <= 3) {
-          insights.push('Geographic access limited to: ' + relayCountries.join(', ') + '.');
+        // Open relays
+        if (isNip23 && retentionDays && retentionDays >= 90) {
+          insights.push('Suitable for long-form articles and blogs. Good retention for archival.');
         } else {
-          insights.push('Geographic access limited to ' + relayCountries.length + ' countries.');
+          insights.push('A general-purpose relay for everyday use.');
         }
       }
 
-      // Data retention warning
-      if (retention && retention.length > 0) {
-        const generalRetention = retention.find(r => !r.kinds || r.kinds.length === 0);
-        if (generalRetention && generalRetention.time !== null && generalRetention.time !== undefined) {
-          const days = Math.round(generalRetention.time / 86400);
-          if (days > 0 && days < 365) {
-            insights.push('Events may be deleted after ' + days + ' days.');
+      // 2. GUIDANCE - How should I use this relay?
+      if (policy !== 'specialized') {
+        const highReliability = scores.reliability >= 75;
+        const trustedOperator = d.operator?.trustScore >= 70;
+        const lowReliability = scores.reliability < 50 && hasSufficientData;
+
+        if (highReliability && trustedOperator) {
+          insights.push('Good candidate for a primary relay.');
+        } else if (highReliability && !trustedOperator) {
+          insights.push('Reliable, though the operator is not yet well-established.');
+        } else if (lowReliability) {
+          insights.push('Better suited as a backup relay.');
+        }
+
+        // Retention guidance (only if notably short)
+        if (retentionDays && retentionDays < 30 && retentionDays > 0) {
+          insights.push('Better for everyday posts than long-term archival.');
+        }
+      }
+
+      // 3. COMPARATIVE CONTEXT - How does it compare?
+      if (hasSufficientData && aggregates && policy !== 'specialized') {
+        if (reliabilityPct >= 75) {
+          insights.push('More reliable than most relays.');
+        } else if (reliabilityPct <= 25) {
+          // Covered by guidance above
+        } else if (reliabilityInPolicyPct >= 75 && policy !== 'open') {
+          insights.push('Above average reliability for ' + policy + ' relays.');
+        }
+
+        if (qualityPct >= 75 && policy === 'open') {
+          insights.push('Higher quality than most free relays.');
+        }
+      }
+
+      // 4. SCORE EXPLANATIONS - Why is a score low?
+      if (hasSufficientData) {
+        // Reliability explanations
+        if (scores.reliability < 50) {
+          if (components.uptimeScore < 50) {
+            insights.push('Reliability affected by connectivity issues.');
+          } else if (components.consistencyScore < 40) {
+            insights.push('Response times have been inconsistent.');
+          }
+        }
+
+        // Quality explanations
+        if (scores.quality < 50) {
+          if (components.policyScore < 40) {
+            insights.push('Quality score reflects minimal documentation.');
+          } else if (components.securityScore < 50) {
+            insights.push('Quality score affected by lack of encryption.');
           }
         }
       }
 
-      // Add payment info if not already covered
-      if (hasPaymentsUrl && !paymentRequired) {
-        insights.push('Accepts optional payments for additional features or higher limits.');
+      // 5. TREND CONTEXT - Is it improving or declining?
+      if (d.trend && d.trend.change !== undefined && hasSufficientData) {
+        const change = d.trend.change;
+        if (change > 5) {
+          insights.push('Reliability has been improving recently.');
+        } else if (change < -5) {
+          insights.push('Reliability has declined recently. May be worth monitoring.');
+        } else if (scores.reliability >= 70) {
+          insights.push('Consistently reliable.');
+        }
       }
 
-      // Operator trust insight
+      // 6. OPERATOR INSIGHTS - Who runs this relay?
       if (d.operator?.pubkey) {
-        const wotScore = d.operator.trustScore;
-        if (wotScore >= 70) {
-          insights.push('Operated by a highly trusted entity.');
-        } else if (wotScore >= 50) {
-          insights.push('Operated by a verified entity with good reputation.');
+        const trustScore = d.operator.trustScore;
+        const providerCount = d.operator.trustProviderCount || 0;
+        const verificationMethod = d.operator.verificationMethod;
+
+        if (trustScore >= 70) {
+          if (providerCount >= 3) {
+            insights.push('Run by a well-established operator with strong reputation across multiple sources.');
+          } else {
+            insights.push('Run by a trusted operator.');
+          }
+        } else if (trustScore >= 50) {
+          insights.push('Operator has a reasonable reputation.');
+        } else if (trustScore > 0 && trustScore < 50) {
+          insights.push('Operator has limited reputation in the network.');
+        } else if (trustScore === 0 || trustScore === undefined) {
+          if (verificationMethod) {
+            insights.push('Operator identity verified but no reputation data available yet.');
+          }
         }
       } else {
-        if (d.observations?.probeCount < 10) {
-          insights.push('Recently discovered with limited track record.');
+        // No operator identified
+        if (probeCount < 10) {
+          insights.push('Limited track record so far. Consider pairing with a more established relay.');
+        } else if (scores.reliability < 60) {
+          insights.push('Unknown operator and middling reliability. Worth observing before relying on it.');
+        } else if (hasSufficientData) {
+          insights.push('Operator not identified.');
         }
       }
 
-      // Reliability concern
-      if (scores.reliability < 50 && d.observations?.probeCount >= 10) {
-        insights.push('Reliability concerns observed. Frequent downtime or connectivity issues detected.');
+      // 7. SOFT WARNINGS - What should I be cautious about?
+      // Restricted writes on open relay
+      if (lim.restricted_writes && policy === 'open') {
+        insights.push('May have additional access requirements despite being listed as open.');
       }
 
       return insights.join(' ');
@@ -784,7 +942,8 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       document.getElementById('modal-subtitle').textContent = r?.name || '';
       // Update nostr.watch link
       const relayHost = url.replace('wss://', '').replace('ws://', '').split('/')[0];
-      document.getElementById('modal-nostr-watch').href = 'https://nostr.watch/relay/' + encodeURIComponent(relayHost);
+      const protocol = isSecure ? 'wss' : 'ws';
+      document.getElementById('modal-nostr-watch').href = 'https://nostr.watch/relays/' + protocol + '/' + relayHost;
       // Show skeleton loader while fetching
       document.getElementById('modal-body').innerHTML =
         '<div class="detail-grid">' +
@@ -808,6 +967,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
           '</div>' +
         '</div>';
       document.getElementById('modal').classList.add('open');
+      updateFavoriteButton(isFavorite(url));
 
       try {
         const res = await fetch('/api/relay?url=' + encodeURIComponent(url));
@@ -939,7 +1099,8 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       '</div>';
 
       // Insights section - natural language summary
-      const insightText = generateInsights(d, sc);
+      const aggregates = computeAggregateStats();
+      const insightText = generateInsights(d, sc, aggregates);
       if (insightText) {
         html += '<div class="insights-section">';
         html += '<div class="detail-group-title">Insights</div>';
@@ -1058,6 +1219,18 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
     document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeModal(); closeAlgoModal(); } });
     document.getElementById('algo-link').addEventListener('click', openAlgoModal);
     document.getElementById('modal-copy').addEventListener('click', () => { copyUrl(currentRelayUrl); });
+    document.getElementById('modal-favorite').addEventListener('click', () => {
+      const isFav = toggleFavorite(currentRelayUrl);
+      updateFavoriteButton(isFav);
+      showToast(isFav ? 'Added to favorites' : 'Removed from favorites');
+    });
+
+    function updateFavoriteButton(isFav) {
+      const btn = document.getElementById('modal-favorite');
+      btn.textContent = isFav ? '★' : '☆';
+      btn.title = isFav ? 'Remove from favorites' : 'Add to favorites';
+      btn.classList.toggle('active', isFav);
+    }
 
     // Dropdown toggle
     document.getElementById('modal-open-dropdown').addEventListener('click', (e) => {

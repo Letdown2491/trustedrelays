@@ -533,6 +533,7 @@ export class DataStore {
    * Percentile scoring removes geographic bias by ranking each relay relative
    * to other relays from each monitor's perspective, then averaging across monitors.
    * Only monitors tracking ≥20 relays contribute to percentile scores.
+   * Excludes data from stale monitors (no activity in 30 days).
    */
   async getNip66Stats(relayUrl: string, sinceDays: number = 30): Promise<{
     metricCount: number;
@@ -549,41 +550,52 @@ export class DataStore {
   }> {
     const db = await this.ensureReady();
     const sinceTimestamp = Math.floor(Date.now() / 1000) - (sinceDays * 86400);
+    const staleThreshold = Math.floor(Date.now() / 1000) - (30 * 86400); // 30 days
 
-    // Basic aggregation for raw metrics
+    // Basic aggregation for raw metrics (excluding stale monitors)
     const basicRows = await db.all(
       `SELECT
         COUNT(*) as metric_count,
-        COUNT(DISTINCT monitor_pubkey) as monitor_count,
-        AVG(rtt_open) as avg_rtt_open,
-        AVG(rtt_read) as avg_rtt_read,
-        AVG(rtt_write) as avg_rtt_write,
-        MIN(timestamp) as first_seen,
-        MAX(timestamp) as last_seen
-      FROM nip66_metrics
-      WHERE relay_url = ? AND timestamp >= ?`,
+        COUNT(DISTINCT m.monitor_pubkey) as monitor_count,
+        AVG(m.rtt_open) as avg_rtt_open,
+        AVG(m.rtt_read) as avg_rtt_read,
+        AVG(m.rtt_write) as avg_rtt_write,
+        MIN(m.timestamp) as first_seen,
+        MAX(m.timestamp) as last_seen
+      FROM nip66_metrics m
+      INNER JOIN trusted_monitors tm ON m.monitor_pubkey = tm.pubkey
+      WHERE m.relay_url = ?
+        AND m.timestamp >= ?
+        AND (tm.last_seen IS NULL OR tm.last_seen >= ?)`,
       relayUrl,
-      sinceTimestamp
+      sinceTimestamp,
+      staleThreshold
     );
 
     const basicRow = (basicRows[0] as any) || {};
 
-    // Percentile calculation using latest metrics only
+    // Percentile calculation using latest metrics only (excluding stale monitors)
     // Uses ROW_NUMBER to get most recent metric per monitor per relay
     const percentileRows = await db.all(
-      `WITH latest_metrics AS (
-        -- Get most recent metric from each monitor for each relay
+      `WITH active_monitors AS (
+        -- Only include monitors that have been active within the stale threshold
+        SELECT pubkey FROM trusted_monitors
+        WHERE last_seen IS NULL OR last_seen >= ?
+      ),
+      latest_metrics AS (
+        -- Get most recent metric from each active monitor for each relay
         SELECT
-          monitor_pubkey,
-          relay_url,
-          rtt_open,
-          rtt_read,
+          m.monitor_pubkey,
+          m.relay_url,
+          m.rtt_open,
+          m.rtt_read,
           ROW_NUMBER() OVER (
-            PARTITION BY monitor_pubkey, relay_url
-            ORDER BY timestamp DESC
+            PARTITION BY m.monitor_pubkey, m.relay_url
+            ORDER BY m.timestamp DESC
           ) as rn
-        FROM nip66_metrics
-        WHERE timestamp >= ?
+        FROM nip66_metrics m
+        WHERE m.timestamp >= ?
+          AND m.monitor_pubkey IN (SELECT pubkey FROM active_monitors)
       ),
       latest_only AS (
         SELECT monitor_pubkey, relay_url, rtt_open, rtt_read
@@ -620,6 +632,7 @@ export class DataStore {
         AVG(connect_pct * 0.3 + read_pct * 0.7) as latency_score,
         COUNT(*) as qualifying_monitor_count
       FROM monitor_percentiles`,
+      staleThreshold,
       sinceTimestamp,
       relayUrl
     );

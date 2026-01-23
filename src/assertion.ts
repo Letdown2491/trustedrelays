@@ -1,7 +1,7 @@
 import type { ProbeResult, ReliabilityScore, RelayAssertion, RelayPolicy, UnsignedEvent, OperatorResolution, QualityScore, AccessibilityScore, RelayReport } from './types.js';
 import { normalizeRelayUrl } from './prober.js';
 import { classifyPolicy, type PolicyClassification } from './policy-classifier.js';
-import { calculateWeightedObservations, getConfidenceLevel } from './scorer.js';
+import { calculateWeightedObservations, getConfidenceLevel, calculateOfflineReliability } from './scorer.js';
 import type { JurisdictionInfo } from './jurisdiction.js';
 
 /**
@@ -61,8 +61,14 @@ export function buildAssertion(
   const firstProbe = probes[0];
 
   // Calculate historical uptime for offline penalty
-  const reachableProbes = probes.filter(p => p.reachable).length;
-  const uptimePercent = probes.length > 0 ? Math.round((reachableProbes / probes.length) * 100) : 0;
+  const reachableProbesList = probes.filter(p => p.reachable);
+  const uptimePercent = probes.length > 0 ? Math.round((reachableProbesList.length / probes.length) * 100) : 0;
+
+  // Find last online timestamp for offline decay calculation
+  const lastOnlineProbe = reachableProbesList.length > 0
+    ? reachableProbesList.reduce((latest, p) => p.timestamp > latest.timestamp ? p : latest)
+    : undefined;
+  const lastOnlineTimestamp = lastOnlineProbe?.timestamp;
 
   // Calculate weighted observations for confidence
   // NIP-66 metrics are weighted by monitor diversity and observation time
@@ -103,8 +109,10 @@ export function buildAssertion(
   const { policy, classification } = determinePolicy(probes, options?.reports);
 
   // Compute overall score as weighted average: Reliability 40%, Quality 35%, Accessibility 25%
-  // If currently offline: use historical uptime capped at 50 (offline relays can't score high on reliability)
-  const reliabilityVal = latestProbe.reachable ? score.overall : Math.min(50, uptimePercent);
+  // If currently offline: use decayed score based on how long offline
+  const reliabilityVal = latestProbe.reachable
+    ? score.overall
+    : calculateOfflineReliability(uptimePercent, lastOnlineTimestamp);
   const qualityVal = qualityScore?.overall ?? 50;
   const accessibilityVal = accessibilityScore?.overall ?? 50;
   const overallScore = Math.round(

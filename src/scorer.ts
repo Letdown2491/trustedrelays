@@ -63,6 +63,33 @@ function clampScore(score: number): number {
 }
 
 /**
+ * Time decay constants for temporal weighting
+ */
+const TIME_DECAY = {
+  HALF_LIFE_DAYS: 3,      // Weight halves every 3 days
+  MIN_WEIGHT: 0.1,        // Minimum weight floor (old data still counts a bit)
+} as const;
+
+/**
+ * Calculate time-based weight for a probe using exponential decay.
+ * More recent probes are weighted more heavily.
+ *
+ * Formula: max(MIN_WEIGHT, e^(-age_days / HALF_LIFE_DAYS))
+ *
+ * With half-life of 3 days:
+ * - Today: weight ≈ 1.0
+ * - 3 days ago: weight ≈ 0.5
+ * - 6 days ago: weight ≈ 0.25
+ * - 30 days ago: weight ≈ 0.1 (floor)
+ */
+function getTimeWeight(timestamp: number, now: number = Date.now() / 1000): number {
+  const ageSeconds = now - timestamp;
+  const ageDays = ageSeconds / 86400;
+  const decay = Math.exp(-ageDays / TIME_DECAY.HALF_LIFE_DAYS);
+  return Math.max(TIME_DECAY.MIN_WEIGHT, decay);
+}
+
+/**
  * Calculate weighted observation count for confidence scoring
  *
  * NIP-66 metrics are weighted by:
@@ -98,6 +125,51 @@ export function calculateWeightedObservations(
 }
 
 /**
+ * Offline decay constants
+ */
+const OFFLINE_DECAY = {
+  MAX_DAYS: 30,        // Full decay after 30 days
+  MIN_FACTOR: 0.2,     // Floor at 20% of original score
+  BASE_CAP: 50,        // Maximum reliability score when offline
+} as const;
+
+/**
+ * Calculate reliability value for offline relays with gradual decay.
+ *
+ * Relays that just went offline get a higher score than those offline for weeks.
+ * This reflects the likelihood of the relay coming back online.
+ *
+ * @param uptimePercent - Historical uptime percentage (0-100)
+ * @param lastOnlineTimestamp - Unix timestamp of last successful probe
+ * @param now - Current timestamp (optional, defaults to now)
+ * @returns Decayed reliability value (0-50)
+ */
+export function calculateOfflineReliability(
+  uptimePercent: number,
+  lastOnlineTimestamp: number | undefined,
+  now: number = Math.floor(Date.now() / 1000)
+): number {
+  // Start with capped uptime
+  const baseScore = Math.min(OFFLINE_DECAY.BASE_CAP, uptimePercent);
+
+  // If no last online timestamp, assume worst case
+  if (!lastOnlineTimestamp) {
+    return Math.round(baseScore * OFFLINE_DECAY.MIN_FACTOR);
+  }
+
+  // Calculate days since last online
+  const daysSinceOnline = (now - lastOnlineTimestamp) / 86400;
+
+  // Linear decay from 1.0 to MIN_FACTOR over MAX_DAYS
+  const decayFactor = Math.max(
+    OFFLINE_DECAY.MIN_FACTOR,
+    1 - (daysSinceOnline / OFFLINE_DECAY.MAX_DAYS) * (1 - OFFLINE_DECAY.MIN_FACTOR)
+  );
+
+  return Math.round(baseScore * decayFactor);
+}
+
+/**
  * Determine confidence level from weighted observation count
  */
 export function getConfidenceLevel(weightedObservations: number): 'low' | 'medium' | 'high' {
@@ -126,18 +198,33 @@ function scoreLatency(ms: number | undefined): number {
 }
 
 /**
- * Calculate uptime score from probe results
- * Returns percentage of probes where relay was reachable (0-100)
+ * Calculate uptime score from probe results with temporal weighting.
+ * Recent probes are weighted more heavily than older ones.
+ * Returns weighted percentage of probes where relay was reachable (0-100)
  */
 export function computeUptimeScore(probes: ProbeResult[]): number {
   if (probes.length === 0) return 0;
-  const reachableCount = probes.filter(p => p.reachable).length;
-  return Math.round((reachableCount / probes.length) * 100);
+
+  const now = Date.now() / 1000;
+  let weightedReachable = 0;
+  let totalWeight = 0;
+
+  for (const probe of probes) {
+    const weight = getTimeWeight(probe.timestamp, now);
+    totalWeight += weight;
+    if (probe.reachable) {
+      weightedReachable += weight;
+    }
+  }
+
+  if (totalWeight === 0) return 0;
+  return Math.round((weightedReachable / totalWeight) * 100);
 }
 
 /**
- * Calculate consistency score from probe results
- * Low variance in connection times = high consistency
+ * Calculate consistency score from probe results with temporal weighting.
+ * Low variance in connection times = high consistency.
+ * Recent variance is weighted more heavily than older variance.
  * Uses coefficient of variation (CV): stddev / mean
  * CV of 0 = score 100, CV of 1+ = score 0
  *
@@ -152,55 +239,88 @@ export function computeConsistencyScore(probes: ProbeResult[]): number {
     return 70;
   }
 
-  // Get connect times only (not read times - they're different operations)
-  const connectTimes: number[] = [];
+  const now = Date.now() / 1000;
+
+  // Get connect times with weights
+  const samples: Array<{ time: number; weight: number }> = [];
   for (const probe of reachableProbes) {
     if (probe.connectTime !== undefined) {
-      connectTimes.push(probe.connectTime);
+      samples.push({
+        time: probe.connectTime,
+        weight: getTimeWeight(probe.timestamp, now),
+      });
     }
   }
 
-  if (connectTimes.length < 2) {
+  if (samples.length < 2) {
     return 70; // Not enough data
   }
 
-  // Calculate mean
-  const mean = connectTimes.reduce((sum, v) => sum + v, 0) / connectTimes.length;
-  if (mean === 0) return 100; // Perfect (no latency)
+  // Calculate weighted mean
+  let weightedSum = 0;
+  let totalWeight = 0;
+  for (const s of samples) {
+    weightedSum += s.time * s.weight;
+    totalWeight += s.weight;
+  }
+  const weightedMean = weightedSum / totalWeight;
 
-  // Calculate standard deviation
-  const squaredDiffs = connectTimes.map(v => Math.pow(v - mean, 2));
-  const variance = squaredDiffs.reduce((sum, v) => sum + v, 0) / connectTimes.length;
-  const stddev = Math.sqrt(variance);
+  if (weightedMean === 0) return 100; // Perfect (no latency)
+
+  // Calculate weighted variance
+  let weightedSquaredDiffSum = 0;
+  for (const s of samples) {
+    const diff = s.time - weightedMean;
+    weightedSquaredDiffSum += s.weight * diff * diff;
+  }
+  const weightedVariance = weightedSquaredDiffSum / totalWeight;
+  const weightedStddev = Math.sqrt(weightedVariance);
 
   // Coefficient of variation
-  const cv = stddev / mean;
+  const cv = weightedStddev / weightedMean;
 
   // Score: CV of 0 = 100, CV of 0.5 = 50, CV of 1+ = 0
   return clampScore(100 - (cv * 100));
 }
 
 /**
- * Calculate recovery score from probe results
- * Measures how quickly relay recovers from outages
+ * Recovery scoring constants
+ */
+const RECOVERY_FREQUENCY = {
+  PENALTY_PER_OUTAGE: 3,  // Points deducted per outage
+  MAX_PENALTY: 20,        // Maximum frequency penalty
+} as const;
+
+/**
+ * Calculate recovery score from probe results with temporal weighting.
+ * Measures how quickly relay recovers from outages.
+ * Recent outages are weighted more heavily than older ones.
  *
- * Scoring based on average outage duration:
+ * Score combines two factors:
+ * 1. Duration score: Based on weighted average outage duration
+ * 2. Frequency penalty: Penalizes frequent outages (flapping)
+ *
+ * Duration scoring thresholds:
  * - No outages: 100 (perfect)
  * - < 10 minutes avg: 90-100 (excellent recovery)
  * - 10-30 minutes avg: 75-90 (good recovery)
  * - 30-120 minutes avg: 50-75 (moderate recovery)
  * - > 120 minutes avg: 0-50 (poor recovery)
+ *
+ * Frequency penalty: 3 points per weighted outage, max 20 points
  */
 export function computeRecoveryScore(probes: ProbeResult[]): number {
   if (probes.length < 2) {
     return 80; // Not enough data - assume moderate
   }
 
+  const now = Date.now() / 1000;
+
   // Sort probes by timestamp (oldest first)
   const sortedProbes = [...probes].sort((a, b) => a.timestamp - b.timestamp);
 
-  // Find outage periods (consecutive unreachable probes)
-  const outageDurations: number[] = [];
+  // Find outage periods with their end timestamps for weighting
+  const outages: Array<{ duration: number; endTimestamp: number }> = [];
   let outageStart: number | null = null;
 
   for (let i = 0; i < sortedProbes.length; i++) {
@@ -212,7 +332,7 @@ export function computeRecoveryScore(probes: ProbeResult[]): number {
     } else if (probe.reachable && outageStart !== null) {
       // End of outage - calculate duration
       const duration = probe.timestamp - outageStart;
-      outageDurations.push(duration);
+      outages.push({ duration, endTimestamp: probe.timestamp });
       outageStart = null;
     }
   }
@@ -221,35 +341,54 @@ export function computeRecoveryScore(probes: ProbeResult[]): number {
   if (outageStart !== null) {
     const lastProbe = sortedProbes[sortedProbes.length - 1];
     const duration = lastProbe.timestamp - outageStart;
-    outageDurations.push(duration);
+    outages.push({ duration, endTimestamp: lastProbe.timestamp });
   }
 
   // No outages = perfect recovery
-  if (outageDurations.length === 0) {
+  if (outages.length === 0) {
     return 100;
   }
 
-  // Calculate average outage duration in minutes
-  const avgDurationSec = outageDurations.reduce((sum, d) => sum + d, 0) / outageDurations.length;
-  const avgDurationMin = avgDurationSec / 60;
+  // Calculate weighted average outage duration and weighted outage count
+  // Weight by when the outage ended (recent outages matter more)
+  let weightedDurationSum = 0;
+  let totalWeight = 0;
+  let weightedOutageCount = 0;
 
-  // Score based on average outage duration using thresholds
-  let score: number;
-  if (avgDurationMin < RECOVERY_THRESHOLDS.EXCELLENT) {
-    // Excellent: 90-100 (linear from 100 at 0 to 90 at threshold)
-    score = 100 - (avgDurationMin);
-  } else if (avgDurationMin < RECOVERY_THRESHOLDS.GOOD) {
-    // Good: 75-90 (linear from 90 at EXCELLENT to 75 at GOOD)
-    score = 90 - ((avgDurationMin - RECOVERY_THRESHOLDS.EXCELLENT) * 0.75);
-  } else if (avgDurationMin < RECOVERY_THRESHOLDS.MODERATE) {
-    // Moderate: 50-75 (linear from 75 at GOOD to 50 at MODERATE)
-    score = 75 - ((avgDurationMin - RECOVERY_THRESHOLDS.GOOD) * (25 / 90));
-  } else {
-    // Poor: 0-50 (linear from 50 at MODERATE to 0 at MAX)
-    score = 50 - ((avgDurationMin - RECOVERY_THRESHOLDS.MODERATE) * (50 / 240));
+  for (const outage of outages) {
+    const weight = getTimeWeight(outage.endTimestamp, now);
+    weightedDurationSum += outage.duration * weight;
+    totalWeight += weight;
+    weightedOutageCount += weight; // Each outage contributes its weight to frequency
   }
 
-  return clampScore(score);
+  const avgDurationSec = weightedDurationSum / totalWeight;
+  const avgDurationMin = avgDurationSec / 60;
+
+  // Calculate duration-based score using thresholds
+  let durationScore: number;
+  if (avgDurationMin < RECOVERY_THRESHOLDS.EXCELLENT) {
+    // Excellent: 90-100 (linear from 100 at 0 to 90 at threshold)
+    durationScore = 100 - (avgDurationMin);
+  } else if (avgDurationMin < RECOVERY_THRESHOLDS.GOOD) {
+    // Good: 75-90 (linear from 90 at EXCELLENT to 75 at GOOD)
+    durationScore = 90 - ((avgDurationMin - RECOVERY_THRESHOLDS.EXCELLENT) * 0.75);
+  } else if (avgDurationMin < RECOVERY_THRESHOLDS.MODERATE) {
+    // Moderate: 50-75 (linear from 75 at GOOD to 50 at MODERATE)
+    durationScore = 75 - ((avgDurationMin - RECOVERY_THRESHOLDS.GOOD) * (25 / 90));
+  } else {
+    // Poor: 0-50 (linear from 50 at MODERATE to 0 at MAX)
+    durationScore = 50 - ((avgDurationMin - RECOVERY_THRESHOLDS.MODERATE) * (50 / 240));
+  }
+
+  // Calculate frequency penalty (penalize flapping/frequent outages)
+  // Uses weighted outage count so recent outages penalize more
+  const frequencyPenalty = Math.min(
+    RECOVERY_FREQUENCY.MAX_PENALTY,
+    weightedOutageCount * RECOVERY_FREQUENCY.PENALTY_PER_OUTAGE
+  );
+
+  return clampScore(durationScore - frequencyPenalty);
 }
 
 /**

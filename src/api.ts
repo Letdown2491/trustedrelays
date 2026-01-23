@@ -1,6 +1,6 @@
 import { DataStore } from './database.js';
 import { buildAssertion, assertionToEvent } from './assertion.js';
-import { computeCombinedReliabilityScore, calculateWeightedObservations, getConfidenceLevel } from './scorer.js';
+import { computeCombinedReliabilityScore, calculateWeightedObservations, getConfidenceLevel, calculateOfflineReliability } from './scorer.js';
 import { computeQualityScore } from './quality-scorer.js';
 import { computeAccessibilityScore, getEyesAlliance } from './accessibility-scorer.js';
 import { classifyPolicy } from './policy-classifier.js';
@@ -930,11 +930,18 @@ async function getRelayScore(db: DataStore, url: string): Promise<{
   const confidence = getConfidenceLevel(weightedObs);
 
   // Calculate historical uptime for offline penalty
-  const reachableProbes = probes.filter(p => p.reachable).length;
-  const uptimePercent = probes.length > 0 ? Math.round((reachableProbes / probes.length) * 100) : 0;
+  const reachableProbesList = probes.filter(p => p.reachable);
+  const uptimePercent = probes.length > 0 ? Math.round((reachableProbesList.length / probes.length) * 100) : 0;
 
-  // Compute overall score
-  const reliabilityVal = latestProbe.reachable ? reliabilityScore.overall : Math.min(50, uptimePercent);
+  // Find last online timestamp for offline decay
+  const lastOnlineProbe = reachableProbesList.length > 0
+    ? reachableProbesList.reduce((latest, p) => p.timestamp > latest.timestamp ? p : latest)
+    : undefined;
+
+  // Compute overall score with offline decay if needed
+  const reliabilityVal = latestProbe.reachable
+    ? reliabilityScore.overall
+    : calculateOfflineReliability(uptimePercent, lastOnlineProbe?.timestamp);
   const overallScore = Math.round(
     reliabilityVal * 0.40 +
     qualityScore.overall * 0.35 +
@@ -1011,11 +1018,18 @@ async function getRelayList(db: DataStore): Promise<Array<{
     const accessibilityScore = computeAccessibilityScore(latestProbe.nip11, jurisdiction?.countryCode);
 
     // Calculate uptime for offline penalty
-    const reachableProbes = probes.filter(p => p.reachable).length;
-    const uptimePercent = probes.length > 0 ? Math.round((reachableProbes / probes.length) * 100) : 0;
+    const reachableProbesList = probes.filter(p => p.reachable);
+    const uptimePercent = probes.length > 0 ? Math.round((reachableProbesList.length / probes.length) * 100) : 0;
 
-    // Use same logic as detail view for reliability value
-    const reliabilityVal = latestProbe.reachable ? reliabilityScore.overall : Math.min(50, uptimePercent);
+    // Find last online timestamp for offline decay
+    const lastOnlineProbe = reachableProbesList.length > 0
+      ? reachableProbesList.reduce((latest, p) => p.timestamp > latest.timestamp ? p : latest)
+      : undefined;
+
+    // Use same logic as detail view for reliability value with offline decay
+    const reliabilityVal = latestProbe.reachable
+      ? reliabilityScore.overall
+      : calculateOfflineReliability(uptimePercent, lastOnlineProbe?.timestamp);
     const qualityVal = qualityScore.overall;
     const accessibilityVal = accessibilityScore.overall;
 
@@ -1140,12 +1154,19 @@ async function getRelayDetails(db: DataStore, url: string): Promise<object | nul
   const policy = classifyPolicy(latestProbe.nip11, latestProbe.relayType, reports);
 
   // Calculate uptime from probe history
-  const reachableProbes = probes.filter(p => p.reachable).length;
-  const uptimePercent = probes.length > 0 ? Math.round((reachableProbes / probes.length) * 100) : 0;
+  const reachableProbesList = probes.filter(p => p.reachable);
+  const uptimePercent = probes.length > 0 ? Math.round((reachableProbesList.length / probes.length) * 100) : 0;
+
+  // Find last online timestamp for offline decay
+  const lastOnlineProbe = reachableProbesList.length > 0
+    ? reachableProbesList.reduce((latest, p) => p.timestamp > latest.timestamp ? p : latest)
+    : undefined;
 
   // Compute overall score as weighted average: Reliability 40%, Quality 35%, Accessibility 25%
-  // If currently offline: use historical uptime capped at 50 (offline relays can't score high on reliability)
-  const reliabilityVal = latestProbe.reachable ? score.overall : Math.min(50, uptimePercent);
+  // If currently offline: use decayed score based on how long offline
+  const reliabilityVal = latestProbe.reachable
+    ? score.overall
+    : calculateOfflineReliability(uptimePercent, lastOnlineProbe?.timestamp);
   const overallScore = Math.round(
     reliabilityVal * 0.40 +
     qualityScore.overall * 0.35 +

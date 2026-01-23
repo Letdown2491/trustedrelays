@@ -85,17 +85,18 @@ describe('scoreAccessBarriers', () => {
     expect(scoreAccessBarriers(nip11High)).toBe(85); // 100 - 15 (capped)
   });
 
-  test('combines multiple barriers', () => {
+  test('combines multiple barriers with diminishing returns', () => {
     const nip11: NIP11Info = {
       limitation: {
         auth_required: true,
         payment_required: true,
       },
     };
-    expect(scoreAccessBarriers(nip11)).toBe(30); // 100 - 30 - 40
+    // Diminishing returns: 40 × 1.0 + 30 × 0.5 = 55 penalty
+    expect(scoreAccessBarriers(nip11)).toBe(45);
   });
 
-  test('never goes below 0', () => {
+  test('applies diminishing returns to all barriers', () => {
     const nip11: NIP11Info = {
       limitation: {
         auth_required: true,
@@ -104,8 +105,8 @@ describe('scoreAccessBarriers', () => {
         min_pow_difficulty: 20,
       },
     };
-    // 100 - 30 - 40 - 10 - 15 = 5
-    expect(scoreAccessBarriers(nip11)).toBe(5);
+    // Diminishing returns: 40 × 1.0 + 30 × 0.5 + 15 × 0.3 + 10 × 0.2 = 61.5 penalty
+    expect(scoreAccessBarriers(nip11)).toBe(39);
   });
 });
 
@@ -220,9 +221,10 @@ describe('computeAccessibilityScore', () => {
 
     const score = computeAccessibilityScore(nip11, 'US');
 
-    expect(score.barrierScore).toBe(30);
-    // barrierScore 30 * 0.4 + limitScore 100 * 0.2 + jurisdiction ~95 * 0.2 + surveillance 70 * 0.2
-    // = 12 + 20 + 19 + 14 = ~65
-    expect(score.overall).toBeLessThan(70);
+    // Diminishing returns: 40 × 1.0 + 30 × 0.5 = 55 penalty → 45 score
+    expect(score.barrierScore).toBe(45);
+    // barrierScore 45 * 0.4 + limitScore 100 * 0.2 + jurisdiction ~95 * 0.2 + surveillance 70 * 0.2
+    // = 18 + 20 + 19 + 14 = ~71
+    expect(score.overall).toBeLessThan(75);
   });
 });

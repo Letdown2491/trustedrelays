@@ -250,12 +250,16 @@ Reliability = (Uptime × 0.40) + (Recovery × 0.20) + (Consistency × 0.20) + (L
 
 | Component | Calculation |
 |-----------|-------------|
-| **Uptime** | % of successful probes over observation period |
-| **Recovery** | Inverse of average outage duration (shorter = better) |
+| **Uptime** | % of successful probes over observation period (temporally weighted) |
+| **Recovery** | Inverse of average outage duration minus frequency penalty (3 pts/outage, max 20) |
 | **Consistency** | Inverse of connection time variance (stable = better) |
 | **Latency** | Tiered scoring based on absolute latency (≤50ms=100, ≤200ms=85, ≤500ms=60, etc.) |
 
-**Data fusion:** Probe data (30%) + NIP-66 data (70%) when both available.
+**Temporal weighting:** Recent observations weighted more heavily using exponential decay with 3-day half-life (minimum weight 0.1). This ensures recent behavior has more impact than old data.
+
+**Offline relay decay:** When a relay is currently unreachable, its reliability score decays linearly over 30 days to a 20% floor. A relay offline for 15 days retains ~60% of its historical score; after 30+ days it's capped at 20%.
+
+**Data fusion:** Probe data (30%) + NIP-66 data (70%) when both available. Stale monitors (inactive 30+ days) are excluded.
 
 ### Quality Score (35% weight)
 
@@ -286,10 +290,12 @@ Accessibility = (Barriers × 0.40) + (Limits × 0.20) + (Jurisdiction × 0.20) +
 
 | Component | Calculation |
 |-----------|-------------|
-| **Barriers** | Penalties for auth (-30), payment (-40), restricted writes (-10), PoW (-5 to -15) |
+| **Barriers** | Penalties for auth (-30), payment (-40), restricted writes (-10), PoW (-5 to -15) with diminishing returns |
 | **Limits** | Penalty for restrictive subscription/content/message limits |
 | **Jurisdiction** | Freedom House internet freedom index (0-100) |
-| **Surveillance** | Eyes Alliance: Five Eyes (-40), Nine Eyes (-30), Fourteen Eyes (-20), Privacy-friendly (+0) |
+| **Surveillance** | Eyes Alliance: Five Eyes (-30), Nine Eyes (-25), Fourteen Eyes (-20), Privacy-friendly (+0) |
+
+**Barrier diminishing returns:** When multiple barriers stack, penalties apply with decreasing weight: first at 100%, second at 50%, third at 30%, fourth+ at 20%. This prevents unrealistic scores when barriers overlap (e.g., auth + payment = 55 penalty, not 70).
 
 ### Confidence Levels
 
@@ -385,7 +391,7 @@ When sources disagree (different pubkeys found), the system uses the highest-con
 
 Operator WoT scores are fetched from NIP-85 assertion providers and cached in the database. Scores are refreshed daily during the probe cycle:
 
-- Queries relays: `wss://nip85.nostr.band`, `wss://relay.damus.io`, `wss://nos.lol`
+- Queries relays: `wss://nip85.nostr.band`, `wss://relay.damus.io`, `wss://nos.lol`, `wss://relay.snort.social`
 - Parallel lookups with concurrency limit (20) to avoid rate limiting
 - Scores older than 24 hours are refreshed
 - Results cached in `operator_mappings` table

@@ -52,6 +52,7 @@ const DEFAULT_NIP85_RELAYS = [
   'wss://nip85.nostr.band',
   'wss://relay.damus.io',
   'wss://nos.lol',
+  'wss://relay.snort.social',
 ];
 
 /**
