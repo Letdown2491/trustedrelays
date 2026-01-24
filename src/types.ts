@@ -464,3 +464,80 @@ export interface ScoreSnapshot {
   observations: number;
   confidence: 'low' | 'medium' | 'high';
 }
+
+/**
+ * Network-wide statistics for aggregate analytics
+ */
+export interface NetworkStats {
+  computedAt: number;
+  periodDays: number;
+  summary: {
+    totalRelays: number;
+    avgScore: number;
+    medianScore: number;
+    p25Score: number;
+    p75Score: number;
+    stddev: number;
+    healthyCount: number;
+    healthyPercent: number;
+    degradedCount: number;
+    poorCount: number;
+    avgReliability: number;
+    avgQuality: number;
+    avgAccessibility: number;
+  };
+  comparison: {
+    avgScoreChange: number | null;
+    relayCountChange: number;
+    healthyPercentChange: number | null;
+  };
+  distribution: Array<{
+    bucket: string;
+    count: number;
+    percent: number;
+  }>;
+  trend: Array<{
+    timestamp: number;
+    avgScore: number;
+    medianScore: number;
+    relayCount: number;
+  }>;
+  geographic: Array<{
+    countryCode: string;
+    countryName: string;
+    relayCount: number;
+    avgScore: number;
+    avgReliability: number;
+  }>;
+  topMovers: {
+    improving: Array<{
+      relayUrl: string;
+      change: number;
+      fromScore: number;
+      toScore: number;
+    }>;
+    declining: Array<{
+      relayUrl: string;
+      change: number;
+      fromScore: number;
+      toScore: number;
+    }>;
+  };
+  churn: {
+    newRelays: number;
+    wentOffline: number;
+    zombieRelays: number;
+  };
+  relayTypes?: Array<{
+    type: string;
+    count: number;
+    percent: number;
+  }>;
+  operatorTrust?: Array<{
+    type: string;
+    label: string;
+    count: number;
+    percent: number;
+  }>;
+  dataAgeDays?: number;
+}

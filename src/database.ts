@@ -1,5 +1,5 @@
 import { Database } from 'duckdb-async';
-import type { ProbeResult, RelayType, OperatorResolution, VerificationMethod, RelayReport, ReportType, RelayReportStats, RelayAssertion } from './types.js';
+import type { ProbeResult, RelayType, OperatorResolution, VerificationMethod, RelayReport, ReportType, RelayReportStats, RelayAssertion, NetworkStats } from './types.js';
 import type { JurisdictionInfo } from './jurisdiction.js';
 import { normalizeRelayUrl } from './prober.js';
 
@@ -59,6 +59,14 @@ const SCHEMA = `
     added_at BIGINT NOT NULL,
     last_seen BIGINT,
     event_count INTEGER DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS operators (
+    pubkey VARCHAR PRIMARY KEY,
+    wot_score INTEGER,
+    wot_confidence VARCHAR,
+    wot_provider_count INTEGER,
+    wot_updated_at BIGINT
   );
 
   CREATE TABLE IF NOT EXISTS operator_mappings (
@@ -138,6 +146,13 @@ const SCHEMA = `
     requested_at BIGINT NOT NULL,
     requested_by VARCHAR
   );
+
+  CREATE TABLE IF NOT EXISTS network_stats_cache (
+    period VARCHAR NOT NULL,
+    computed_at BIGINT NOT NULL,
+    stats_json VARCHAR NOT NULL,
+    PRIMARY KEY (period)
+  );
 `;
 
 export class DataStore {
@@ -170,6 +185,9 @@ export class DataStore {
 
     // Migration 2: Add access_level and closed_reason columns to probes
     await this.migrateProbesAccessLevel();
+
+    // Migration 3: Normalize operator WoT data into separate operators table
+    await this.migrateOperatorWotToSeparateTable();
   }
 
   /**
@@ -258,19 +276,90 @@ export class DataStore {
       // Column doesn't exist or table doesn't exist - no migration needed
     }
 
-    // Add WoT fields to operator_mappings if they don't exist
+  }
+
+  /**
+   * Migration 3: Move WoT data from operator_mappings to separate operators table
+   * This normalizes the schema so WoT scores are stored per operator (pubkey)
+   * rather than per relay URL
+   */
+  private async migrateOperatorWotToSeparateTable(): Promise<void> {
+    if (!this.db) return;
+
+    // Check if operator_mappings has WoT columns (old denormalized schema)
+    let hasWotColumns = false;
     try {
       await this.db.all(`SELECT wot_score FROM operator_mappings LIMIT 1`);
-      // Column exists, no migration needed
+      hasWotColumns = true;
     } catch {
-      // Columns don't exist, add them
+      // WoT columns don't exist in operator_mappings
+    }
+
+    // Create operators table if it doesn't exist
+    try {
+      await this.db.exec(`
+        CREATE TABLE IF NOT EXISTS operators (
+          pubkey VARCHAR PRIMARY KEY,
+          wot_score INTEGER,
+          wot_confidence VARCHAR,
+          wot_provider_count INTEGER,
+          wot_updated_at BIGINT
+        )
+      `);
+    } catch {
+      // Table already exists
+    }
+
+    // Migrate data from operator_mappings to operators if old schema exists
+    if (hasWotColumns) {
+      // Insert distinct operators with their WoT scores
+      // Use the most recent wot_updated_at for each operator
       try {
-        await this.db.exec(`ALTER TABLE operator_mappings ADD COLUMN wot_score INTEGER`);
-        await this.db.exec(`ALTER TABLE operator_mappings ADD COLUMN wot_confidence VARCHAR`);
-        await this.db.exec(`ALTER TABLE operator_mappings ADD COLUMN wot_provider_count INTEGER`);
-        await this.db.exec(`ALTER TABLE operator_mappings ADD COLUMN wot_updated_at BIGINT`);
-      } catch {
-        // Ignore errors if columns already exist
+        await this.db.exec(`
+          INSERT INTO operators (pubkey, wot_score, wot_confidence, wot_provider_count, wot_updated_at)
+          SELECT DISTINCT
+            operator_pubkey,
+            FIRST_VALUE(wot_score) OVER (PARTITION BY operator_pubkey ORDER BY wot_updated_at DESC NULLS LAST),
+            FIRST_VALUE(wot_confidence) OVER (PARTITION BY operator_pubkey ORDER BY wot_updated_at DESC NULLS LAST),
+            FIRST_VALUE(wot_provider_count) OVER (PARTITION BY operator_pubkey ORDER BY wot_updated_at DESC NULLS LAST),
+            MAX(wot_updated_at) OVER (PARTITION BY operator_pubkey)
+          FROM operator_mappings
+          WHERE operator_pubkey IS NOT NULL
+          AND wot_score IS NOT NULL
+          ON CONFLICT (pubkey) DO UPDATE SET
+            wot_score = COALESCE(excluded.wot_score, operators.wot_score),
+            wot_confidence = COALESCE(excluded.wot_confidence, operators.wot_confidence),
+            wot_provider_count = COALESCE(excluded.wot_provider_count, operators.wot_provider_count),
+            wot_updated_at = GREATEST(COALESCE(excluded.wot_updated_at, 0), COALESCE(operators.wot_updated_at, 0))
+        `);
+      } catch (e) {
+        // Migration might fail on empty table or other edge cases
+        console.warn('WoT migration insert failed (may be expected on first run):', e);
+      }
+
+      // Recreate operator_mappings without WoT columns
+      try {
+        await this.db.exec(`
+          CREATE TABLE operator_mappings_new AS
+          SELECT
+            relay_url,
+            operator_pubkey,
+            verification_method,
+            verified_at,
+            confidence,
+            nip11_pubkey,
+            dns_pubkey,
+            wellknown_pubkey
+          FROM operator_mappings;
+
+          DROP TABLE operator_mappings;
+
+          ALTER TABLE operator_mappings_new RENAME TO operator_mappings;
+
+          CREATE INDEX IF NOT EXISTS idx_operator_pubkey ON operator_mappings(operator_pubkey);
+        `);
+      } catch (e) {
+        console.warn('operator_mappings migration failed:', e);
       }
     }
   }
@@ -629,7 +718,11 @@ export class DataStore {
       SELECT
         AVG(connect_pct) as connect_percentile,
         AVG(read_pct) as read_percentile,
-        AVG(connect_pct * 0.3 + read_pct * 0.7) as latency_score,
+        -- Use connect-only when read data unavailable, otherwise 30/70 weighted
+        AVG(CASE
+          WHEN target_rtt_read IS NULL THEN connect_pct
+          ELSE connect_pct * 0.3 + read_pct * 0.7
+        END) as latency_score,
         COUNT(*) as qualifying_monitor_count
       FROM monitor_percentiles`,
       staleThreshold,
@@ -843,13 +936,16 @@ export class DataStore {
 
   /**
    * Store an operator resolution
+   * Relay mapping goes to operator_mappings, WoT data goes to operators table
    */
   async storeOperatorResolution(resolution: OperatorResolution): Promise<void> {
     const db = await this.ensureReady();
+
+    // Store relay -> operator mapping
     await db.run(
       `INSERT INTO operator_mappings
-       (relay_url, operator_pubkey, verification_method, verified_at, confidence, nip11_pubkey, dns_pubkey, wellknown_pubkey, wot_score, wot_confidence, wot_provider_count, wot_updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       (relay_url, operator_pubkey, verification_method, verified_at, confidence, nip11_pubkey, dns_pubkey, wellknown_pubkey)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (relay_url) DO UPDATE SET
          operator_pubkey = excluded.operator_pubkey,
          verification_method = excluded.verification_method,
@@ -857,11 +953,7 @@ export class DataStore {
          confidence = excluded.confidence,
          nip11_pubkey = excluded.nip11_pubkey,
          dns_pubkey = excluded.dns_pubkey,
-         wellknown_pubkey = excluded.wellknown_pubkey,
-         wot_score = excluded.wot_score,
-         wot_confidence = excluded.wot_confidence,
-         wot_provider_count = excluded.wot_provider_count,
-         wot_updated_at = excluded.wot_updated_at`,
+         wellknown_pubkey = excluded.wellknown_pubkey`,
       resolution.relayUrl,
       resolution.operatorPubkey,
       resolution.verificationMethod,
@@ -869,22 +961,84 @@ export class DataStore {
       resolution.confidence,
       resolution.nip11Pubkey ?? null,
       resolution.dnsPubkey ?? null,
-      resolution.wellknownPubkey ?? null,
-      resolution.trustScore ?? null,
-      resolution.trustConfidence ?? null,
-      resolution.trustProviderCount ?? null,
-      resolution.trustScore != null ? Math.floor(Date.now() / 1000) : null
+      resolution.wellknownPubkey ?? null
+    );
+
+    // Store WoT data in operators table if present
+    if (resolution.operatorPubkey && resolution.trustScore != null) {
+      await this.storeOperatorWot(
+        resolution.operatorPubkey,
+        resolution.trustScore,
+        resolution.trustConfidence ?? null,
+        resolution.trustProviderCount ?? null
+      );
+    }
+  }
+
+  /**
+   * Store or update an operator's WoT score
+   */
+  async storeOperatorWot(
+    pubkey: string,
+    wotScore: number,
+    wotConfidence: 'low' | 'medium' | 'high' | null,
+    wotProviderCount: number | null
+  ): Promise<void> {
+    const db = await this.ensureReady();
+    await db.run(
+      `INSERT INTO operators (pubkey, wot_score, wot_confidence, wot_provider_count, wot_updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (pubkey) DO UPDATE SET
+         wot_score = excluded.wot_score,
+         wot_confidence = excluded.wot_confidence,
+         wot_provider_count = excluded.wot_provider_count,
+         wot_updated_at = excluded.wot_updated_at`,
+      pubkey,
+      wotScore,
+      wotConfidence,
+      wotProviderCount,
+      Math.floor(Date.now() / 1000)
     );
   }
 
   /**
+   * Get an operator's WoT score
+   */
+  async getOperatorWot(pubkey: string): Promise<{
+    wotScore: number | null;
+    wotConfidence: 'low' | 'medium' | 'high' | null;
+    wotProviderCount: number | null;
+    wotUpdatedAt: number | null;
+  } | null> {
+    const db = await this.ensureReady();
+    const rows = await db.all(
+      `SELECT * FROM operators WHERE pubkey = ?`,
+      pubkey
+    );
+
+    if (rows.length === 0) return null;
+
+    const row = rows[0] as any;
+    return {
+      wotScore: row.wot_score != null ? Number(row.wot_score) : null,
+      wotConfidence: row.wot_confidence as 'low' | 'medium' | 'high' | null,
+      wotProviderCount: row.wot_provider_count != null ? Number(row.wot_provider_count) : null,
+      wotUpdatedAt: row.wot_updated_at != null ? Number(row.wot_updated_at) : null,
+    };
+  }
+
+  /**
    * Get cached operator resolution for a relay
+   * Joins with operators table to include WoT data
    */
   async getOperatorResolution(relayUrl: string): Promise<OperatorResolution | null> {
     const db = await this.ensureReady();
     const normalizedUrl = normalizeRelayUrl(relayUrl);
     const rows = await db.all(
-      `SELECT * FROM operator_mappings WHERE relay_url = ?`,
+      `SELECT m.*, o.wot_score, o.wot_confidence, o.wot_provider_count
+       FROM operator_mappings m
+       LEFT JOIN operators o ON m.operator_pubkey = o.pubkey
+       WHERE m.relay_url = ?`,
       normalizedUrl
     );
 
@@ -902,7 +1056,7 @@ export class DataStore {
       wellknownPubkey: row.wellknown_pubkey ?? undefined,
     };
 
-    // Add WoT fields if present
+    // Add WoT fields if present (from joined operators table)
     if (row.wot_score != null) {
       resolution.trustScore = Number(row.wot_score);
       resolution.trustConfidence = row.wot_confidence as 'low' | 'medium' | 'high';
@@ -913,33 +1067,26 @@ export class DataStore {
   }
 
   /**
-   * Get operator resolutions that need WoT score refresh
-   * Returns operators with pubkey where wot_updated_at is null or older than maxAgeDays
+   * Get operator pubkeys that need WoT score refresh
+   * Returns distinct operator pubkeys where wot_updated_at is null or older than maxAgeDays
    */
-  async getOperatorsNeedingWotRefresh(maxAgeDays: number = 1): Promise<OperatorResolution[]> {
+  async getOperatorsNeedingWotRefresh(maxAgeDays: number = 1): Promise<string[]> {
     const db = await this.ensureReady();
     const cutoff = Math.floor(Date.now() / 1000) - (maxAgeDays * 86400);
 
+    // Get distinct operator pubkeys that either:
+    // 1. Don't have an entry in operators table
+    // 2. Have an entry with wot_updated_at older than cutoff
     const rows = await db.all(
-      `SELECT * FROM operator_mappings
-       WHERE operator_pubkey IS NOT NULL
-       AND (wot_updated_at IS NULL OR wot_updated_at < ?)`,
+      `SELECT DISTINCT m.operator_pubkey
+       FROM operator_mappings m
+       LEFT JOIN operators o ON m.operator_pubkey = o.pubkey
+       WHERE m.operator_pubkey IS NOT NULL
+       AND (o.pubkey IS NULL OR o.wot_updated_at IS NULL OR o.wot_updated_at < ?)`,
       cutoff
     );
 
-    return rows.map((row: any) => ({
-      relayUrl: row.relay_url,
-      operatorPubkey: row.operator_pubkey,
-      verificationMethod: row.verification_method as VerificationMethod | null,
-      verifiedAt: Number(row.verified_at),
-      confidence: Number(row.confidence),
-      nip11Pubkey: row.nip11_pubkey ?? undefined,
-      dnsPubkey: row.dns_pubkey ?? undefined,
-      wellknownPubkey: row.wellknown_pubkey ?? undefined,
-      trustScore: row.wot_score != null ? Number(row.wot_score) : undefined,
-      trustConfidence: row.wot_confidence as 'low' | 'medium' | 'high' | undefined,
-      trustProviderCount: row.wot_provider_count != null ? Number(row.wot_provider_count) : undefined,
-    }));
+    return rows.map((row: any) => row.operator_pubkey);
   }
 
   /**
@@ -1720,6 +1867,7 @@ export class DataStore {
         SELECT
           target.relay_url,
           target.monitor_pubkey,
+          target.rtt_read as target_rtt_read,
           (SUM(CASE WHEN other.rtt_open > target.rtt_open THEN 1 ELSE 0 END) * 100.0 / COUNT(*)) as connect_pct,
           (SUM(CASE WHEN other.rtt_read > target.rtt_read THEN 1 ELSE 0 END) * 100.0 / COUNT(*)) as read_pct
         FROM latest_only target
@@ -1733,7 +1881,11 @@ export class DataStore {
         relay_url,
         AVG(connect_pct) as connect_percentile,
         AVG(read_pct) as read_percentile,
-        AVG(connect_pct * 0.3 + read_pct * 0.7) as latency_score,
+        -- Use connect-only when read data unavailable, otherwise 30/70 weighted
+        AVG(CASE
+          WHEN target_rtt_read IS NULL THEN connect_pct
+          ELSE connect_pct * 0.3 + read_pct * 0.7
+        END) as latency_score,
         COUNT(*) as qualifying_monitor_count
       FROM relay_percentiles_per_monitor
       GROUP BY relay_url
@@ -1782,10 +1934,15 @@ export class DataStore {
 
   /**
    * Get ALL operator resolutions in a single query
+   * Joins with operators table to include WoT data
    */
   async getAllOperatorResolutions(): Promise<Map<string, OperatorResolution>> {
     const db = await this.ensureReady();
-    const rows = await db.all(`SELECT * FROM operator_mappings`);
+    const rows = await db.all(`
+      SELECT m.*, o.wot_score, o.wot_confidence, o.wot_provider_count
+      FROM operator_mappings m
+      LEFT JOIN operators o ON m.operator_pubkey = o.pubkey
+    `);
 
     const result = new Map<string, OperatorResolution>();
     for (const row of rows as any[]) {
@@ -1800,7 +1957,7 @@ export class DataStore {
         wellknownPubkey: row.wellknown_pubkey ?? undefined,
       };
 
-      // Add WoT fields if present
+      // Add WoT fields if present (from joined operators table)
       if (row.wot_score != null) {
         resolution.trustScore = Number(row.wot_score);
         resolution.trustConfidence = row.wot_confidence as 'low' | 'medium' | 'high';
@@ -2335,25 +2492,370 @@ export class DataStore {
     return result;
   }
 
+  // ============================================================================
+  // NETWORK STATS - Aggregate analytics across all relays
+  // ============================================================================
+
   /**
-   * Checkpoint the WAL file to prevent stale WAL issues
-   * Should be called periodically and before shutdown
+   * Compute comprehensive network statistics using DuckDB analytical functions.
+   * This is computationally expensive - results should be cached.
    */
-  async checkpoint(): Promise<void> {
+  async computeNetworkStats(periodDays: number = 7): Promise<NetworkStats> {
+    const db = await this.ensureReady();
+    const now = Math.floor(Date.now() / 1000);
+    const periodStart = now - (periodDays * 86400);
+    const prevPeriodStart = periodStart - (periodDays * 86400);
+
+    // Get latest scores for each relay
+    const summaryRows = await db.all(`
+      WITH latest_scores AS (
+        SELECT relay_url, score, reliability, quality, accessibility, timestamp,
+          ROW_NUMBER() OVER (PARTITION BY relay_url ORDER BY timestamp DESC) as rn
+        FROM score_history WHERE score IS NOT NULL
+      ),
+      current AS (SELECT * FROM latest_scores WHERE rn = 1)
+      SELECT
+        COUNT(*) as total_relays,
+        AVG(score) as avg_score,
+        MEDIAN(score) as median_score,
+        QUANTILE_CONT(score, 0.25) as p25,
+        QUANTILE_CONT(score, 0.75) as p75,
+        STDDEV_SAMP(score) as stddev,
+        SUM(CASE WHEN score >= 70 THEN 1 ELSE 0 END) as healthy_count,
+        SUM(CASE WHEN score >= 50 AND score < 70 THEN 1 ELSE 0 END) as degraded_count,
+        SUM(CASE WHEN score < 50 THEN 1 ELSE 0 END) as poor_count,
+        AVG(reliability) as avg_reliability,
+        AVG(quality) as avg_quality,
+        AVG(accessibility) as avg_accessibility
+      FROM current
+    `);
+
+    const summary = (summaryRows[0] as any) || {};
+
+    // Score distribution histogram
+    const distributionRows = await db.all(`
+      WITH latest_scores AS (
+        SELECT relay_url, score,
+          ROW_NUMBER() OVER (PARTITION BY relay_url ORDER BY timestamp DESC) as rn
+        FROM score_history WHERE score IS NOT NULL
+      )
+      SELECT
+        CASE
+          WHEN score >= 90 THEN '90-100'
+          WHEN score >= 80 THEN '80-89'
+          WHEN score >= 70 THEN '70-79'
+          WHEN score >= 60 THEN '60-69'
+          WHEN score >= 50 THEN '50-59'
+          ELSE '<50'
+        END as bucket,
+        COUNT(*) as count
+      FROM latest_scores WHERE rn = 1
+      GROUP BY 1
+      ORDER BY 1 DESC
+    `);
+
+    // Network trend over time (daily averages)
+    const trendRows = await db.all(`
+      SELECT
+        CAST(timestamp / 86400 AS INTEGER) * 86400 as day,
+        AVG(score) as avg_score,
+        MEDIAN(score) as median_score,
+        COUNT(DISTINCT relay_url) as relay_count
+      FROM score_history
+      WHERE timestamp >= ? AND score IS NOT NULL
+      GROUP BY 1
+      ORDER BY 1
+    `, periodStart);
+
+    // Compare with previous period for "vs last week" stats
+    const compareRows = await db.all(`
+      WITH current_scores AS (
+        SELECT relay_url, score,
+          ROW_NUMBER() OVER (PARTITION BY relay_url ORDER BY timestamp DESC) as rn
+        FROM score_history
+        WHERE timestamp >= ? AND score IS NOT NULL
+      ),
+      prev_scores AS (
+        SELECT relay_url, score,
+          ROW_NUMBER() OVER (PARTITION BY relay_url ORDER BY timestamp DESC) as rn
+        FROM score_history
+        WHERE timestamp >= ? AND timestamp < ? AND score IS NOT NULL
+      ),
+      current_agg AS (
+        SELECT AVG(score) as avg_score, COUNT(*) as cnt,
+          SUM(CASE WHEN score >= 70 THEN 1 ELSE 0 END) as healthy
+        FROM current_scores WHERE rn = 1
+      ),
+      prev_agg AS (
+        SELECT AVG(score) as avg_score, COUNT(*) as cnt,
+          SUM(CASE WHEN score >= 70 THEN 1 ELSE 0 END) as healthy
+        FROM prev_scores WHERE rn = 1
+      )
+      SELECT
+        c.avg_score as current_avg,
+        p.avg_score as prev_avg,
+        c.cnt as current_count,
+        p.cnt as prev_count,
+        c.healthy as current_healthy,
+        p.healthy as prev_healthy
+      FROM current_agg c, prev_agg p
+    `, periodStart, prevPeriodStart, periodStart);
+
+    const compare = (compareRows[0] as any) || {};
+
+    // Geographic breakdown
+    const geoRows = await db.all(`
+      WITH latest_scores AS (
+        SELECT relay_url, score, reliability,
+          ROW_NUMBER() OVER (PARTITION BY relay_url ORDER BY timestamp DESC) as rn
+        FROM score_history WHERE score IS NOT NULL
+      )
+      SELECT
+        COALESCE(j.country_code, 'Unknown') as country_code,
+        COALESCE(j.country_name, 'Unknown') as country_name,
+        COUNT(*) as relay_count,
+        AVG(s.score) as avg_score,
+        AVG(s.reliability) as avg_reliability
+      FROM latest_scores s
+      LEFT JOIN relay_jurisdictions j ON s.relay_url = j.relay_url
+      WHERE s.rn = 1
+      GROUP BY j.country_code, j.country_name
+      ORDER BY relay_count DESC
+    `);
+
+    // Top movers (biggest score changes)
+    const moversRows = await db.all(`
+      WITH period_scores AS (
+        SELECT relay_url, score, timestamp,
+          FIRST_VALUE(score) OVER (PARTITION BY relay_url ORDER BY timestamp ASC) as first_score,
+          LAST_VALUE(score) OVER (PARTITION BY relay_url ORDER BY timestamp ASC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as last_score
+        FROM score_history
+        WHERE timestamp >= ? AND score IS NOT NULL
+      ),
+      changes AS (
+        SELECT DISTINCT relay_url,
+          last_score - first_score as change,
+          first_score,
+          last_score
+        FROM period_scores
+      )
+      SELECT * FROM changes WHERE ABS(change) >= 3 ORDER BY change DESC
+    `, periodStart);
+
+    // Churn analysis
+    const churnRows = await db.all(`
+      WITH latest_probes AS (
+        SELECT url, MAX(timestamp) as last_seen,
+          MIN(timestamp) as first_seen,
+          SUM(CASE WHEN reachable THEN 1 ELSE 0 END) as reachable_count,
+          COUNT(*) as total_count
+        FROM probes
+        GROUP BY url
+      )
+      SELECT
+        COUNT(*) FILTER (WHERE first_seen >= ?) as new_relays,
+        COUNT(*) FILTER (WHERE last_seen < ? AND last_seen >= ?) as went_offline,
+        COUNT(*) FILTER (WHERE last_seen < ?) as zombie_relays
+      FROM latest_probes
+    `, periodStart, now - 86400, periodStart, now - (30 * 86400));
+
+    const churn = (churnRows[0] as any) || {};
+
+    // Build result
+    const totalRelays = Number(summary.total_relays ?? 0);
+
+    return {
+      computedAt: now,
+      periodDays,
+      summary: {
+        totalRelays,
+        avgScore: Math.round((summary.avg_score ?? 0) * 10) / 10,
+        medianScore: Math.round(summary.median_score ?? 0),
+        p25Score: Math.round(summary.p25 ?? 0),
+        p75Score: Math.round(summary.p75 ?? 0),
+        stddev: Math.round((summary.stddev ?? 0) * 10) / 10,
+        healthyCount: Number(summary.healthy_count ?? 0),
+        healthyPercent: totalRelays > 0 ? Math.round((Number(summary.healthy_count ?? 0) / totalRelays) * 100) : 0,
+        degradedCount: Number(summary.degraded_count ?? 0),
+        poorCount: Number(summary.poor_count ?? 0),
+        avgReliability: Math.round(summary.avg_reliability ?? 0),
+        avgQuality: Math.round(summary.avg_quality ?? 0),
+        avgAccessibility: Math.round(summary.avg_accessibility ?? 0),
+      },
+      comparison: {
+        avgScoreChange: compare.current_avg != null && compare.prev_avg != null
+          ? Math.round((Number(compare.current_avg) - Number(compare.prev_avg)) * 10) / 10
+          : null,
+        relayCountChange: Number(compare.current_count ?? 0) - Number(compare.prev_count ?? 0),
+        healthyPercentChange: compare.current_count && compare.prev_count
+          ? Math.round((Number(compare.current_healthy) / Number(compare.current_count) - Number(compare.prev_healthy) / Number(compare.prev_count)) * 100)
+          : null,
+      },
+      distribution: distributionRows.map((r: any) => ({
+        bucket: r.bucket,
+        count: Number(r.count),
+        percent: totalRelays > 0 ? Math.round((Number(r.count) / totalRelays) * 100) : 0,
+      })),
+      trend: trendRows.map((r: any) => ({
+        timestamp: Number(r.day),
+        avgScore: Math.round((r.avg_score ?? 0) * 10) / 10,
+        medianScore: Math.round(r.median_score ?? 0),
+        relayCount: Number(r.relay_count),
+      })),
+      geographic: geoRows.map((r: any) => ({
+        countryCode: r.country_code,
+        countryName: r.country_name,
+        relayCount: Number(r.relay_count),
+        avgScore: Math.round((r.avg_score ?? 0) * 10) / 10,
+        avgReliability: Math.round(r.avg_reliability ?? 0),
+      })),
+      topMovers: {
+        improving: moversRows
+          .filter((r: any) => Number(r.change) > 0)
+          .slice(0, 10)
+          .map((r: any) => ({
+            relayUrl: r.relay_url,
+            change: Number(r.change),
+            fromScore: Number(r.first_score),
+            toScore: Number(r.last_score),
+          })),
+        declining: moversRows
+          .filter((r: any) => Number(r.change) < 0)
+          .slice(-10)
+          .reverse()
+          .map((r: any) => ({
+            relayUrl: r.relay_url,
+            change: Number(r.change),
+            fromScore: Number(r.first_score),
+            toScore: Number(r.last_score),
+          })),
+      },
+      churn: {
+        newRelays: Number(churn.new_relays ?? 0),
+        wentOffline: Number(churn.went_offline ?? 0),
+        zombieRelays: Number(churn.zombie_relays ?? 0),
+      },
+    };
+  }
+
+  /**
+   * Cache network stats for a specific period
+   */
+  async cacheNetworkStats(period: string, stats: NetworkStats): Promise<void> {
+    const db = await this.ensureReady();
+    await db.run(
+      `INSERT OR REPLACE INTO network_stats_cache (period, computed_at, stats_json)
+       VALUES (?, ?, ?)`,
+      period,
+      stats.computedAt,
+      JSON.stringify(stats)
+    );
+  }
+
+  /**
+   * Get cached network stats for a period
+   * Returns null if cache is stale (older than maxAgeSeconds)
+   */
+  async getCachedNetworkStats(period: string, maxAgeSeconds: number = 3600): Promise<NetworkStats | null> {
+    const db = await this.ensureReady();
+    const now = Math.floor(Date.now() / 1000);
+
+    const rows = await db.all(
+      `SELECT stats_json, computed_at FROM network_stats_cache WHERE period = ?`,
+      period
+    );
+
+    if (rows.length === 0) return null;
+
+    const row = rows[0] as any;
+    const age = now - Number(row.computed_at);
+
+    if (age > maxAgeSeconds) return null;
+
+    try {
+      return JSON.parse(row.stats_json) as NetworkStats;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Get network stats, using cache if available, otherwise compute fresh
+   */
+  async getNetworkStats(periodDays: number = 7, maxCacheAgeSeconds: number = 3600): Promise<NetworkStats> {
+    const period = `${periodDays}d`;
+
+    // Try cache first
+    const cached = await this.getCachedNetworkStats(period, maxCacheAgeSeconds);
+    if (cached) return cached;
+
+    // Compute fresh
+    const stats = await this.computeNetworkStats(periodDays);
+
+    // Cache for future requests
+    await this.cacheNetworkStats(period, stats);
+
+    return stats;
+  }
+
+  /**
+   * Checkpoint the WAL file to prevent stale WAL issues.
+   * Uses FORCE CHECKPOINT to push through even with active readers.
+   * Should be called periodically and before shutdown.
+   *
+   * @param force - If true, use FORCE CHECKPOINT (default: true)
+   * @returns true if checkpoint succeeded, false otherwise
+   */
+  async checkpoint(force: boolean = true): Promise<boolean> {
     const db = await this.ensureReady();
     try {
-      await db.run('CHECKPOINT');
+      await db.run(force ? 'FORCE CHECKPOINT' : 'CHECKPOINT');
+      return true;
     } catch (err) {
-      // Ignore checkpoint errors - not critical
       console.error('Checkpoint failed:', err);
+      return false;
     }
+  }
+
+  /**
+   * Get the WAL file size in bytes.
+   * Returns 0 if WAL file doesn't exist.
+   */
+  getWalFileSize(): number {
+    try {
+      const walPath = this.dbPath + '.wal';
+      const fs = require('fs');
+      const stats = fs.statSync(walPath);
+      return stats.size;
+    } catch {
+      // WAL file doesn't exist or can't be read
+      return 0;
+    }
+  }
+
+  /**
+   * Get the WAL file size in megabytes (for logging).
+   */
+  getWalFileSizeMB(): number {
+    return Math.round(this.getWalFileSize() / (1024 * 1024) * 10) / 10;
+  }
+
+  /**
+   * Get the oldest probe timestamp to determine data availability
+   */
+  async getOldestProbeTimestamp(): Promise<number | null> {
+    const db = await this.ensureReady();
+    const rows = await db.all(`SELECT MIN(timestamp) as oldest FROM probes`);
+    const oldest = (rows[0] as any)?.oldest;
+    return oldest ? Number(oldest) : null;
   }
 
   async close(): Promise<void> {
     if (this.db) {
-      // Checkpoint before closing to flush WAL
+      // Force checkpoint before closing to flush WAL
       try {
-        await this.db.run('CHECKPOINT');
+        await this.db.run('FORCE CHECKPOINT');
       } catch {
         // Ignore checkpoint errors during close
       }

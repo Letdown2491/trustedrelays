@@ -222,65 +222,76 @@ export function computeUptimeScore(probes: ProbeResult[]): number {
 }
 
 /**
- * Calculate consistency score from probe results with temporal weighting.
- * Low variance in connection times = high consistency.
- * Recent variance is weighted more heavily than older variance.
- * Uses coefficient of variation (CV): stddev / mean
- * CV of 0 = score 100, CV of 1+ = score 0
+ * Calculate consistency score from probe results using IQR (Interquartile Range).
+ *
+ * Uses IQR-based scoring which is robust to outliers, unlike CV (coefficient of
+ * variation). This is important because network probes often have bimodal
+ * distributions with occasional multi-second outliers from TCP retries or
+ * rate limiting, which would unfairly penalize otherwise excellent relays.
+ *
+ * Formula: score = 100 - (iqr_ratio * 50), where iqr_ratio = (P75 - P25) / P50
+ *
+ * Scoring scale:
+ * - IQR ratio 0.0 → 100 (perfect consistency)
+ * - IQR ratio 0.5 → 75 (good consistency)
+ * - IQR ratio 1.0 → 50 (moderate consistency)
+ * - IQR ratio 2.0+ → 0 (poor consistency)
  *
  * Note: Only uses connectTime (not readTime) because they measure different
- * operations with different baseline latencies. Mixing them would create
- * artificial variance even if both are individually stable.
+ * operations with different baseline latencies.
  */
 export function computeConsistencyScore(probes: ProbeResult[]): number {
   const reachableProbes = probes.filter(p => p.reachable);
-  if (reachableProbes.length < 2) {
-    // Not enough data to measure consistency - assume moderate
+  if (reachableProbes.length < 4) {
+    // Need at least 4 samples for meaningful quartiles
     return 70;
   }
 
-  const now = Date.now() / 1000;
-
-  // Get connect times with weights
-  const samples: Array<{ time: number; weight: number }> = [];
+  // Get connect times
+  const times: number[] = [];
   for (const probe of reachableProbes) {
-    if (probe.connectTime !== undefined) {
-      samples.push({
-        time: probe.connectTime,
-        weight: getTimeWeight(probe.timestamp, now),
-      });
+    if (probe.connectTime !== undefined && probe.connectTime > 0) {
+      times.push(probe.connectTime);
     }
   }
 
-  if (samples.length < 2) {
+  if (times.length < 4) {
     return 70; // Not enough data
   }
 
-  // Calculate weighted mean
-  let weightedSum = 0;
-  let totalWeight = 0;
-  for (const s of samples) {
-    weightedSum += s.time * s.weight;
-    totalWeight += s.weight;
-  }
-  const weightedMean = weightedSum / totalWeight;
+  // Sort for percentile calculation
+  times.sort((a, b) => a - b);
 
-  if (weightedMean === 0) return 100; // Perfect (no latency)
+  // Calculate percentiles
+  const p25 = percentile(times, 25);
+  const p50 = percentile(times, 50);
+  const p75 = percentile(times, 75);
 
-  // Calculate weighted variance
-  let weightedSquaredDiffSum = 0;
-  for (const s of samples) {
-    const diff = s.time - weightedMean;
-    weightedSquaredDiffSum += s.weight * diff * diff;
-  }
-  const weightedVariance = weightedSquaredDiffSum / totalWeight;
-  const weightedStddev = Math.sqrt(weightedVariance);
+  if (p50 === 0) return 100; // Perfect (no latency)
 
-  // Coefficient of variation
-  const cv = weightedStddev / weightedMean;
+  // IQR ratio: how spread out is the middle 50% relative to median
+  const iqrRatio = (p75 - p25) / p50;
 
-  // Score: CV of 0 = 100, CV of 0.5 = 50, CV of 1+ = 0
-  return clampScore(100 - (cv * 100));
+  // Score: IQR ratio of 0 = 100, ratio of 2 = 0
+  return clampScore(100 - (iqrRatio * 50));
+}
+
+/**
+ * Calculate percentile value from sorted array.
+ * Uses linear interpolation between closest ranks.
+ */
+function percentile(sorted: number[], p: number): number {
+  if (sorted.length === 0) return 0;
+  if (sorted.length === 1) return sorted[0];
+
+  const index = (p / 100) * (sorted.length - 1);
+  const lower = Math.floor(index);
+  const upper = Math.ceil(index);
+
+  if (lower === upper) return sorted[lower];
+
+  const fraction = index - lower;
+  return sorted[lower] * (1 - fraction) + sorted[upper] * fraction;
 }
 
 /**

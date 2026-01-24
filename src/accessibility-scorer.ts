@@ -21,7 +21,6 @@ const ACCESSIBILITY_WEIGHTS = {
 const BARRIER_PENALTIES = {
   AUTH_REQUIRED: 30,      // Authentication is a significant barrier
   PAYMENT_REQUIRED: 40,   // Payment is the biggest barrier
-  RESTRICTED_WRITES: 10,  // Minor barrier
   MAX_POW_PENALTY: 15,    // Maximum PoW difficulty penalty
 } as const;
 
@@ -116,7 +115,10 @@ const SURVEILLANCE_SCORES: Record<EyesAlliance, number> = {
  * - payment_required: Major barrier (-40)
  * - auth_required: Significant barrier (-30)
  * - min_pow_difficulty: Minor barrier (-5 to -15)
- * - restricted_writes: Minor barrier (-10)
+ *
+ * Note: restricted_writes is NOT penalized because it indicates
+ * relay specialization (e.g., NIP-46 signing relays), not access restriction.
+ * The real barriers to access are auth and payment, which are already penalized.
  *
  * Uses diminishing returns so stacked barriers don't over-penalize:
  * First barrier at 100%, second at 50%, third at 30%, rest at 20%
@@ -148,11 +150,6 @@ export function scoreAccessBarriers(nip11?: NIP11Info): number {
     if (lim.min_pow_difficulty !== undefined && lim.min_pow_difficulty > 0) {
       const powPenalty = Math.min(BARRIER_PENALTIES.MAX_POW_PENALTY, lim.min_pow_difficulty);
       penalties.push(powPenalty);
-    }
-
-    // Restricted writes is a minor barrier
-    if (lim.restricted_writes) {
-      penalties.push(BARRIER_PENALTIES.RESTRICTED_WRITES);
     }
   }
 

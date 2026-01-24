@@ -349,9 +349,9 @@ export class RelayTrustService {
       await this.cleanupOldData();
     }
 
-    // Checkpoint WAL every hour to prevent stale WAL issues on restart
-    const oneHourMs = 60 * 60 * 1000;
-    if (Date.now() - this.lastCheckpointAt > oneHourMs) {
+    // Checkpoint WAL every 15 minutes to prevent WAL growth
+    const fifteenMinMs = 15 * 60 * 1000;
+    if (Date.now() - this.lastCheckpointAt > fifteenMinMs) {
       await this.checkpointDatabase();
     }
 
@@ -385,16 +385,36 @@ export class RelayTrustService {
   }
 
   /**
-   * Checkpoint the database WAL to prevent stale WAL issues
-   * DuckDB can hang on startup if there's a large uncommitted WAL file
+   * Checkpoint the database WAL to prevent stale WAL issues.
+   * DuckDB can hang or OOM if there's a large uncommitted WAL file.
+   * Uses FORCE CHECKPOINT to push through even with active readers.
+   *
+   * WAL size threshold: 100MB - if exceeded after checkpoint, logs a warning.
    */
   private async checkpointDatabase(): Promise<void> {
-    try {
-      await this.db.checkpoint();
-      this.lastCheckpointAt = Date.now();
-      this.log('debug', 'Database checkpoint completed');
-    } catch (err) {
-      this.log('warn', `Database checkpoint failed: ${err}`);
+    const WAL_SIZE_THRESHOLD_MB = 100;
+
+    // Check WAL size before checkpoint
+    const walSizeBefore = this.db.getWalFileSizeMB();
+    if (walSizeBefore > 10) {
+      this.log('debug', `WAL size before checkpoint: ${walSizeBefore}MB`);
+    }
+
+    // Perform force checkpoint
+    const success = await this.db.checkpoint(true);
+    this.lastCheckpointAt = Date.now();
+
+    if (success) {
+      const walSizeAfter = this.db.getWalFileSizeMB();
+      if (walSizeAfter > WAL_SIZE_THRESHOLD_MB) {
+        this.log('warn', `WAL file still large after checkpoint: ${walSizeAfter}MB (threshold: ${WAL_SIZE_THRESHOLD_MB}MB)`);
+      } else if (walSizeBefore > 10) {
+        this.log('debug', `Checkpoint completed, WAL size: ${walSizeBefore}MB -> ${walSizeAfter}MB`);
+      } else {
+        this.log('debug', 'Database checkpoint completed');
+      }
+    } else {
+      this.log('warn', 'Database checkpoint failed');
     }
   }
 
@@ -455,10 +475,40 @@ export class RelayTrustService {
           // Resolve and store operator if NIP-11 has pubkey
           if (probe.nip11?.pubkey) {
             try {
-              const operatorResolution = await resolveOperator(url, probe.nip11);
+              // First resolve operator WITHOUT fetching WoT
+              const operatorResolution = await resolveOperator(url, probe.nip11, {
+                fetchTrustScore: false,
+              });
+
               if (operatorResolution.operatorPubkey) {
+                // Check if operator already has fresh WoT data (< 1 day old)
+                const existingWot = await this.db.getOperatorWot(operatorResolution.operatorPubkey);
+                const oneDayAgo = Math.floor(Date.now() / 1000) - 86400;
+                const needsWotFetch = !existingWot || !existingWot.wotUpdatedAt || existingWot.wotUpdatedAt < oneDayAgo;
+
+                if (needsWotFetch) {
+                  // Fetch WoT for this operator
+                  try {
+                    const trustScore = await getTrustScore(operatorResolution.operatorPubkey, { timeout: 10000 });
+                    if (trustScore) {
+                      operatorResolution.trustScore = trustScore.score;
+                      operatorResolution.trustConfidence = trustScore.confidence;
+                      operatorResolution.trustProviderCount = trustScore.providers.length;
+                    }
+                  } catch {
+                    // WoT fetch failure is not fatal
+                  }
+                } else {
+                  // Use existing WoT data
+                  if (existingWot.wotScore != null) {
+                    operatorResolution.trustScore = existingWot.wotScore;
+                    operatorResolution.trustConfidence = existingWot.wotConfidence ?? undefined;
+                    operatorResolution.trustProviderCount = existingWot.wotProviderCount ?? undefined;
+                  }
+                }
+
                 await this.db.storeOperatorResolution(operatorResolution);
-                this.log('debug', `Resolved operator for ${url}: ${operatorResolution.verificationMethod}`);
+                this.log('debug', `Resolved operator for ${url}: ${operatorResolution.verificationMethod}${needsWotFetch ? ' (fetched WoT)' : ' (used cached WoT)'}`);
               }
             } catch {
               // Operator resolution failure is not fatal
@@ -571,11 +621,35 @@ export class RelayTrustService {
         // Use cached operator resolution or resolve fresh
         let operatorResolution = allOperatorResolutions.get(url);
         if (!operatorResolution) {
+          // First resolve WITHOUT WoT
           operatorResolution = await resolveOperator(url, latestProbe?.nip11, {
-            fetchTrustScore: true,
+            fetchTrustScore: false,
             nip85Timeout: 10000,
           });
+
           if (operatorResolution.operatorPubkey) {
+            // Check if operator already has fresh WoT data
+            const existingWot = await this.db.getOperatorWot(operatorResolution.operatorPubkey);
+            const oneDayAgo = Math.floor(Date.now() / 1000) - 86400;
+            const needsWotFetch = !existingWot || !existingWot.wotUpdatedAt || existingWot.wotUpdatedAt < oneDayAgo;
+
+            if (needsWotFetch) {
+              try {
+                const trustScore = await getTrustScore(operatorResolution.operatorPubkey, { timeout: 10000 });
+                if (trustScore) {
+                  operatorResolution.trustScore = trustScore.score;
+                  operatorResolution.trustConfidence = trustScore.confidence;
+                  operatorResolution.trustProviderCount = trustScore.providers.length;
+                }
+              } catch {
+                // WoT fetch failure is not fatal
+              }
+            } else if (existingWot?.wotScore != null) {
+              operatorResolution.trustScore = existingWot.wotScore;
+              operatorResolution.trustConfidence = existingWot.wotConfidence ?? undefined;
+              operatorResolution.trustProviderCount = existingWot.wotProviderCount ?? undefined;
+            }
+
             await this.db.storeOperatorResolution(operatorResolution);
           }
         }
@@ -695,47 +769,40 @@ export class RelayTrustService {
   /**
    * Standalone WoT refresh (called from runCycle, doesn't need in-memory cache)
    * Uses parallel lookups with concurrency limit for efficiency
+   * Now works with normalized schema where WoT scores are stored per operator pubkey
    */
   private async refreshStaleWotScoresStandalone(): Promise<void> {
-    const staleOperators = await this.db.getOperatorsNeedingWotRefresh(1); // 1 day max age
-    if (staleOperators.length === 0) {
+    const stalePubkeys = await this.db.getOperatorsNeedingWotRefresh(1); // 1 day max age
+    if (stalePubkeys.length === 0) {
       this.log('debug', 'No stale WoT scores to refresh');
       return;
     }
 
-    // Dedupe by operator pubkey to avoid redundant lookups
-    const uniquePubkeys = new Map<string, OperatorResolution[]>();
-    for (const op of staleOperators) {
-      if (!op.operatorPubkey) continue;
-      const existing = uniquePubkeys.get(op.operatorPubkey) || [];
-      existing.push(op);
-      uniquePubkeys.set(op.operatorPubkey, existing);
-    }
-
-    const pubkeyList = Array.from(uniquePubkeys.entries());
-    this.log('info', `Refreshing WoT scores for ${pubkeyList.length} unique operators...`);
+    this.log('info', `Refreshing WoT scores for ${stalePubkeys.length} operators...`);
 
     let refreshed = 0;
     let failed = 0;
     const concurrency = 20; // Process 20 pubkeys in parallel
 
     // Process in batches for parallel lookups
-    for (let i = 0; i < pubkeyList.length; i += concurrency) {
-      const batch = pubkeyList.slice(i, i + concurrency);
+    for (let i = 0; i < stalePubkeys.length; i += concurrency) {
+      const batch = stalePubkeys.slice(i, i + concurrency);
 
       const results = await Promise.allSettled(
-        batch.map(async ([pubkey, resolutions]) => {
+        batch.map(async (pubkey) => {
           const trustScore = await getTrustScore(pubkey, { timeout: 10000 });
 
-          // Update all resolutions for this operator
-          for (const resolution of resolutions) {
-            if (trustScore) {
-              resolution.trustScore = trustScore.score;
-              resolution.trustConfidence = trustScore.confidence;
-              resolution.trustProviderCount = trustScore.providers.length;
-            }
-            // Store with updated wot_updated_at timestamp (even if no score found)
-            await this.db.storeOperatorResolution(resolution);
+          // Store WoT score directly in operators table
+          if (trustScore) {
+            await this.db.storeOperatorWot(
+              pubkey,
+              trustScore.score,
+              trustScore.confidence,
+              trustScore.providers.length
+            );
+          } else {
+            // Store with null score but updated timestamp to avoid re-fetching
+            await this.db.storeOperatorWot(pubkey, 0, null, 0);
           }
           return true;
         })
@@ -750,12 +817,12 @@ export class RelayTrustService {
       }
 
       // Progress logging every 100 operators
-      if ((i + concurrency) % 100 < concurrency && i + concurrency < pubkeyList.length) {
-        this.log('info', `WoT refresh progress: ${Math.min(i + concurrency, pubkeyList.length)}/${pubkeyList.length}`);
+      if ((i + concurrency) % 100 < concurrency && i + concurrency < stalePubkeys.length) {
+        this.log('info', `WoT refresh progress: ${Math.min(i + concurrency, stalePubkeys.length)}/${stalePubkeys.length}`);
       }
 
       // Small delay between batches to be nice to NIP-85 relays
-      if (i + concurrency < pubkeyList.length) {
+      if (i + concurrency < stalePubkeys.length) {
         await sleep(500);
       }
     }

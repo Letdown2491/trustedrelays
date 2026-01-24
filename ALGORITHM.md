@@ -101,24 +101,29 @@ Relay B is more reliable for users because brief interruptions are less disrupti
 
 ### Consistency Score (20%)
 
-Measures how stable the relay's connection times are. Uses coefficient of variation (CV):
+Measures how stable the relay's connection times are. Uses **IQR (Interquartile Range)** which is robust to outliers:
 
 ```
-cv = stddev(connect_times) / mean(connect_times)
-consistency_score = max(0, 100 - (cv * 100))
+iqr_ratio = (P75 - P25) / P50
+consistency_score = max(0, 100 - (iqr_ratio * 50))
 ```
 
-Note: Only uses `connectTime` (not `readTime`) because they measure different operations with different baseline latencies. Mixing them would create artificial variance even if both are individually stable.
+Note: Only uses `connectTime` (not `readTime`) because they measure different operations with different baseline latencies.
 
-| CV | Meaning | Score |
-|----|---------|-------|
+| IQR Ratio | Meaning | Score |
+|-----------|---------|-------|
 | 0.0 | Perfect consistency | 100 |
-| 0.1 | 10% variation | 90 |
-| 0.3 | 30% variation | 70 |
-| 0.5 | 50% variation | 50 |
-| 1.0+ | Wild swings | 0 |
+| 0.5 | Moderate spread | 75 |
+| 1.0 | High spread | 50 |
+| 2.0+ | Unstable | 0 |
 
-**Why this matters:** A relay with 200ms ± 20ms is more reliable than one with 100ms ± 200ms, even though the second one is sometimes faster.
+**Why IQR instead of CV (coefficient of variation)?**
+
+Network probes often have bimodal distributions with occasional multi-second outliers from TCP retries, rate limiting, or transient network issues. Using CV (stddev/mean), a single 2000ms outlier among 100ms samples would destroy the score. IQR ignores outliers by design since it only considers the middle 50% of measurements.
+
+**Example:** A relay with probes of [100, 110, 120, 130, 2500]ms:
+- CV approach: mean=592ms, stddev=1018ms, CV=1.72 → **Score: 0** (unfairly penalized)
+- IQR approach: P25=105ms, P50=120ms, P75=125ms, IQR ratio=0.17 → **Score: 92** (correctly reflects stable core performance)
 
 ### Latency Score (20%)
 
@@ -154,6 +159,14 @@ latency_score = connect_percentile * 0.30 + read_percentile * 0.70
 ```
 
 **Rationale:** Users connect once but read many times. Read performance matters more for ongoing experience.
+
+**Handling missing read data:** Some relays (e.g., NIP-46 signing relays) don't support standard event reads, so `rtt_read` may be NULL. When read data is unavailable, the score uses connect percentile only:
+
+```
+latency_score = connect_percentile  (when rtt_read is NULL)
+```
+
+This prevents relays from being unfairly penalized for not having read metrics.
 
 #### Example
 
@@ -322,9 +335,10 @@ Base score: 100
 Deductions:
   -40: payment_required
   -30: auth_required
-  -10: restricted_writes
   -5 to -15: min_pow_difficulty (penalty equals difficulty level, max 15)
 ```
+
+Note: `restricted_writes` is NOT penalized. It indicates relay specialization (e.g., NIP-46 signing relays only accepting kinds 24133/24135), not access restriction. The real barriers to user access are auth and payment requirements.
 
 If NIP-11 unavailable: default score is 70 (assume somewhat open).
 

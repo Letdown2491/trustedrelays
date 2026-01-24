@@ -72,9 +72,9 @@ describe('scoreAccessBarriers', () => {
     expect(scoreAccessBarriers(nip11)).toBe(60); // 100 - 40
   });
 
-  test('penalizes restricted_writes', () => {
+  test('does not penalize restricted_writes (specialization, not exclusion)', () => {
     const nip11: NIP11Info = { limitation: { restricted_writes: true } };
-    expect(scoreAccessBarriers(nip11)).toBe(90); // 100 - 10
+    expect(scoreAccessBarriers(nip11)).toBe(100); // No penalty for kind restrictions
   });
 
   test('penalizes PoW requirement', () => {
@@ -101,12 +101,11 @@ describe('scoreAccessBarriers', () => {
       limitation: {
         auth_required: true,
         payment_required: true,
-        restricted_writes: true,
         min_pow_difficulty: 20,
       },
     };
-    // Diminishing returns: 40 × 1.0 + 30 × 0.5 + 15 × 0.3 + 10 × 0.2 = 61.5 penalty
-    expect(scoreAccessBarriers(nip11)).toBe(39);
+    // Diminishing returns: 40 × 1.0 + 30 × 0.5 + 15 × 0.3 = 59.5 penalty
+    expect(scoreAccessBarriers(nip11)).toBe(41);
   });
 });
 

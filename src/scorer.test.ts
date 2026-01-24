@@ -106,10 +106,16 @@ describe('computeUptimeScore', () => {
 });
 
 describe('computeConsistencyScore', () => {
-  test('returns 70 for insufficient data', () => {
+  test('returns 70 for insufficient data (need 4+ samples for IQR)', () => {
     expect(computeConsistencyScore([])).toBe(70);
     expect(computeConsistencyScore([
       probe({ url: 'wss://test', timestamp: 1, reachable: true, connectTime: 100 }),
+    ])).toBe(70);
+    // 3 samples still insufficient for meaningful IQR
+    expect(computeConsistencyScore([
+      probe({ url: 'wss://test', timestamp: 1, reachable: true, connectTime: 100 }),
+      probe({ url: 'wss://test', timestamp: 2, reachable: true, connectTime: 100 }),
+      probe({ url: 'wss://test', timestamp: 3, reachable: true, connectTime: 100 }),
     ])).toBe(70);
   });
 
@@ -118,6 +124,7 @@ describe('computeConsistencyScore', () => {
       probe({ url: 'wss://test', timestamp: 1, reachable: true, connectTime: 100 }),
       probe({ url: 'wss://test', timestamp: 2, reachable: true, connectTime: 100 }),
       probe({ url: 'wss://test', timestamp: 3, reachable: true, connectTime: 100 }),
+      probe({ url: 'wss://test', timestamp: 4, reachable: true, connectTime: 100 }),
     ];
     expect(computeConsistencyScore(probes)).toBe(100);
   });

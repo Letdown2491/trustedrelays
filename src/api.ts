@@ -6,6 +6,7 @@ import { computeAccessibilityScore, getEyesAlliance } from './accessibility-scor
 import { classifyPolicy } from './policy-classifier.js';
 import { resolveOperator } from './operator-resolver.js';
 import { DASHBOARD_HTML } from './dashboard-template.js';
+import { NETWORK_HTML } from './network-template.js';
 import {
   computeScoreConfidenceInterval,
   computeUptimeConfidenceInterval,
@@ -160,6 +161,22 @@ function validateRelayUrl(urlParam: string | null): { valid: true; url: string }
 }
 
 /**
+ * Parse period parameter (24h, 7d, 30d, 90d) to days
+ */
+function parsePeriod(period: string): number {
+  const match = period.match(/^(\d+)(h|d)$/);
+  if (!match) return 7; // Default to 7 days
+
+  const value = parseInt(match[1], 10);
+  const unit = match[2];
+
+  if (unit === 'h') {
+    return value / 24; // Convert hours to fractional days (6h = 0.25 days)
+  }
+  return Math.min(365, Math.max(1, value)); // Clamp to 1-365 days
+}
+
+/**
  * Serve static files from public folder
  */
 async function serveStaticFile(filename: string, contentType: string): Promise<Response> {
@@ -190,6 +207,23 @@ function serveDashboard(): Response {
       'X-XSS-Protection': '1; mode=block',
       'Referrer-Policy': 'strict-origin-when-cross-origin',
       'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'",
+    },
+  });
+}
+
+/**
+ * Serve the network statistics page
+ */
+function serveNetworkPage(): Response {
+  return new Response(NETWORK_HTML, {
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8',
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
+      'X-XSS-Protection': '1; mode=block',
+      'Referrer-Policy': 'strict-origin-when-cross-origin',
+      // Allow Leaflet from unpkg and map tiles from CartoDB
+      'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://unpkg.com; style-src 'self' 'unsafe-inline' https://unpkg.com; img-src 'self' data: https://*.basemaps.cartocdn.com; connect-src 'self' https://*.basemaps.cartocdn.com",
     },
   });
 }
@@ -837,12 +871,46 @@ export function startApiServer(config: ApiConfig): { stop: () => void } {
           }
         }
 
+        // Get network-wide statistics
+        if (path === '/api/network/stats') {
+          try {
+            const periodParam = url.searchParams.get('period') || '6h';
+            const periodDays = parsePeriod(periodParam);
+
+            // Check cache first (keyed by period)
+            const statsCacheKey = `network-stats:${periodParam}`;
+            let stats = responseCache.get<object>(statsCacheKey);
+            if (!stats) {
+              // Get relay list (also cached)
+              const relaysCacheKey = 'relays';
+              let relays = responseCache.get<any[]>(relaysCacheKey);
+              if (!relays) {
+                relays = await getRelayList(db);
+                responseCache.set(relaysCacheKey, relays, CACHE_TTL.RELAY_LIST);
+              }
+
+              // Compute summary stats from relay list
+              stats = await computeNetworkStatsFromRelays(db, relays, periodDays);
+              responseCache.set(statsCacheKey, stats, CACHE_TTL.RELAY_LIST); // Same 30s TTL
+            }
+            return addRateLimitHeaders(jsonResponse(stats));
+          } catch (err) {
+            console.error('Failed to get network stats:', err);
+            return addRateLimitHeaders(errorResponse(sanitizeError(err), 500));
+          }
+        }
+
         return addRateLimitHeaders(errorResponse('Not found', 404));
       }
 
       // Dashboard
       if (path === '/' || path === '/dashboard') {
         return serveDashboard();
+      }
+
+      // Network stats page
+      if (path === '/network') {
+        return serveNetworkPage();
       }
 
       // Static assets
@@ -973,8 +1041,10 @@ async function getRelayList(db: DataStore): Promise<Array<{
   status: string;
   isOnline: boolean;
   accessLevel: string;
+  relayType: string;
   policy: string | null;
   countryCode: string | null;
+  countryName: string | null;
   region: string | null;
   observations: number;
   confidence: 'low' | 'medium' | 'high';
@@ -984,6 +1054,7 @@ async function getRelayList(db: DataStore): Promise<Array<{
   isSecure: boolean;
   lastSeen: number | null;
   supportedNips: number[];
+  operatorTrust: number | null;
 }>> {
   // Fetch all data in parallel using bulk queries
   const [
@@ -1089,8 +1160,10 @@ async function getRelayList(db: DataStore): Promise<Array<{
       status,
       isOnline: latestProbe.reachable,
       accessLevel: latestProbe.accessLevel ?? 'unknown',
+      relayType: latestProbe.relayType ?? 'unknown',
       policy: policy.policy,
       countryCode: jurisdiction?.countryCode ?? null,
+      countryName: jurisdiction?.countryName ?? null,
       region: jurisdiction?.region ?? null,
       observations: weightedObs,
       confidence,
@@ -1100,6 +1173,7 @@ async function getRelayList(db: DataStore): Promise<Array<{
       isSecure,
       lastSeen: latestProbe.timestamp ?? null,
       supportedNips: normalizeNipArray(latestProbe.nip11?.supported_nips),
+      operatorTrust: operatorResolution?.trustScore ?? null,
     });
   }
 
@@ -1497,5 +1571,198 @@ async function getRelayAnalytics(db: DataStore, url: string): Promise<{
       rolling30d: rolling?.rolling30d ?? null,
       rolling90d: rolling?.rolling90d ?? null,
     },
+  };
+}
+
+/**
+ * Compute network statistics from relay list data.
+ * This ensures stats match the relay list count (computed from probes)
+ * rather than score_history (which only has published assertions).
+ */
+async function computeNetworkStatsFromRelays(
+  db: DataStore,
+  relays: Array<{
+    url: string;
+    score: number | null;
+    reliability: number | null;
+    quality: number | null;
+    accessibility: number | null;
+    countryCode: string | null;
+    countryName: string | null;
+    region: string | null;
+    relayType: string;
+    policy: string | null;
+    isOnline: boolean;
+    operatorTrust: number | null;
+  }>,
+  periodDays: number
+): Promise<import('./types.js').NetworkStats> {
+  const now = Math.floor(Date.now() / 1000);
+
+  // Filter to relays with scores
+  const scoredRelays = relays.filter(r => r.score !== null);
+  const scores = scoredRelays.map(r => r.score as number);
+
+  // Compute summary stats
+  const totalRelays = relays.length;
+  const avgScore = scores.length > 0 ? scores.reduce((a, b) => a + b, 0) / scores.length : 0;
+
+  // Sort for percentiles
+  const sortedScores = [...scores].sort((a, b) => a - b);
+  const medianScore = sortedScores.length > 0
+    ? sortedScores[Math.floor(sortedScores.length / 2)]
+    : 0;
+  const p25 = sortedScores.length > 0
+    ? sortedScores[Math.floor(sortedScores.length * 0.25)]
+    : 0;
+  const p75 = sortedScores.length > 0
+    ? sortedScores[Math.floor(sortedScores.length * 0.75)]
+    : 0;
+
+  // Standard deviation
+  const variance = scores.length > 1
+    ? scores.reduce((sum, s) => sum + Math.pow(s - avgScore, 2), 0) / (scores.length - 1)
+    : 0;
+  const stddev = Math.sqrt(variance);
+
+  // Health counts
+  const healthyCount = scoredRelays.filter(r => (r.score ?? 0) >= 70).length;
+  const degradedCount = scoredRelays.filter(r => (r.score ?? 0) >= 50 && (r.score ?? 0) < 70).length;
+  const poorCount = scoredRelays.filter(r => (r.score ?? 0) < 50).length;
+
+  // Average component scores
+  const avgReliability = scoredRelays.length > 0
+    ? scoredRelays.reduce((sum, r) => sum + (r.reliability ?? 0), 0) / scoredRelays.length
+    : 0;
+  const avgQuality = scoredRelays.length > 0
+    ? scoredRelays.reduce((sum, r) => sum + (r.quality ?? 0), 0) / scoredRelays.length
+    : 0;
+  const avgAccessibility = scoredRelays.length > 0
+    ? scoredRelays.reduce((sum, r) => sum + (r.accessibility ?? 0), 0) / scoredRelays.length
+    : 0;
+
+  // Score distribution
+  const buckets = ['90-100', '80-89', '70-79', '60-69', '50-59', '<50'];
+  const distribution = buckets.map(bucket => {
+    let count = 0;
+    if (bucket === '90-100') count = scoredRelays.filter(r => (r.score ?? 0) >= 90).length;
+    else if (bucket === '80-89') count = scoredRelays.filter(r => (r.score ?? 0) >= 80 && (r.score ?? 0) < 90).length;
+    else if (bucket === '70-79') count = scoredRelays.filter(r => (r.score ?? 0) >= 70 && (r.score ?? 0) < 80).length;
+    else if (bucket === '60-69') count = scoredRelays.filter(r => (r.score ?? 0) >= 60 && (r.score ?? 0) < 70).length;
+    else if (bucket === '50-59') count = scoredRelays.filter(r => (r.score ?? 0) >= 50 && (r.score ?? 0) < 60).length;
+    else count = scoredRelays.filter(r => (r.score ?? 0) < 50).length;
+    return {
+      bucket,
+      count,
+      percent: totalRelays > 0 ? Math.round((count / totalRelays) * 100) : 0,
+    };
+  });
+
+  // Geographic breakdown (from relay list data)
+  const geoMap = new Map<string, { count: number; scores: number[]; reliabilities: number[]; countryName: string }>();
+  for (const relay of scoredRelays) {
+    const code = relay.countryCode ?? 'Unknown';
+    const name = relay.countryName ?? relay.countryCode ?? 'Unknown';
+    if (!geoMap.has(code)) {
+      geoMap.set(code, { count: 0, scores: [], reliabilities: [], countryName: name });
+    }
+    const geo = geoMap.get(code)!;
+    geo.count++;
+    geo.scores.push(relay.score ?? 0);
+    geo.reliabilities.push(relay.reliability ?? 0);
+  }
+
+  const geographic = Array.from(geoMap.entries())
+    .map(([code, data]) => ({
+      countryCode: code,
+      countryName: data.countryName,
+      relayCount: data.count,
+      avgScore: data.scores.reduce((a, b) => a + b, 0) / data.scores.length,
+      avgReliability: data.reliabilities.reduce((a, b) => a + b, 0) / data.reliabilities.length,
+    }))
+    .sort((a, b) => b.relayCount - a.relayCount);
+
+  // Get trend data from score_history (historical data)
+  // Note: This may have fewer relays than current, but provides time series
+  const dbStats = await db.getNetworkStats(periodDays);
+
+  // Churn: count online vs offline from relay list
+  const onlineCount = relays.filter(r => r.isOnline).length;
+  const offlineCount = relays.length - onlineCount;
+
+  // Get oldest data timestamp to determine available periods
+  const oldestTimestamp = await db.getOldestProbeTimestamp();
+  const dataAgeDays = oldestTimestamp
+    ? Math.floor((now - oldestTimestamp) / 86400)
+    : 0;
+
+  // Policy breakdown (open/moderated/curated/specialized)
+  const policyCounts = new Map<string, number>();
+  for (const relay of relays) {
+    const policy = relay.policy || 'unknown';
+    policyCounts.set(policy, (policyCounts.get(policy) || 0) + 1);
+  }
+  const relayTypes = Array.from(policyCounts.entries())
+    .map(([type, count]) => ({
+      type,
+      count,
+      percent: totalRelays > 0 ? Math.round((count / totalRelays) * 100) : 0,
+    }))
+    .sort((a, b) => b.count - a.count);
+
+  // Operator trust breakdown
+  let highTrust = 0, mediumTrust = 0, lowTrust = 0, unverified = 0;
+  for (const relay of relays) {
+    if (relay.operatorTrust === null) {
+      unverified++;
+    } else if (relay.operatorTrust >= 70) {
+      highTrust++;
+    } else if (relay.operatorTrust >= 40) {
+      mediumTrust++;
+    } else {
+      lowTrust++;
+    }
+  }
+  const operatorTrust = [
+    { type: 'high', label: 'High (70+)', count: highTrust, percent: totalRelays > 0 ? Math.round((highTrust / totalRelays) * 100) : 0 },
+    { type: 'medium', label: 'Medium (40-69)', count: mediumTrust, percent: totalRelays > 0 ? Math.round((mediumTrust / totalRelays) * 100) : 0 },
+    { type: 'low', label: 'Low (<40)', count: lowTrust, percent: totalRelays > 0 ? Math.round((lowTrust / totalRelays) * 100) : 0 },
+    { type: 'unverified', label: 'Unverified', count: unverified, percent: totalRelays > 0 ? Math.round((unverified / totalRelays) * 100) : 0 },
+  ].filter(t => t.count > 0);
+
+  return {
+    computedAt: now,
+    periodDays,
+    summary: {
+      totalRelays,
+      avgScore: Math.round(avgScore * 10) / 10,
+      medianScore: Math.round(medianScore),
+      p25Score: Math.round(p25),
+      p75Score: Math.round(p75),
+      stddev: Math.round(stddev * 10) / 10,
+      healthyCount,
+      healthyPercent: totalRelays > 0 ? Math.round((healthyCount / totalRelays) * 100) : 0,
+      degradedCount,
+      poorCount,
+      avgReliability: Math.round(avgReliability * 10) / 10,
+      avgQuality: Math.round(avgQuality * 10) / 10,
+      avgAccessibility: Math.round(avgAccessibility * 10) / 10,
+    },
+    // Use comparison from DB if available (requires score_history)
+    comparison: dbStats.comparison,
+    distribution,
+    // Use trend from DB (requires score_history for historical data)
+    trend: dbStats.trend,
+    geographic,
+    // Use top movers from DB (requires score_history)
+    topMovers: dbStats.topMovers,
+    churn: {
+      newRelays: dbStats.churn.newRelays,
+      wentOffline: offlineCount,
+      zombieRelays: dbStats.churn.zombieRelays,
+    },
+    relayTypes,
+    operatorTrust,
+    dataAgeDays,
   };
 }
