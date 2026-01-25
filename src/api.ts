@@ -1260,9 +1260,9 @@ async function getRelayDetails(db: DataStore, url: string): Promise<object | nul
       quality: qualityScore.overall,
       accessibility: accessibilityScore.overall,
       components: {
-        // Reliability components (40% uptime, 20% recovery, 20% consistency, 20% latency)
+        // Reliability components (40% uptime, 20% resilience, 20% consistency, 20% latency)
         uptimeScore: score.uptimeScore,
-        recoveryScore: score.recoveryScore,
+        resilienceScore: score.resilienceScore,
         consistencyScore: score.consistencyScore,
         latencyScore: score.latencyScore,
         // Quality components

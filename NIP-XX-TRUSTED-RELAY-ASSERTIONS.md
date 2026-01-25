@@ -65,7 +65,7 @@ A parameterized replaceable event with `d` tag containing the relay's canonical 
 | Tag | Description |
 |-----|-------------|
 | `score` | Overall trust score (weighted combination: 40% reliability + 35% quality + 25% accessibility) |
-| `reliability` | Availability, recovery speed, consistency, and latency (0-100) |
+| `reliability` | Availability, outage resilience, consistency, and latency (0-100) |
 | `quality` | Policy documentation, security (TLS), and operator accountability (0-100) |
 | `accessibility` | Access barriers, limits, jurisdiction freedom, and surveillance risk (0-100) |
 | `confidence` | `low` (<100 obs), `medium` (100-499 obs), or `high` (500+ obs) |

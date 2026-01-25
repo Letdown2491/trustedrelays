@@ -221,7 +221,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
               <div class="algo-card-desc">Measures operational stability from probe data and NIP-66 monitor metrics.</div>
               <div class="algo-sub-list">
                 <div class="algo-sub-item"><span class="algo-sub-name">Uptime</span><span class="algo-sub-weight">40%</span></div>
-                <div class="algo-sub-item"><span class="algo-sub-name">Recovery</span><span class="algo-sub-weight">20%</span></div>
+                <div class="algo-sub-item"><span class="algo-sub-name">Resilience</span><span class="algo-sub-weight">20%</span></div>
                 <div class="algo-sub-item"><span class="algo-sub-name">Consistency</span><span class="algo-sub-weight">20%</span></div>
                 <div class="algo-sub-item"><span class="algo-sub-name">Latency</span><span class="algo-sub-weight">20%</span></div>
               </div>
@@ -1070,12 +1070,12 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
           '</div>' +
         '</div>' +
         // Three component score cards below
-        '<div class="detail-card ' + scoreClass(sc.reliability) + '" title="Reliability: Uptime (40%), Recovery (20%), Consistency (20%), Latency (20%)">' +
+        '<div class="detail-card ' + scoreClass(sc.reliability) + '" title="Reliability: Uptime (40%), Resilience (20%), Consistency (20%), Latency (20%)">' +
           '<div class="detail-card-label">Reliability</div>' +
           '<div class="detail-card-value">' + sc.reliability + '</div>' +
           '<div class="detail-card-scores">' +
             metricRow('Uptime', c.uptimeScore, 'Percentage of probes where relay was reachable (40% weight)') +
-            metricRow('Recovery', c.recoveryScore, 'How quickly relay recovers from outages (20% weight)') +
+            metricRow('Resilience', c.resilienceScore, 'Outage severity, frequency, and stability (20% weight)') +
             metricRow('Consistency', c.consistencyScore, 'Response time stability - low variance = high score (20% weight)') +
             metricRow('Latency', c.latencyScore, 'Latency rank vs other relays - removes geographic bias (20% weight)') +
           '</div>' +

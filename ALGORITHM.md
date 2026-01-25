@@ -11,7 +11,7 @@ Relays are evaluated across three primary dimensions:
 
 | Dimension | Overall Weight | Components | Description |
 |-----------|---------------|------------|-------------|
-| **Reliability** | 40% | 40% uptime + 20% recovery + 20% consistency + 20% latency | Availability, recovery speed, stability, and latency rank |
+| **Reliability** | 40% | 40% uptime + 20% resilience + 20% consistency + 20% latency | Availability, outage resilience, stability, and latency rank |
 | **Quality** | 35% | 60% policy + 25% security + 15% operator | Policy documentation, encryption, and operator accountability |
 | **Accessibility** | 25% | 40% barriers + 20% limits + 20% jurisdiction + 20% surveillance | Access barriers, limits, internet freedom, and surveillance risk |
 
@@ -48,14 +48,14 @@ A slow but consistently available relay is more reliable than a fast but flaky o
 | Component | Weight | Description |
 |-----------|--------|-------------|
 | **Uptime** | 40% | Percentage of probes where relay was reachable |
-| **Recovery** | 20% | How quickly relay recovers from outages |
+| **Resilience** | 20% | Outage severity, frequency, and stability pattern |
 | **Consistency** | 20% | Low variance in response times (stable = high score) |
 | **Latency** | 20% | Tiered scoring based on absolute latency (reflects real-world usability) |
 
 ### Overall Formula
 
 ```
-reliability_score = uptime_score * 0.40 + recovery_score * 0.20 + consistency_score * 0.20 + latency_score * 0.20
+reliability_score = uptime_score * 0.40 + resilience_score * 0.20 + consistency_score * 0.20 + latency_score * 0.20
 ```
 
 ### Uptime Score (40%)
@@ -74,30 +74,64 @@ uptime_score = (reachable_probes / total_probes) * 100
 | 80% | 80 |
 | <50% | <50 |
 
-### Recovery Score (20%)
+### Resilience Score (20%)
 
-Measures how quickly the relay recovers from outages. Calculated by analyzing the duration of downtime periods in probe history.
+Measures outage severity, frequency, and stability patterns. Designed for hourly probe granularity—we measure in "consecutive failed probes" rather than minutes, since we can't distinguish a 5-minute recovery from a 55-minute recovery with hourly probing.
 
 ```
-For each outage period:
-  outage_duration = time_of_recovery - time_of_failure
-
-average_outage_duration = sum(outage_durations) / count(outages)
+resilience_score = 100 - outage_severity - frequency_penalty - flapping_penalty
 ```
 
-| Avg Outage Duration | Score Range | Rating |
-|--------------------|-------------|--------|
-| No outages | 100 | Perfect |
-| < 10 minutes | 90-100 | Excellent |
-| 10-30 minutes | 75-90 | Good |
-| 30-120 minutes | 50-75 | Moderate |
-| > 120 minutes | 0-50 | Poor |
+#### Outage Severity
+
+Each outage is scored by how many consecutive probes failed:
+
+| Consecutive Failed Probes | Severity Points | Typical Duration |
+|---------------------------|-----------------|------------------|
+| 1 | 2 | ~1-2 hours |
+| 2-3 | 6 | ~2-4 hours |
+| 4-6 | 15 | ~4-7 hours |
+| 7-12 | 25 | ~7-13 hours |
+| 13-24 | 40 | ~13-25 hours |
+| 24+ | 60 | >24 hours |
+
+Sum severity points across all outages in observation window (with temporal decay). **Cap: 60 points.**
+
+#### Frequency Penalty
+
+Counts distinct outage events regardless of duration:
+
+```
+frequency_penalty = min(20, outage_count × 2)
+```
+
+This catches "constantly flaky" relays—ten 1-hour outages is worse than one 10-hour outage for user experience.
+
+#### Flapping Penalty
+
+Detects unstable relays that oscillate between up and down states:
+
+```
+flapping_penalty = min(15, state_changes_in_6hr_window × 3)
+```
+
+A relay going UP→DOWN→UP→DOWN→UP within 6 hours indicates instability worse than one clean outage of equivalent total duration.
+
+#### Example Calculations
+
+| Scenario | Severity | Frequency | Flapping | **Resilience** |
+|----------|----------|-----------|----------|----------------|
+| Perfect (no outages) | 0 | 0 | 0 | **100** |
+| One 3-hour outage/month | 6 | 2 | 0 | **92** |
+| Ten 1-hour outages/month | 20 | 20 | 0 | **60** |
+| Flapping relay (5 state changes) | 10 | 10 | 15 | **65** |
+| One 48-hour outage | 60 | 2 | 0 | **38** |
 
 **Why this matters:** Two relays with 95% uptime can have very different reliability profiles:
-- Relay A: One 7-hour outage per week
-- Relay B: Several 5-minute blips per week
+- Relay A: One 7-hour outage per week → Resilience ~73
+- Relay B: Seven 1-hour outages per week → Resilience ~64
 
-Relay B is more reliable for users because brief interruptions are less disruptive than extended outages.
+Relay A scores higher because fewer, longer outages are more predictable than constant flakiness.
 
 ### Consistency Score (20%)
 
@@ -199,15 +233,15 @@ This tiered approach (rather than linear) reflects actual user experience—user
 
 ### Example Calculations
 
-| Relay | Uptime | Recovery | Consistency | Latency | **Reliability** |
-|-------|--------|----------|-------------|---------|-----------------|
+| Relay | Uptime | Resilience | Consistency | Latency | **Reliability** |
+|-------|--------|------------|-------------|---------|-----------------|
 | A: Fast but flaky | 85% | 60 | 40 | 95 | **73** |
 | B: Slow but rock solid | 100% | 100 | 95 | 40 | **87** |
 | C: Average, stable | 98% | 90 | 85 | 70 | **88** |
-| D: Brief outages | 90% | 95 | 80 | 60 | **83** |
+| D: Rare outages | 90% | 92 | 80 | 60 | **82** |
 
-Relay B correctly scores higher than A despite being slower - because it's more *reliable*.
-Relay D with brief outages (high recovery) scores better than A despite lower uptime.
+Relay B correctly scores higher than A despite being slower—because it's more *reliable*.
+Relay D with rare, clean outages (high resilience) scores better than A despite lower uptime.
 
 ---
 

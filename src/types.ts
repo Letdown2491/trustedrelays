@@ -88,16 +88,16 @@ export interface ProbeResult {
 /**
  * Computed reliability score components
  *
- * Reliability = 40% uptime + 20% recovery + 20% consistency + 20% latency percentile
+ * Reliability = 40% uptime + 20% resilience + 20% consistency + 20% latency percentile
  * - Uptime: % of probes where relay was reachable
- * - Recovery: How quickly relay recovers from outages (short downtime = high)
+ * - Resilience: Outage severity, frequency, and stability (fewer/shorter outages = high)
  * - Consistency: Inverse of response time variance (stable = high)
  * - Latency Percentile: Rank vs other relays (removes geographic bias)
  */
 export interface ReliabilityScore {
   overall: number;           // 0-100, weighted combination
   uptimeScore: number;       // 0-100, % of probes where relay was reachable
-  recoveryScore: number;     // 0-100, how quickly relay recovers from outages
+  resilienceScore: number;   // 0-100, outage severity, frequency, and stability
   consistencyScore: number;  // 0-100, inverse of response time variance
   latencyScore: number;      // 0-100, percentile rank vs other relays
   reachable: boolean;

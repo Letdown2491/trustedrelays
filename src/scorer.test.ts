@@ -142,7 +142,7 @@ describe('computeConsistencyScore', () => {
   });
 });
 
-describe('computeRecoveryScore', () => {
+describe('computeResilienceScore (via computeRecoveryScore alias)', () => {
   test('returns 80 for insufficient data', () => {
     expect(computeRecoveryScore([])).toBe(80);
     expect(computeRecoveryScore([
@@ -159,27 +159,71 @@ describe('computeRecoveryScore', () => {
     expect(computeRecoveryScore(probes)).toBe(100);
   });
 
-  test('returns high score for quick recovery', () => {
+  test('returns high score for single failed probe (1-2 hour outage)', () => {
+    // Simulating hourly probes: 1 consecutive failed probe = minor outage
     const probes: ProbeResult[] = [
       probe({ url: 'wss://test', timestamp: 0, reachable: true }),
-      probe({ url: 'wss://test', timestamp: 60, reachable: false }),    // 1 min outage
-      probe({ url: 'wss://test', timestamp: 120, reachable: true }),   // recovered
-      probe({ url: 'wss://test', timestamp: 180, reachable: true }),
+      probe({ url: 'wss://test', timestamp: 3600, reachable: false }),    // hour 1: down
+      probe({ url: 'wss://test', timestamp: 7200, reachable: true }),     // hour 2: recovered
+      probe({ url: 'wss://test', timestamp: 10800, reachable: true }),
     ];
     const score = computeRecoveryScore(probes);
-    expect(score).toBeGreaterThan(90);
+    // 1 failed probe = 2 severity pts, 1 outage = 2 frequency pts → 100 - 4 = 96
+    expect(score).toBeGreaterThanOrEqual(90);
   });
 
-  test('returns lower score for longer outages', () => {
+  test('returns lower score for extended outage (7-12 hours)', () => {
+    // Simulating hourly probes: 8 consecutive failed probes = significant outage
+    const baseTime = Date.now() / 1000;
     const probes: ProbeResult[] = [
-      probe({ url: 'wss://test', timestamp: 0, reachable: true }),
-      probe({ url: 'wss://test', timestamp: 60, reachable: false }),
-      probe({ url: 'wss://test', timestamp: 3600, reachable: false }), // 1 hour outage
-      probe({ url: 'wss://test', timestamp: 7200, reachable: true }),  // recovered after 2 hours
+      probe({ url: 'wss://test', timestamp: baseTime, reachable: true }),
+      probe({ url: 'wss://test', timestamp: baseTime + 3600, reachable: false }),
+      probe({ url: 'wss://test', timestamp: baseTime + 7200, reachable: false }),
+      probe({ url: 'wss://test', timestamp: baseTime + 10800, reachable: false }),
+      probe({ url: 'wss://test', timestamp: baseTime + 14400, reachable: false }),
+      probe({ url: 'wss://test', timestamp: baseTime + 18000, reachable: false }),
+      probe({ url: 'wss://test', timestamp: baseTime + 21600, reachable: false }),
+      probe({ url: 'wss://test', timestamp: baseTime + 25200, reachable: false }),
+      probe({ url: 'wss://test', timestamp: baseTime + 28800, reachable: false }),  // 8 consecutive fails
+      probe({ url: 'wss://test', timestamp: baseTime + 32400, reachable: true }),   // recovered
     ];
     const score = computeRecoveryScore(probes);
-    expect(score).toBeLessThan(75);
-    expect(score).toBeGreaterThan(40);
+    // 8 failed probes (tier 4) = 25 severity pts, 1 outage = 2 frequency pts → 100 - 27 = 73
+    expect(score).toBeLessThan(80);
+    expect(score).toBeGreaterThan(60);
+  });
+
+  test('penalizes frequent outages more than single long outage', () => {
+    const baseTime = Date.now() / 1000;
+
+    // Relay A: one 4-hour outage (4 consecutive fails)
+    const relayA: ProbeResult[] = [
+      probe({ url: 'wss://test', timestamp: baseTime, reachable: true }),
+      probe({ url: 'wss://test', timestamp: baseTime + 3600, reachable: false }),
+      probe({ url: 'wss://test', timestamp: baseTime + 7200, reachable: false }),
+      probe({ url: 'wss://test', timestamp: baseTime + 10800, reachable: false }),
+      probe({ url: 'wss://test', timestamp: baseTime + 14400, reachable: false }),
+      probe({ url: 'wss://test', timestamp: baseTime + 18000, reachable: true }),
+    ];
+
+    // Relay B: four 1-hour outages
+    const relayB: ProbeResult[] = [
+      probe({ url: 'wss://test', timestamp: baseTime, reachable: true }),
+      probe({ url: 'wss://test', timestamp: baseTime + 3600, reachable: false }),
+      probe({ url: 'wss://test', timestamp: baseTime + 7200, reachable: true }),
+      probe({ url: 'wss://test', timestamp: baseTime + 10800, reachable: false }),
+      probe({ url: 'wss://test', timestamp: baseTime + 14400, reachable: true }),
+      probe({ url: 'wss://test', timestamp: baseTime + 18000, reachable: false }),
+      probe({ url: 'wss://test', timestamp: baseTime + 21600, reachable: true }),
+      probe({ url: 'wss://test', timestamp: baseTime + 25200, reachable: false }),
+      probe({ url: 'wss://test', timestamp: baseTime + 28800, reachable: true }),
+    ];
+
+    const scoreA = computeRecoveryScore(relayA);
+    const scoreB = computeRecoveryScore(relayB);
+
+    // Relay B (constant flakiness) should score lower than Relay A (one long outage)
+    expect(scoreB).toBeLessThan(scoreA);
   });
 });
 

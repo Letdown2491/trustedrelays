@@ -50,7 +50,7 @@ A system for computing and publishing NIP-XX relay trust assertions (kind 30385)
 │  │  │   (40%)     │  │   (35%)     │  │   (25%)     │  │  Trust    │  │     │
 │  │  │             │  │             │  │             │  │           │  │     │
 │  │  │ - uptime    │  │ - policy    │  │ - barriers  │  │ - NIP-11  │  │     │
-│  │  │ - recovery  │  │ - security  │  │ - limits    │  │ - DNS     │  │     │
+│  │  │ - resilienc │  │ - security  │  │ - limits    │  │ - DNS     │  │     │
 │  │  │ - latency   │  │ - operator  │  │ - jurisdict │  │ - WoT     │  │     │
 │  │  │ - consistcy │  │             │  │ - surveill  │  │           │  │     │
 │  │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └─────┬─────┘  │     │
@@ -245,15 +245,20 @@ Overall Score = (Reliability × 0.40) + (Quality × 0.35) + (Accessibility × 0.
 Measures operational stability from probe data and NIP-66 metrics.
 
 ```typescript
-Reliability = (Uptime × 0.40) + (Recovery × 0.20) + (Consistency × 0.20) + (Latency × 0.20)
+Reliability = (Uptime × 0.40) + (Resilience × 0.20) + (Consistency × 0.20) + (Latency × 0.20)
 ```
 
 | Component | Calculation |
 |-----------|-------------|
 | **Uptime** | % of successful probes over observation period (temporally weighted) |
-| **Recovery** | Inverse of average outage duration minus frequency penalty (3 pts/outage, max 20) |
+| **Resilience** | 100 - OutageSeverity - FrequencyPenalty - FlappingPenalty (see below) |
 | **Consistency** | Inverse of connection time variance (stable = better) |
 | **Latency** | Tiered scoring based on absolute latency (≤50ms=100, ≤200ms=85, ≤500ms=60, etc.) |
+
+**Resilience calculation** (designed for hourly probe granularity):
+- **OutageSeverity**: Sum of severity points per outage based on consecutive failed probes: 1 fail→2pts, 2-3→6pts, 4-6→15pts, 7-12→25pts, 13-24→40pts, 24+→60pts. Cap: 60.
+- **FrequencyPenalty**: 2 pts × distinct outage events, max 20. Catches "constantly flaky" relays.
+- **FlappingPenalty**: 3 pts × state changes in 6-hour window, max 15. Penalizes instability.
 
 **Temporal weighting:** Recent observations weighted more heavily using exponential decay with 3-day half-life (minimum weight 0.1). This ensures recent behavior has more impact than old data.
 

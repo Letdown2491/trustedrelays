@@ -9,7 +9,7 @@ import type { ProbeResult, ReliabilityScore, Nip66Stats } from './types.js';
  */
 const RELIABILITY_WEIGHTS = {
   UPTIME: 0.40,
-  RECOVERY: 0.20,
+  RESILIENCE: 0.20,
   CONSISTENCY: 0.20,
   LATENCY: 0.20,
 } as const;
@@ -23,13 +23,18 @@ const CONFIDENCE_THRESHOLDS = {
 } as const;
 
 /**
- * Recovery scoring thresholds (in minutes)
+ * Resilience scoring: outage severity based on consecutive failed probes
+ * With hourly probes, we measure in probe intervals, not minutes
  */
-const RECOVERY_THRESHOLDS = {
-  EXCELLENT: 10,   // < 10 min avg outage = excellent (90-100)
-  GOOD: 30,        // 10-30 min avg = good (75-90)
-  MODERATE: 120,   // 30-120 min avg = moderate (50-75)
-  MAX: 360,        // > 360 min = 0 score
+const RESILIENCE_SEVERITY = {
+  // Consecutive failed probes -> severity points
+  TIER_1: { maxFails: 1, points: 2 },    // 1 fail = ~1-2 hours
+  TIER_2: { maxFails: 3, points: 6 },    // 2-3 fails = ~2-4 hours
+  TIER_3: { maxFails: 6, points: 15 },   // 4-6 fails = ~4-7 hours
+  TIER_4: { maxFails: 12, points: 25 },  // 7-12 fails = ~7-13 hours
+  TIER_5: { maxFails: 24, points: 40 },  // 13-24 fails = ~13-25 hours
+  TIER_6: { maxFails: Infinity, points: 60 }, // 24+ fails = >24 hours
+  MAX_SEVERITY: 60,
 } as const;
 
 /**
@@ -295,32 +300,37 @@ function percentile(sorted: number[], p: number): number {
 }
 
 /**
- * Recovery scoring constants
+ * Resilience scoring constants
  */
-const RECOVERY_FREQUENCY = {
-  PENALTY_PER_OUTAGE: 3,  // Points deducted per outage
-  MAX_PENALTY: 20,        // Maximum frequency penalty
+const RESILIENCE_PENALTIES = {
+  // Frequency penalty: penalizes many distinct outages
+  FREQUENCY_PER_OUTAGE: 2,  // Points deducted per outage event
+  MAX_FREQUENCY_PENALTY: 20,
+  // Flapping penalty: penalizes rapid state changes
+  FLAPPING_WINDOW_HOURS: 6,
+  FLAPPING_PER_CHANGE: 3,   // Points per state change in window
+  MAX_FLAPPING_PENALTY: 15,
+  MIN_STATE_CHANGES_FOR_FLAPPING: 3, // Need >3 changes to trigger
 } as const;
 
 /**
- * Calculate recovery score from probe results with temporal weighting.
- * Measures how quickly relay recovers from outages.
- * Recent outages are weighted more heavily than older ones.
+ * Calculate resilience score from probe results.
+ * Designed for hourly probe granularity - measures in consecutive failed probes,
+ * not minutes, since we can't distinguish a 5-minute recovery from a 55-minute one.
  *
- * Score combines two factors:
- * 1. Duration score: Based on weighted average outage duration
- * 2. Frequency penalty: Penalizes frequent outages (flapping)
+ * Score = 100 - OutageSeverity - FrequencyPenalty - FlappingPenalty
  *
- * Duration scoring thresholds:
- * - No outages: 100 (perfect)
- * - < 10 minutes avg: 90-100 (excellent recovery)
- * - 10-30 minutes avg: 75-90 (good recovery)
- * - 30-120 minutes avg: 50-75 (moderate recovery)
- * - > 120 minutes avg: 0-50 (poor recovery)
+ * OutageSeverity: Based on consecutive failed probes per outage
+ *   - 1 fail: 2 pts, 2-3 fails: 6 pts, 4-6 fails: 15 pts, etc.
+ *   - Capped at 60 points total
  *
- * Frequency penalty: 3 points per weighted outage, max 20 points
+ * FrequencyPenalty: 2 pts per distinct outage, max 20
+ *   - Catches "constantly flaky" relays
+ *
+ * FlappingPenalty: 3 pts per state change in 6-hour window, max 15
+ *   - Penalizes instability (UP-DOWN-UP-DOWN pattern)
  */
-export function computeRecoveryScore(probes: ProbeResult[]): number {
+export function computeResilienceScore(probes: ProbeResult[]): number {
   if (probes.length < 2) {
     return 80; // Not enough data - assume moderate
   }
@@ -330,76 +340,121 @@ export function computeRecoveryScore(probes: ProbeResult[]): number {
   // Sort probes by timestamp (oldest first)
   const sortedProbes = [...probes].sort((a, b) => a.timestamp - b.timestamp);
 
-  // Find outage periods with their end timestamps for weighting
-  const outages: Array<{ duration: number; endTimestamp: number }> = [];
-  let outageStart: number | null = null;
+  // Find outages and count consecutive failed probes for each
+  const outages: Array<{ consecutiveFails: number; endTimestamp: number }> = [];
+  let consecutiveFails = 0;
+  let outageStartTimestamp: number | null = null;
 
   for (let i = 0; i < sortedProbes.length; i++) {
     const probe = sortedProbes[i];
 
-    if (!probe.reachable && outageStart === null) {
-      // Start of outage
-      outageStart = probe.timestamp;
-    } else if (probe.reachable && outageStart !== null) {
-      // End of outage - calculate duration
-      const duration = probe.timestamp - outageStart;
-      outages.push({ duration, endTimestamp: probe.timestamp });
-      outageStart = null;
+    if (!probe.reachable) {
+      if (consecutiveFails === 0) {
+        outageStartTimestamp = probe.timestamp;
+      }
+      consecutiveFails++;
+    } else if (consecutiveFails > 0) {
+      // End of outage
+      outages.push({ consecutiveFails, endTimestamp: probe.timestamp });
+      consecutiveFails = 0;
+      outageStartTimestamp = null;
     }
   }
 
-  // If still in outage at end, count time until last probe
-  if (outageStart !== null) {
+  // If still in outage at end, count it
+  if (consecutiveFails > 0) {
     const lastProbe = sortedProbes[sortedProbes.length - 1];
-    const duration = lastProbe.timestamp - outageStart;
-    outages.push({ duration, endTimestamp: lastProbe.timestamp });
+    outages.push({ consecutiveFails, endTimestamp: lastProbe.timestamp });
   }
 
-  // No outages = perfect recovery
+  // No outages = perfect resilience
   if (outages.length === 0) {
     return 100;
   }
 
-  // Calculate weighted average outage duration and weighted outage count
-  // Weight by when the outage ended (recent outages matter more)
-  let weightedDurationSum = 0;
-  let totalWeight = 0;
-  let weightedOutageCount = 0;
-
+  // Calculate outage severity (weighted by recency)
+  let totalSeverity = 0;
   for (const outage of outages) {
     const weight = getTimeWeight(outage.endTimestamp, now);
-    weightedDurationSum += outage.duration * weight;
-    totalWeight += weight;
-    weightedOutageCount += weight; // Each outage contributes its weight to frequency
+    const severity = getOutageSeverity(outage.consecutiveFails);
+    totalSeverity += severity * weight;
   }
+  const outageSeverity = Math.min(RESILIENCE_SEVERITY.MAX_SEVERITY, totalSeverity);
 
-  const avgDurationSec = weightedDurationSum / totalWeight;
-  const avgDurationMin = avgDurationSec / 60;
-
-  // Calculate duration-based score using thresholds
-  let durationScore: number;
-  if (avgDurationMin < RECOVERY_THRESHOLDS.EXCELLENT) {
-    // Excellent: 90-100 (linear from 100 at 0 to 90 at threshold)
-    durationScore = 100 - (avgDurationMin);
-  } else if (avgDurationMin < RECOVERY_THRESHOLDS.GOOD) {
-    // Good: 75-90 (linear from 90 at EXCELLENT to 75 at GOOD)
-    durationScore = 90 - ((avgDurationMin - RECOVERY_THRESHOLDS.EXCELLENT) * 0.75);
-  } else if (avgDurationMin < RECOVERY_THRESHOLDS.MODERATE) {
-    // Moderate: 50-75 (linear from 75 at GOOD to 50 at MODERATE)
-    durationScore = 75 - ((avgDurationMin - RECOVERY_THRESHOLDS.GOOD) * (25 / 90));
-  } else {
-    // Poor: 0-50 (linear from 50 at MODERATE to 0 at MAX)
-    durationScore = 50 - ((avgDurationMin - RECOVERY_THRESHOLDS.MODERATE) * (50 / 240));
-  }
-
-  // Calculate frequency penalty (penalize flapping/frequent outages)
-  // Uses weighted outage count so recent outages penalize more
+  // Calculate frequency penalty (penalize many distinct outages)
   const frequencyPenalty = Math.min(
-    RECOVERY_FREQUENCY.MAX_PENALTY,
-    weightedOutageCount * RECOVERY_FREQUENCY.PENALTY_PER_OUTAGE
+    RESILIENCE_PENALTIES.MAX_FREQUENCY_PENALTY,
+    outages.length * RESILIENCE_PENALTIES.FREQUENCY_PER_OUTAGE
   );
 
-  return clampScore(durationScore - frequencyPenalty);
+  // Calculate flapping penalty (rapid state changes within 6-hour windows)
+  const flappingPenalty = computeFlappingPenalty(sortedProbes);
+
+  return clampScore(100 - outageSeverity - frequencyPenalty - flappingPenalty);
+}
+
+/**
+ * Get severity points for an outage based on consecutive failed probes
+ */
+function getOutageSeverity(consecutiveFails: number): number {
+  if (consecutiveFails <= RESILIENCE_SEVERITY.TIER_1.maxFails) {
+    return RESILIENCE_SEVERITY.TIER_1.points;
+  } else if (consecutiveFails <= RESILIENCE_SEVERITY.TIER_2.maxFails) {
+    return RESILIENCE_SEVERITY.TIER_2.points;
+  } else if (consecutiveFails <= RESILIENCE_SEVERITY.TIER_3.maxFails) {
+    return RESILIENCE_SEVERITY.TIER_3.points;
+  } else if (consecutiveFails <= RESILIENCE_SEVERITY.TIER_4.maxFails) {
+    return RESILIENCE_SEVERITY.TIER_4.points;
+  } else if (consecutiveFails <= RESILIENCE_SEVERITY.TIER_5.maxFails) {
+    return RESILIENCE_SEVERITY.TIER_5.points;
+  } else {
+    return RESILIENCE_SEVERITY.TIER_6.points;
+  }
+}
+
+/**
+ * Compute flapping penalty by detecting rapid state changes in 6-hour windows
+ */
+function computeFlappingPenalty(sortedProbes: ProbeResult[]): number {
+  const windowSeconds = RESILIENCE_PENALTIES.FLAPPING_WINDOW_HOURS * 3600;
+  let maxStateChangesInWindow = 0;
+
+  // Slide through probes and count state changes in each 6-hour window
+  for (let windowStart = 0; windowStart < sortedProbes.length; windowStart++) {
+    const startTime = sortedProbes[windowStart].timestamp;
+    let stateChanges = 0;
+    let prevReachable = sortedProbes[windowStart].reachable;
+
+    for (let j = windowStart + 1; j < sortedProbes.length; j++) {
+      const probe = sortedProbes[j];
+      if (probe.timestamp - startTime > windowSeconds) {
+        break; // Outside 6-hour window
+      }
+      if (probe.reachable !== prevReachable) {
+        stateChanges++;
+        prevReachable = probe.reachable;
+      }
+    }
+
+    maxStateChangesInWindow = Math.max(maxStateChangesInWindow, stateChanges);
+  }
+
+  // Only penalize if state changes exceed threshold
+  if (maxStateChangesInWindow <= RESILIENCE_PENALTIES.MIN_STATE_CHANGES_FOR_FLAPPING) {
+    return 0;
+  }
+
+  return Math.min(
+    RESILIENCE_PENALTIES.MAX_FLAPPING_PENALTY,
+    maxStateChangesInWindow * RESILIENCE_PENALTIES.FLAPPING_PER_CHANGE
+  );
+}
+
+/**
+ * @deprecated Use computeResilienceScore instead. Alias for backward compatibility.
+ */
+export function computeRecoveryScore(probes: ProbeResult[]): number {
+  return computeResilienceScore(probes);
 }
 
 /**
@@ -446,7 +501,7 @@ export function computeLatencyPercentileScore(
 /**
  * Compute reliability score from probes and NIP-66 stats
  *
- * Reliability = 40% uptime + 20% recovery + 20% consistency + 20% latency percentile
+ * Reliability = 40% uptime + 20% resilience + 20% consistency + 20% latency percentile
  *
  * For latency, we prefer the percentile-based score from NIP-66 monitors when available.
  * This removes geographic bias by ranking relays relative to other relays from each
@@ -467,8 +522,8 @@ export function computeCombinedReliabilityScore(
   const uptimeScore = hasProbes ? computeUptimeScore(probes) : (hasNip66 ? 95 : 50);
   const uptimePercent = hasProbes ? uptimeScore : undefined;
 
-  // Calculate recovery score from probes (how quickly relay recovers from outages)
-  const recoveryScore = hasProbes ? computeRecoveryScore(probes) : 80;
+  // Calculate resilience score from probes (outage severity, frequency, and stability)
+  const resilienceScore = hasProbes ? computeResilienceScore(probes) : 80;
 
   // Calculate consistency from probes
   const consistencyScore = hasProbes ? computeConsistencyScore(probes) : 70;
@@ -509,7 +564,7 @@ export function computeCombinedReliabilityScore(
   // Compute overall reliability score using configured weights
   const overall = clampScore(
     uptimeScore * RELIABILITY_WEIGHTS.UPTIME +
-    recoveryScore * RELIABILITY_WEIGHTS.RECOVERY +
+    resilienceScore * RELIABILITY_WEIGHTS.RESILIENCE +
     consistencyScore * RELIABILITY_WEIGHTS.CONSISTENCY +
     latencyScore * RELIABILITY_WEIGHTS.LATENCY
   );
@@ -531,7 +586,7 @@ export function computeCombinedReliabilityScore(
   return {
     overall,
     uptimeScore,
-    recoveryScore,
+    resilienceScore,
     consistencyScore,
     latencyScore,
     reachable,
@@ -554,7 +609,7 @@ export function computeReliabilityScore(probe: ProbeResult): ReliabilityScore {
     return {
       overall: 0,
       uptimeScore: 0,
-      recoveryScore: 0,
+      resilienceScore: 0,
       consistencyScore: 0,
       latencyScore: 0,
       connectScore: 0,
@@ -566,15 +621,15 @@ export function computeReliabilityScore(probe: ProbeResult): ReliabilityScore {
   const connectScore = scoreLatency(probe.connectTime);
   const readScore = scoreLatency(probe.readTime);
 
-  // Single probe: uptime = 100 (it's reachable), recovery = 100 (no outages), consistency = 70 (unknown)
+  // Single probe: uptime = 100 (it's reachable), resilience = 100 (no outages), consistency = 70 (unknown)
   const uptimeScore = 100;
-  const recoveryScore = 100; // No outages observed
+  const resilienceScore = 100; // No outages observed
   const consistencyScore = 70;
   const latencyScore = connectScore; // Use raw score as fallback
 
   const overall = clampScore(
     uptimeScore * RELIABILITY_WEIGHTS.UPTIME +
-    recoveryScore * RELIABILITY_WEIGHTS.RECOVERY +
+    resilienceScore * RELIABILITY_WEIGHTS.RESILIENCE +
     consistencyScore * RELIABILITY_WEIGHTS.CONSISTENCY +
     latencyScore * RELIABILITY_WEIGHTS.LATENCY
   );
@@ -582,7 +637,7 @@ export function computeReliabilityScore(probe: ProbeResult): ReliabilityScore {
   return {
     overall,
     uptimeScore,
-    recoveryScore,
+    resilienceScore,
     consistencyScore,
     latencyScore,
     connectScore,
@@ -602,7 +657,7 @@ export function aggregateReliabilityScores(probes: ProbeResult[]): ReliabilitySc
     return {
       overall: 0,
       uptimeScore: 0,
-      recoveryScore: 0,
+      resilienceScore: 0,
       consistencyScore: 0,
       latencyScore: 0,
       connectScore: 0,
@@ -626,7 +681,7 @@ export function computeNip66ReliabilityScore(stats: Nip66Stats): ReliabilityScor
     return {
       overall: 0,
       uptimeScore: 0,
-      recoveryScore: 0,
+      resilienceScore: 0,
       consistencyScore: 0,
       latencyScore: 0,
       connectScore: 0,
@@ -637,9 +692,9 @@ export function computeNip66ReliabilityScore(stats: Nip66Stats): ReliabilityScor
     };
   }
 
-  // NIP-66 only reports reachable relays, so assume good uptime and recovery
+  // NIP-66 only reports reachable relays, so assume good uptime and resilience
   const uptimeScore = 95;
-  const recoveryScore = 80; // Unknown from NIP-66 data - assume moderate
+  const resilienceScore = 80; // Unknown from NIP-66 data - assume moderate
   const consistencyScore = 70; // Unknown from NIP-66 data
 
   const connectScore = scoreLatency(stats.avgRttOpen ?? undefined);
@@ -648,7 +703,7 @@ export function computeNip66ReliabilityScore(stats: Nip66Stats): ReliabilityScor
 
   const overall = clampScore(
     uptimeScore * RELIABILITY_WEIGHTS.UPTIME +
-    recoveryScore * RELIABILITY_WEIGHTS.RECOVERY +
+    resilienceScore * RELIABILITY_WEIGHTS.RESILIENCE +
     consistencyScore * RELIABILITY_WEIGHTS.CONSISTENCY +
     latencyScore * RELIABILITY_WEIGHTS.LATENCY
   );
@@ -661,7 +716,7 @@ export function computeNip66ReliabilityScore(stats: Nip66Stats): ReliabilityScor
   return {
     overall,
     uptimeScore,
-    recoveryScore,
+    resilienceScore,
     consistencyScore,
     latencyScore,
     connectScore,
