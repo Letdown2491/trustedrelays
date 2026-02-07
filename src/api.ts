@@ -378,7 +378,7 @@ class ResponseCache {
 }
 
 // Global response cache
-const responseCache = new ResponseCache(1000);
+const responseCache = new ResponseCache(50);
 
 // Cache TTLs
 const CACHE_TTL = {
@@ -621,7 +621,17 @@ export function startApiServer(config: ApiConfig): { stop: () => void } {
 
         // Health check (also accessible without rate limit above)
         if (path === '/api/health') {
-          return addRateLimitHeaders(jsonResponse({ status: 'ok', timestamp: Date.now() }));
+          const mem = process.memoryUsage();
+          return addRateLimitHeaders(jsonResponse({
+            status: 'ok',
+            timestamp: Date.now(),
+            memory: {
+              heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024),
+              heapTotalMB: Math.round(mem.heapTotal / 1024 / 1024),
+              rssMB: Math.round(mem.rss / 1024 / 1024),
+              externalMB: Math.round(mem.external / 1024 / 1024),
+            },
+          }));
         }
 
         // List all relays with scores (expensive endpoint - stricter rate limit)
@@ -1057,15 +1067,19 @@ async function getRelayList(db: DataStore): Promise<Array<{
   operatorTrust: number | null;
 }>> {
   // Fetch all data in parallel using bulk queries
+  // getAllLatestProbes() provides NIP-11 data (one per relay, includes nip11_json)
+  // getAllProbes() provides scoring data (excludes nip11_json to save memory)
   const [
+    allLatestProbes,
     allProbes,
     nip66Stats,
     jurisdictions,
     operatorResolutions,
     scoreTrends,
   ] = await Promise.all([
+    db.getAllLatestProbes(),
     db.getAllProbes(30),
-    db.getAllNip66Stats(365),
+    db.getAllNip66Stats(90),
     db.getAllJurisdictions(),
     db.getAllOperatorResolutions(),
     db.getAllScoreTrends(7),
@@ -1073,11 +1087,10 @@ async function getRelayList(db: DataStore): Promise<Array<{
 
   const results = [];
 
-  // Iterate over all relays with probes
-  for (const [url, probes] of allProbes) {
-    if (probes.length === 0) continue;
-
-    const latestProbe = probes[probes.length - 1];
+  // Iterate over all relays with latest probes
+  for (const [url, latestProbe] of allLatestProbes) {
+    // Use bulk probe history for scoring (no nip11_json)
+    const probes = allProbes.get(url) ?? [latestProbe];
     const nip66 = nip66Stats.get(url);
     const jurisdiction = jurisdictions.get(url);
     const operatorResolution = operatorResolutions.get(url);

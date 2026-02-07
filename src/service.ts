@@ -54,6 +54,7 @@ export class RelayTrustService {
 
   private running = false;
   private cycleTimer: ReturnType<typeof setInterval> | null = null;
+  private checkpointTimer: ReturnType<typeof setInterval> | null = null;
   private lastCleanupAt: number = 0;
   private lastCheckpointAt: number = 0;
 
@@ -167,6 +168,13 @@ export class RelayTrustService {
       this.config.intervals.cycle * 1000
     );
 
+    // Independent WAL checkpoint timer (every 5 minutes)
+    // Prevents WAL growth between hourly cycles while ingestors write continuously
+    this.checkpointTimer = setInterval(
+      () => this.checkpointDatabase(),
+      5 * 60 * 1000
+    );
+
     this.log('info', `Service started. Cycle interval: ${this.config.intervals.cycle}s (probe → publish)`);
   }
 
@@ -181,10 +189,14 @@ export class RelayTrustService {
     this.log('info', 'Stopping service...');
     this.running = false;
 
-    // Clear timer
+    // Clear timers
     if (this.cycleTimer) {
       clearInterval(this.cycleTimer);
       this.cycleTimer = null;
+    }
+    if (this.checkpointTimer) {
+      clearInterval(this.checkpointTimer);
+      this.checkpointTimer = null;
     }
 
     // Stop ingestors
@@ -329,6 +341,7 @@ export class RelayTrustService {
   private async runCycle(): Promise<void> {
     const mode = this.config.publishing.enabled ? 'probe → publish' : 'probe only';
     this.log('info', `Starting cycle: ${mode}`);
+    this.logMemoryUsage();
 
     // Probe all relays
     this.log('info', 'Probing relays...');
@@ -349,12 +362,7 @@ export class RelayTrustService {
       await this.cleanupOldData();
     }
 
-    // Checkpoint WAL every 15 minutes to prevent WAL growth
-    const fifteenMinMs = 15 * 60 * 1000;
-    if (Date.now() - this.lastCheckpointAt > fifteenMinMs) {
-      await this.checkpointDatabase();
-    }
-
+    this.logMemoryUsage();
     this.log('info', 'Cycle complete');
   }
 
@@ -587,7 +595,7 @@ export class RelayTrustService {
     ] = await Promise.all([
       this.db.getAllLatestProbes(),
       this.db.getAllProbeStats(30),
-      this.db.getAllNip66Stats(365),
+      this.db.getAllNip66Stats(90),
       this.db.getAllJurisdictions(),
       this.db.getAllOperatorResolutions(),
       this.db.getAllReportStats(90),
@@ -764,6 +772,16 @@ export class RelayTrustService {
     this.log('info', `Relays tracked: ${this.stats.relaysTracked}`);
     this.log('info', `Probes: ${this.stats.probeCount} (${this.stats.probeErrorCount} errors)`);
     this.log('info', `Published: ${this.stats.publishCount} (${this.stats.publishSkipCount} skipped)`);
+    this.logMemoryUsage();
+  }
+
+  private logMemoryUsage(): void {
+    const mem = process.memoryUsage();
+    const heapMB = Math.round(mem.heapUsed / 1024 / 1024);
+    const rssMB = Math.round(mem.rss / 1024 / 1024);
+    const externalMB = Math.round(mem.external / 1024 / 1024);
+    const walMB = this.db.getWalFileSizeMB();
+    this.log('info', `Memory: heap=${heapMB}MB rss=${rssMB}MB external=${externalMB}MB wal=${walMB}MB`);
   }
 
   /**

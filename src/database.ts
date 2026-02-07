@@ -166,7 +166,10 @@ export class DataStore {
   }
 
   private async init(): Promise<void> {
-    this.db = await Database.create(this.dbPath);
+    this.db = await Database.create(this.dbPath, {
+      max_memory: '512MB',
+      threads: '2',
+    });
     // Run migrations first to rename columns in existing tables
     await this.runMigrations();
     // Then create/update schema (IF NOT EXISTS won't affect migrated tables)
@@ -1695,8 +1698,12 @@ export class DataStore {
     const db = await this.ensureReady();
     const sinceTimestamp = Math.floor(Date.now() / 1000) - (sinceDays * 86400);
 
+    // Exclude nip11_json from bulk loading - it's the largest column per row
+    // and only needed from the latest probe (use getAllLatestProbes() for that)
     const rows = await db.all(`
-      SELECT * FROM probes
+      SELECT url, timestamp, reachable, relay_type, access_level, closed_reason,
+             connect_time, read_time, write_time, nip11_fetch_time, error
+      FROM probes
       WHERE timestamp >= ?
       ORDER BY url, timestamp ASC
     `, sinceTimestamp);
@@ -1714,7 +1721,6 @@ export class DataStore {
         readTime: row.read_time ?? undefined,
         writeTime: row.write_time ?? undefined,
         nip11FetchTime: row.nip11_fetch_time ?? undefined,
-        nip11: safeJsonParse(row.nip11_json),
         error: row.error ?? undefined,
       };
 
@@ -1836,7 +1842,9 @@ export class DataStore {
       });
     }
 
-    // Percentile calculation for ALL relays in a single query
+    // Percentile calculation for ALL relays using PERCENT_RANK() window function.
+    // This replaces the previous O(N^2) self-join approach with O(N log N) per partition,
+    // significantly reducing DuckDB memory usage during query execution.
     const percentileRows = await db.all(`
       WITH latest_metrics AS (
         SELECT
@@ -1862,20 +1870,17 @@ export class DataStore {
         GROUP BY monitor_pubkey
         HAVING COUNT(DISTINCT relay_url) >= 20
       ),
-      relay_percentiles_per_monitor AS (
-        -- For each relay and qualifying monitor, calculate percentile
+      percentiles AS (
         SELECT
-          target.relay_url,
-          target.monitor_pubkey,
-          target.rtt_read as target_rtt_read,
-          (SUM(CASE WHEN other.rtt_open > target.rtt_open THEN 1 ELSE 0 END) * 100.0 / COUNT(*)) as connect_pct,
-          (SUM(CASE WHEN other.rtt_read > target.rtt_read THEN 1 ELSE 0 END) * 100.0 / COUNT(*)) as read_pct
-        FROM latest_only target
-        JOIN latest_only other ON other.monitor_pubkey = target.monitor_pubkey
-        WHERE target.monitor_pubkey IN (SELECT monitor_pubkey FROM qualifying_monitors)
-          AND target.rtt_open IS NOT NULL
-          AND other.rtt_open IS NOT NULL
-        GROUP BY target.relay_url, target.monitor_pubkey, target.rtt_open, target.rtt_read
+          relay_url,
+          monitor_pubkey,
+          rtt_read,
+          -- PERCENT_RANK gives 0-1 position; invert so lower RTT = higher percentile
+          (1.0 - PERCENT_RANK() OVER (PARTITION BY monitor_pubkey ORDER BY rtt_open ASC)) * 100 as connect_pct,
+          (1.0 - PERCENT_RANK() OVER (PARTITION BY monitor_pubkey ORDER BY rtt_read ASC)) * 100 as read_pct
+        FROM latest_only
+        WHERE monitor_pubkey IN (SELECT monitor_pubkey FROM qualifying_monitors)
+          AND rtt_open IS NOT NULL
       )
       SELECT
         relay_url,
@@ -1883,11 +1888,11 @@ export class DataStore {
         AVG(read_pct) as read_percentile,
         -- Use connect-only when read data unavailable, otherwise 30/70 weighted
         AVG(CASE
-          WHEN target_rtt_read IS NULL THEN connect_pct
+          WHEN rtt_read IS NULL THEN connect_pct
           ELSE connect_pct * 0.3 + read_pct * 0.7
         END) as latency_score,
         COUNT(*) as qualifying_monitor_count
-      FROM relay_percentiles_per_monitor
+      FROM percentiles
       GROUP BY relay_url
     `, sinceTimestamp);
 
@@ -2173,6 +2178,12 @@ export class DataStore {
     await db.run(`DELETE FROM nip66_metrics WHERE timestamp < ?`, cutoff);
     await db.run(`DELETE FROM relay_reports WHERE timestamp < ?`, cutoff);
     await db.run(`DELETE FROM score_history WHERE timestamp < ?`, cutoff);
+
+    // Strip nip11_json from probes older than 7 days to reduce DB size.
+    // NIP-11 data is only needed from recent probes; older probes only need
+    // reachability and timing data for scoring.
+    const nip11Cutoff = Math.floor(Date.now() / 1000) - (7 * 86400);
+    await db.run(`UPDATE probes SET nip11_json = NULL WHERE timestamp < ? AND nip11_json IS NOT NULL`, nip11Cutoff);
 
     return {
       probes: Number((probesResult as any)?.count ?? 0),

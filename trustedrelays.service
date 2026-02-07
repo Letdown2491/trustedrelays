@@ -15,7 +15,7 @@ Environment=NODE_ENV=production
 EnvironmentFile=-/opt/trustedrelays/.env
 
 # Run daemon
-ExecStart=/usr/local/bin/bun run src/index.ts daemon --config /opt/trustedrelays/config.json
+ExecStart=/usr/local/bin/bun run --smol src/index.ts daemon --config /opt/trustedrelays/config.json
 
 # Restart on failure
 Restart=on-failure
@@ -27,6 +27,10 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/opt/trustedrelays/data
+
+# Memory limits (2GB VPS - leave ~500MB for OS)
+MemoryHigh=1280M
+MemoryMax=1536M
 
 # Logging
 StandardOutput=journal
