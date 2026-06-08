@@ -4,6 +4,10 @@ import type { TrustAssertion, AggregatedTrustScore, TrustAssertionProvider } fro
 
 // NIP-85 kind for trust assertions
 const KIND_TRUST_ASSERTION = 30382;
+// Max trust assertions to accept from a single relay per query. Each assertion
+// costs a signature verification, so this bounds both memory and CPU against a
+// hostile or misbehaving relay that ignores the filter limit.
+const MAX_ASSERTIONS_PER_RELAY = 500;
 
 /**
  * Validate that an unknown object has the structure of a Nostr Event
@@ -162,10 +166,13 @@ async function queryRelayForAssertions(
     }, timeout);
 
     ws.on('open', () => {
-      // Query for kind 30382 with d tag matching the subject pubkey
+      // Query for kind 30382 with d tag matching the subject pubkey.
+      // Bound the result set so a hostile relay cannot stream unlimited events
+      // (each one triggers a costly signature verification below).
       const filter = {
         kinds: [KIND_TRUST_ASSERTION],
         '#d': [subjectPubkey.toLowerCase()],
+        limit: MAX_ASSERTIONS_PER_RELAY,
       };
       ws.send(JSON.stringify(['REQ', subId, filter]));
     });
@@ -185,6 +192,14 @@ async function queryRelayForAssertions(
           const assertion = parseTrustAssertion(event);
           if (assertion) {
             assertions.push(assertion);
+          }
+
+          // Hard cap regardless of what the relay sends, in case it ignores
+          // the filter limit.
+          if (assertions.length >= MAX_ASSERTIONS_PER_RELAY) {
+            clearTimeout(timeoutId);
+            ws.close();
+            resolve(assertions);
           }
         } else if (msg[0] === 'EOSE') {
           clearTimeout(timeoutId);

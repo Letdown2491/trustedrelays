@@ -23,6 +23,7 @@ class RelayConnection {
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private stableTimer: ReturnType<typeof setTimeout> | null = null;
   private lastError: string | null = null;
 
   // Pending event callbacks waiting for OK response
@@ -34,6 +35,7 @@ class RelayConnection {
   // Rate limit tracking
   private rateLimitedUntil = 0;
   private eventsSentThisMinute = 0;
+  private maxEventsPerMinute = 120;
   private minuteResetTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Callbacks
@@ -95,7 +97,11 @@ class RelayConnection {
           clearTimeout(connectTimeout);
           this.connected = true;
           this.connecting = false;
-          this.reconnectAttempts = 0;
+          // Only reset the backoff once the connection has proven stable for a
+          // while. Resetting immediately on every open lets a flapping relay
+          // reconnect in a tight ~1s loop (reconnect storm).
+          if (this.stableTimer) clearTimeout(this.stableTimer);
+          this.stableTimer = setTimeout(() => { this.reconnectAttempts = 0; }, 60000);
           this.startMinuteResetTimer();
           this.onConnect?.();
           resolve();
@@ -113,6 +119,12 @@ class RelayConnection {
 
         this.ws.on('close', () => {
           clearTimeout(connectTimeout);
+          // A drop before the stability window elapsed: keep the accumulated
+          // backoff so flapping relays back off progressively.
+          if (this.stableTimer) {
+            clearTimeout(this.stableTimer);
+            this.stableTimer = null;
+          }
           const wasConnected = this.connected;
           this.connected = false;
           this.connecting = false;
@@ -151,8 +163,18 @@ class RelayConnection {
    * Send an event to the relay
    */
   async send(event: Event, timeout = 10000): Promise<RelayPublishResult> {
-    // Check rate limit
+    // Check rate limit (reactive backoff from relay rejections)
     if (this.isRateLimited()) {
+      return {
+        relay: this.url,
+        success: false,
+        error: 'rate_limited',
+        rateLimited: true,
+      };
+    }
+
+    // Proactive per-minute cap so we don't blast a relay until it rejects us.
+    if (this.eventsSentThisMinute >= this.maxEventsPerMinute) {
       return {
         relay: this.url,
         success: false,
@@ -212,6 +234,10 @@ class RelayConnection {
     if (this.minuteResetTimer) {
       clearTimeout(this.minuteResetTimer);
       this.minuteResetTimer = null;
+    }
+    if (this.stableTimer) {
+      clearTimeout(this.stableTimer);
+      this.stableTimer = null;
     }
 
     // Reject all pending events

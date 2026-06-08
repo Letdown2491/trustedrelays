@@ -2,6 +2,7 @@
  * Dashboard HTML template
  * Extracted from api.ts for better code organization
  */
+import { ALGORITHM_VERSION } from './version.js';
 
 // Cache-busting timestamp - set when server starts
 const BUILD_TIME = Date.now();
@@ -198,7 +199,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       <div class="modal-header">
         <div>
           <h2>How Trust Scores Work</h2>
-          <div class="modal-subtitle">Algorithm v0.1.2 — Trusted Relay Assertions</div>
+          <div class="modal-subtitle">Algorithm ${ALGORITHM_VERSION} — Trusted Relay Assertions</div>
         </div>
         <button class="modal-close" onclick="closeAlgoModal()">×</button>
       </div>
@@ -720,8 +721,9 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       observer.observe(sentinel);
     }
 
-    function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-    function escAttr(s) { return s.replace(/'/g, "\\\\'").replace(/"/g, '&quot;'); }
+    function escHtml(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+    // escHtml already escapes quotes, so it is safe for attribute values too.
+    function escAttr(s) { return escHtml(s); }
 
     // Generate natural language insights about a relay
     function generateInsights(d, scores, aggregates) {
@@ -976,7 +978,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
         const res = await fetch('/api/relay?url=' + encodeURIComponent(url));
         const json = await res.json();
         if (json.success) renderModal(json.data);
-        else document.getElementById('modal-body').innerHTML = '<div class="empty">Error: ' + json.error + '</div>';
+        else document.getElementById('modal-body').innerHTML = '<div class="empty">Error: ' + escHtml(json.error) + '</div>';
       } catch (e) {
         document.getElementById('modal-body').innerHTML = '<div class="empty">Failed to load</div>';
       }
@@ -1118,8 +1120,8 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       html += '<div class="detail-group">';
       html += '<div class="detail-group-title">Relay Info</div>';
       html += '<div class="detail-group-grid">';
-      html += '<div class="detail-row" title="Relay classification: general, nip46 (remote signing), or specialized"><span class="detail-key">Type</span><span class="detail-val">' + (d.relayType || '-') + '</span></div>';
-      html += '<div class="detail-row" title="Access policy: open, moderated, curated, or specialized"><span class="detail-key">Policy</span><span class="detail-val">' + (d.policy?.classification || '-') + '</span></div>';
+      html += '<div class="detail-row" title="Relay classification: general, nip46 (remote signing), or specialized"><span class="detail-key">Type</span><span class="detail-val">' + escHtml(d.relayType || '-') + '</span></div>';
+      html += '<div class="detail-row" title="Access policy: open, moderated, curated, or specialized"><span class="detail-key">Policy</span><span class="detail-val">' + escHtml(d.policy?.classification || '-') + '</span></div>';
       if (d.nip11?.software) {
         const sw = d.nip11.software.split('/').pop()?.split('#')[0] || d.nip11.software;
         html += '<div class="detail-row" title="Relay software reported via NIP-11"><span class="detail-key">Software</span><span class="detail-val">' + escHtml(sw) + '</span></div>';
@@ -1133,16 +1135,16 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
         html += '<div class="detail-group">';
         html += '<div class="detail-group-title">Operator</div>';
         html += '<div class="detail-group-grid">';
-        html += '<div class="detail-row" title="Relay operator pubkey (click to copy)"><span class="detail-key">Pubkey</span><span class="detail-val"><span class="operator-pubkey" data-pubkey="' + d.operator.pubkey + '" title="Click to copy">' + d.operator.pubkey.slice(0, 8) + '...' + d.operator.pubkey.slice(-8) + '</span></span></div>';
+        html += '<div class="detail-row" title="Relay operator pubkey (click to copy)"><span class="detail-key">Pubkey</span><span class="detail-val"><span class="operator-pubkey" data-pubkey="' + escAttr(d.operator.pubkey) + '" title="Click to copy">' + escHtml(d.operator.pubkey.slice(0, 8) + '...' + d.operator.pubkey.slice(-8)) + '</span></span></div>';
         const verifyMethod = d.operator.verificationMethod === 'nip11' ? 'NIP-11' : d.operator.verificationMethod === 'dns' ? 'DNS TXT' : d.operator.verificationMethod === 'wellknown' ? '.well-known' : d.operator.verificationMethod || '-';
-        html += '<div class="detail-row" title="How the operator pubkey was verified"><span class="detail-key">Verified via</span><span class="detail-val">' + verifyMethod + '</span></div>';
+        html += '<div class="detail-row" title="How the operator pubkey was verified"><span class="detail-key">Verified via</span><span class="detail-val">' + escHtml(verifyMethod) + '</span></div>';
         if (d.operator.trustScore != null) {
           const wotClass = d.operator.trustScore >= 70 ? 'excellent' : d.operator.trustScore >= 50 ? 'good' : d.operator.trustScore >= 30 ? 'fair' : 'poor';
           html += '<div class="detail-row" title="Web of Trust score from NIP-85 assertions"><span class="detail-key">WoT Score</span><span class="detail-val"><span class="wot-score ' + wotClass + '">' + d.operator.trustScore + '</span></span></div>';
           const confidenceLabel = d.operator.trustConfidence || 'unknown';
           const providerCount = d.operator.trustProviderCount || 0;
           const providerText = providerCount > 0 ? ' (' + providerCount + ' provider' + (providerCount !== 1 ? 's' : '') + ')' : '';
-          html += '<div class="detail-row" title="Confidence level based on number of assertion providers"><span class="detail-key">WoT Confidence</span><span class="detail-val">' + confidenceLabel + providerText + '</span></div>';
+          html += '<div class="detail-row" title="Confidence level based on number of assertion providers"><span class="detail-key">WoT Confidence</span><span class="detail-val">' + escHtml(confidenceLabel) + providerText + '</span></div>';
         }
         html += '</div></div>';
       }
@@ -1159,7 +1161,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
           const allianceLabels = { 'five_eyes': 'Five Eyes', 'nine_eyes': 'Nine Eyes', 'fourteen_eyes': 'Fourteen Eyes', 'privacy_friendly': 'Privacy-friendly', 'non_aligned': 'Non-aligned', 'unknown': 'Unknown' };
           const allianceLabel = allianceLabels[d.jurisdiction.eyesAlliance] || d.jurisdiction.eyesAlliance;
           const isEyes = ['five_eyes', 'nine_eyes', 'fourteen_eyes'].includes(d.jurisdiction.eyesAlliance);
-          html += '<div class="detail-row" title="Intelligence alliance membership"><span class="detail-key">Surveillance</span><span class="detail-val' + (isEyes ? ' warn' : '') + '">' + allianceLabel + '</span></div>';
+          html += '<div class="detail-row" title="Intelligence alliance membership"><span class="detail-key">Surveillance</span><span class="detail-val' + (isEyes ? ' warn' : '') + '">' + escHtml(allianceLabel) + '</span></div>';
         }
         html += '<div class="detail-row" title="Internet freedom rating from Freedom House"><span class="detail-key">Freedom</span><span class="detail-val">' + (c.jurisdictionScore >= 80 ? 'Free' : c.jurisdictionScore >= 50 ? 'Partly Free' : 'Not Free') + '</span></div>';
       } else {

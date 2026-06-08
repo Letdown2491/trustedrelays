@@ -159,13 +159,27 @@ export class DataStore {
   private db: Database | null = null;
   private dbPath: string;
   private initPromise: Promise<void> | null = null;
+  private initError: Error | null = null;
 
   constructor(dbPath: string = './data/trustedrelays.db') {
     this.dbPath = dbPath;
     this.initPromise = this.init();
+    // Attach a no-op rejection handler so a failed init never surfaces as an
+    // unhandled promise rejection (which can crash the process). The real error
+    // is captured in initError and re-thrown from ensureReady().
+    this.initPromise.catch(() => { /* handled in ensureReady */ });
   }
 
   private async init(): Promise<void> {
+    try {
+      await this.initInner();
+    } catch (err) {
+      this.initError = err instanceof Error ? err : new Error(String(err));
+      throw this.initError;
+    }
+  }
+
+  private async initInner(): Promise<void> {
     this.db = await Database.create(this.dbPath, {
       max_memory: '512MB',
       threads: '2',
@@ -191,6 +205,90 @@ export class DataStore {
 
     // Migration 3: Normalize operator WoT data into separate operators table
     await this.migrateOperatorWotToSeparateTable();
+
+    // Migration 4: Repair tables created under an older schema that are missing
+    // their declared PRIMARY KEY. CREATE TABLE IF NOT EXISTS cannot retrofit a
+    // PK, so on such databases every ON CONFLICT upsert (nip66_metrics,
+    // operators, relay_reports) silently fails and inserts go un-deduplicated.
+    await this.repairMissingUniqueConstraints();
+  }
+
+  /**
+   * Ensure each table that should be uniquely keyed actually has a UNIQUE/PK
+   * index. On older databases the declared PRIMARY KEY may be absent (it cannot
+   * be added retroactively via CREATE TABLE IF NOT EXISTS). A UNIQUE INDEX
+   * satisfies DuckDB's ON CONFLICT requirement and enforces the same
+   * uniqueness, without an expensive full table rebuild. Duplicate rows are
+   * removed first (keeping the earliest) so the unique index can be created.
+   */
+  private async repairMissingUniqueConstraints(): Promise<void> {
+    if (!this.db) return;
+
+    const targets: Array<{ table: string; index: string; cols: string[] }> = [
+      { table: 'probes', index: 'uq_probes_key', cols: ['url', 'timestamp'] },
+      { table: 'nip66_metrics', index: 'uq_nip66_metrics_key', cols: ['event_id'] },
+      { table: 'operators', index: 'uq_operators_key', cols: ['pubkey'] },
+      { table: 'relay_reports', index: 'uq_relay_reports_key', cols: ['event_id'] },
+      { table: 'score_history', index: 'uq_score_history_key', cols: ['relay_url', 'timestamp'] },
+    ];
+
+    for (const t of targets) {
+      try {
+        // Migrations run before the SCHEMA's CREATE TABLE statements, so on a
+        // fresh/partial database a target may not exist yet — SCHEMA will then
+        // create it with its declared PRIMARY KEY, so there's nothing to repair.
+        const exists = await this.db.all(
+          `SELECT 1 FROM information_schema.tables WHERE table_name = ?`,
+          t.table
+        );
+        if (exists.length === 0) continue;
+
+        // Already protected? (fresh DBs have the real PRIMARY KEY; previously
+        // repaired DBs have our unique index.)
+        const cons = await this.db.all(
+          `SELECT 1 FROM duckdb_constraints()
+           WHERE table_name = ? AND constraint_type IN ('PRIMARY KEY', 'UNIQUE')`,
+          t.table
+        );
+        const uniqIdx = await this.db.all(
+          `SELECT 1 FROM duckdb_indexes() WHERE table_name = ? AND is_unique = true`,
+          t.table
+        );
+        if (cons.length > 0 || uniqIdx.length > 0) continue;
+
+        const cols = t.cols.join(', ');
+        // Dedup (keep earliest physical row per key) then add the unique index,
+        // atomically so we never end up half-deduped without the index.
+        await this.runInTransaction(`
+          DELETE FROM ${t.table}
+          WHERE rowid NOT IN (SELECT min(rowid) FROM ${t.table} GROUP BY ${cols});
+
+          CREATE UNIQUE INDEX ${t.index} ON ${t.table}(${cols});
+        `);
+        console.log(`[migration] repaired missing unique key on ${t.table}(${cols})`);
+      } catch (err) {
+        // Don't take the whole startup down for one table; log loudly so it's
+        // visible. The table simply remains in its prior state.
+        console.error(`[migration] failed to repair unique key on ${t.table}:`, err);
+      }
+    }
+  }
+
+  /**
+   * Run a multi-statement DDL block atomically. If any statement fails the
+   * whole block is rolled back, so a migration can never leave the schema in a
+   * half-applied state (e.g. table dropped but replacement not yet renamed).
+   */
+  private async runInTransaction(sql: string): Promise<void> {
+    if (!this.db) throw new Error('Database not initialized');
+    await this.db.exec('BEGIN TRANSACTION;');
+    try {
+      await this.db.exec(sql);
+      await this.db.exec('COMMIT;');
+    } catch (err) {
+      try { await this.db.exec('ROLLBACK;'); } catch { /* best effort */ }
+      throw err;
+    }
   }
 
   /**
@@ -221,13 +319,18 @@ export class DataStore {
   private async migrateOpennessToAccessibility(): Promise<void> {
     if (!this.db) return;
 
-    // Check if published_assertions has openness column (indicates old schema)
+    // Detect old schema separately from running the migration, so that a real
+    // migration failure propagates (fail-fast) instead of being swallowed by
+    // the same catch used for "column absent".
+    let assertionsNeedMigration = false;
     try {
-      // Try to select from openness - if it works, we need to migrate
       await this.db.all(`SELECT openness FROM published_assertions LIMIT 1`);
-
-      // Old column exists - recreate table with new schema
-      await this.db.exec(`
+      assertionsNeedMigration = true;
+    } catch {
+      // Column/table doesn't exist - no migration needed
+    }
+    if (assertionsNeedMigration) {
+      await this.runInTransaction(`
         CREATE TABLE published_assertions_new AS
         SELECT
           relay_url,
@@ -246,15 +349,18 @@ export class DataStore {
 
         CREATE INDEX IF NOT EXISTS idx_published_at ON published_assertions(published_at);
       `);
-    } catch {
-      // Column doesn't exist or table doesn't exist - no migration needed
     }
 
     // Same for score_history
+    let historyNeedsMigration = false;
     try {
       await this.db.all(`SELECT openness FROM score_history LIMIT 1`);
-
-      await this.db.exec(`
+      historyNeedsMigration = true;
+    } catch {
+      // Column/table doesn't exist - no migration needed
+    }
+    if (historyNeedsMigration) {
+      await this.runInTransaction(`
         CREATE TABLE score_history_new AS
         SELECT
           relay_url,
@@ -275,10 +381,7 @@ export class DataStore {
         CREATE INDEX IF NOT EXISTS idx_score_history_relay ON score_history(relay_url);
         CREATE INDEX IF NOT EXISTS idx_score_history_timestamp ON score_history(timestamp);
       `);
-    } catch {
-      // Column doesn't exist or table doesn't exist - no migration needed
     }
-
   }
 
   /**
@@ -340,37 +443,44 @@ export class DataStore {
         console.warn('WoT migration insert failed (may be expected on first run):', e);
       }
 
-      // Recreate operator_mappings without WoT columns
-      try {
-        await this.db.exec(`
-          CREATE TABLE operator_mappings_new AS
-          SELECT
-            relay_url,
-            operator_pubkey,
-            verification_method,
-            verified_at,
-            confidence,
-            nip11_pubkey,
-            dns_pubkey,
-            wellknown_pubkey
-          FROM operator_mappings;
+      // Recreate operator_mappings without WoT columns (atomic: never leave the
+      // table dropped without its replacement renamed in).
+      await this.runInTransaction(`
+        CREATE TABLE operator_mappings_new AS
+        SELECT
+          relay_url,
+          operator_pubkey,
+          verification_method,
+          verified_at,
+          confidence,
+          nip11_pubkey,
+          dns_pubkey,
+          wellknown_pubkey
+        FROM operator_mappings;
 
-          DROP TABLE operator_mappings;
+        DROP TABLE operator_mappings;
 
-          ALTER TABLE operator_mappings_new RENAME TO operator_mappings;
+        ALTER TABLE operator_mappings_new RENAME TO operator_mappings;
 
-          CREATE INDEX IF NOT EXISTS idx_operator_pubkey ON operator_mappings(operator_pubkey);
-        `);
-      } catch (e) {
-        console.warn('operator_mappings migration failed:', e);
-      }
+        CREATE INDEX IF NOT EXISTS idx_operator_pubkey ON operator_mappings(operator_pubkey);
+      `);
     }
   }
 
   private async ensureReady(): Promise<Database> {
+    // Await initialization on every call. The promise is retained (not nulled)
+    // so concurrent and later callers all observe the same settled result;
+    // awaiting an already-settled promise is effectively free.
     if (this.initPromise) {
-      await this.initPromise;
-      this.initPromise = null;
+      try {
+        await this.initPromise;
+      } catch (err) {
+        // Surface the original initialization failure with its cause.
+        throw new Error(`Database initialization failed: ${(err as Error).message}`, { cause: err });
+      }
+    }
+    if (this.initError) {
+      throw new Error(`Database initialization failed: ${this.initError.message}`, { cause: this.initError });
     }
     if (!this.db) {
       throw new Error('Database not initialized');
@@ -701,33 +811,31 @@ export class DataStore {
         GROUP BY monitor_pubkey
         HAVING COUNT(DISTINCT relay_url) >= 20
       ),
-      monitor_percentiles AS (
-        -- For each qualifying monitor, calculate percentile for target relay
+      percentiles AS (
+        -- PERCENT_RANK over each monitor's relays; invert so lower RTT = higher
+        -- percentile. Identical formula to getAllNip66Stats so the single-relay
+        -- detail view and the bulk list view agree exactly.
         SELECT
-          target.monitor_pubkey,
-          target.rtt_open as target_rtt_open,
-          target.rtt_read as target_rtt_read,
-          -- Count relays with HIGHER rtt (slower) as percentage
-          (SUM(CASE WHEN other.rtt_open > target.rtt_open THEN 1 ELSE 0 END) * 100.0 / COUNT(*)) as connect_pct,
-          (SUM(CASE WHEN other.rtt_read > target.rtt_read THEN 1 ELSE 0 END) * 100.0 / COUNT(*)) as read_pct
-        FROM latest_only target
-        JOIN latest_only other ON other.monitor_pubkey = target.monitor_pubkey
-        WHERE target.relay_url = ?
-          AND target.monitor_pubkey IN (SELECT monitor_pubkey FROM qualifying_monitors)
-          AND target.rtt_open IS NOT NULL
-          AND other.rtt_open IS NOT NULL
-        GROUP BY target.monitor_pubkey, target.rtt_open, target.rtt_read
+          relay_url,
+          monitor_pubkey,
+          rtt_read,
+          (1.0 - PERCENT_RANK() OVER (PARTITION BY monitor_pubkey ORDER BY rtt_open ASC)) * 100 as connect_pct,
+          (1.0 - PERCENT_RANK() OVER (PARTITION BY monitor_pubkey ORDER BY rtt_read ASC)) * 100 as read_pct
+        FROM latest_only
+        WHERE monitor_pubkey IN (SELECT monitor_pubkey FROM qualifying_monitors)
+          AND rtt_open IS NOT NULL
       )
       SELECT
         AVG(connect_pct) as connect_percentile,
         AVG(read_pct) as read_percentile,
         -- Use connect-only when read data unavailable, otherwise 30/70 weighted
         AVG(CASE
-          WHEN target_rtt_read IS NULL THEN connect_pct
+          WHEN rtt_read IS NULL THEN connect_pct
           ELSE connect_pct * 0.3 + read_pct * 0.7
         END) as latency_score,
         COUNT(*) as qualifying_monitor_count
-      FROM monitor_percentiles`,
+      FROM percentiles
+      WHERE relay_url = ?`,
       staleThreshold,
       sinceTimestamp,
       relayUrl
@@ -802,10 +910,25 @@ export class DataStore {
   /**
    * Add a relay to the requested/tracked list
    */
-  async addRequestedRelay(url: string, requestedBy?: string): Promise<void> {
+  async addRequestedRelay(url: string, requestedBy?: string, maxRequested?: number): Promise<void> {
     const db = await this.ensureReady();
     const normalized = normalizeRelayUrl(url);
     const now = Math.floor(Date.now() / 1000);
+
+    // Enforce a cap on the requested-relay list to prevent unbounded growth
+    // from anonymous /api/track calls. Re-tracking an existing URL is always
+    // allowed (it is an upsert); only genuinely new entries are capped.
+    if (maxRequested && maxRequested > 0) {
+      const existing = await db.all(`SELECT 1 FROM requested_relays WHERE url = ?`, normalized);
+      if (existing.length === 0) {
+        const countRow = await db.all(`SELECT COUNT(*) AS n FROM requested_relays`);
+        const count = Number(countRow[0]?.n ?? 0);
+        if (count >= maxRequested) {
+          throw new Error('Requested relay limit reached');
+        }
+      }
+    }
+
     await db.run(
       `INSERT INTO requested_relays (url, requested_at, requested_by)
        VALUES (?, ?, ?)
@@ -914,10 +1037,18 @@ export class DataStore {
   async updateMonitorStats(pubkey: string): Promise<void> {
     const db = await this.ensureReady();
     const now = Math.floor(Date.now() / 1000);
+    // Upsert: a UPDATE-only statement silently no-ops for monitors that were
+    // never explicitly registered (accept-all ingestion mode), which then made
+    // getNip66Stats' INNER JOIN on trusted_monitors drop all their metrics.
     await db.run(
-      `UPDATE trusted_monitors SET last_seen = ?, event_count = event_count + 1 WHERE pubkey = ?`,
+      `INSERT INTO trusted_monitors (pubkey, name, added_at, last_seen, event_count)
+       VALUES (?, NULL, ?, ?, 1)
+       ON CONFLICT (pubkey) DO UPDATE SET
+         last_seen = excluded.last_seen,
+         event_count = trusted_monitors.event_count + 1`,
+      pubkey,
       now,
-      pubkey
+      now
     );
   }
 
@@ -1111,19 +1242,19 @@ export class DataStore {
   /**
    * Store a relay report
    */
-  async storeReport(report: RelayReport): Promise<void> {
+  /**
+   * Store a report. Reports are immutable (keyed by event id), so a duplicate
+   * is a no-op. Returns true only when a new row was actually inserted, so
+   * callers can avoid double-counting on concurrent delivery of the same event.
+   */
+  async storeReport(report: RelayReport): Promise<boolean> {
     const db = await this.ensureReady();
-    await db.run(
+    const rows = await db.all(
       `INSERT INTO relay_reports
        (event_id, relay_url, reporter_pubkey, report_type, content, timestamp, reporter_trust_weight)
        VALUES (?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT (event_id) DO UPDATE SET
-         relay_url = excluded.relay_url,
-         reporter_pubkey = excluded.reporter_pubkey,
-         report_type = excluded.report_type,
-         content = excluded.content,
-         timestamp = excluded.timestamp,
-         reporter_trust_weight = excluded.reporter_trust_weight`,
+       ON CONFLICT (event_id) DO NOTHING
+       RETURNING event_id`,
       report.eventId,
       report.relayUrl,
       report.reporterPubkey,
@@ -1132,6 +1263,7 @@ export class DataStore {
       report.timestamp,
       report.reporterTrustWeight ?? null
     );
+    return rows.length > 0;
   }
 
   /**
@@ -1794,22 +1926,26 @@ export class DataStore {
   }>> {
     const db = await this.ensureReady();
     const sinceTimestamp = Math.floor(Date.now() / 1000) - (sinceDays * 86400);
+    const staleThreshold = Math.floor(Date.now() / 1000) - (30 * 86400); // 30 days
 
-    // Basic aggregation for raw metrics
+    // Basic aggregation for raw metrics. Filter to trusted, non-stale monitors
+    // so this matches getNip66Stats' single-relay results exactly.
     const basicRows = await db.all(`
       SELECT
-        relay_url,
+        m.relay_url,
         COUNT(*) as metric_count,
-        COUNT(DISTINCT monitor_pubkey) as monitor_count,
-        AVG(rtt_open) as avg_rtt_open,
-        AVG(rtt_read) as avg_rtt_read,
-        AVG(rtt_write) as avg_rtt_write,
-        MIN(timestamp) as first_seen,
-        MAX(timestamp) as last_seen
-      FROM nip66_metrics
-      WHERE timestamp >= ?
-      GROUP BY relay_url
-    `, sinceTimestamp);
+        COUNT(DISTINCT m.monitor_pubkey) as monitor_count,
+        AVG(m.rtt_open) as avg_rtt_open,
+        AVG(m.rtt_read) as avg_rtt_read,
+        AVG(m.rtt_write) as avg_rtt_write,
+        MIN(m.timestamp) as first_seen,
+        MAX(m.timestamp) as last_seen
+      FROM nip66_metrics m
+      INNER JOIN trusted_monitors tm ON m.monitor_pubkey = tm.pubkey
+      WHERE m.timestamp >= ?
+        AND (tm.last_seen IS NULL OR tm.last_seen >= ?)
+      GROUP BY m.relay_url
+    `, sinceTimestamp, staleThreshold);
 
     // Build map with basic stats first
     const result = new Map<string, {
@@ -1846,7 +1982,11 @@ export class DataStore {
     // This replaces the previous O(N^2) self-join approach with O(N log N) per partition,
     // significantly reducing DuckDB memory usage during query execution.
     const percentileRows = await db.all(`
-      WITH latest_metrics AS (
+      WITH active_monitors AS (
+        SELECT pubkey FROM trusted_monitors
+        WHERE last_seen IS NULL OR last_seen >= ?
+      ),
+      latest_metrics AS (
         SELECT
           monitor_pubkey,
           relay_url,
@@ -1858,6 +1998,7 @@ export class DataStore {
           ) as rn
         FROM nip66_metrics
         WHERE timestamp >= ?
+          AND monitor_pubkey IN (SELECT pubkey FROM active_monitors)
       ),
       latest_only AS (
         SELECT monitor_pubkey, relay_url, rtt_open, rtt_read
@@ -1894,7 +2035,7 @@ export class DataStore {
         COUNT(*) as qualifying_monitor_count
       FROM percentiles
       GROUP BY relay_url
-    `, sinceTimestamp);
+    `, staleThreshold, sinceTimestamp);
 
     // Merge percentile data into results (rounded to whole numbers)
     for (const row of percentileRows as any[]) {
@@ -2184,6 +2325,15 @@ export class DataStore {
     // reachability and timing data for scoring.
     const nip11Cutoff = Math.floor(Date.now() / 1000) - (7 * 86400);
     await db.run(`UPDATE probes SET nip11_json = NULL WHERE timestamp < ? AND nip11_json IS NOT NULL`, nip11Cutoff);
+
+    // VACUUM reclaims disk space from deleted/updated rows.
+    // Without this, the database file only grows and never shrinks.
+    // Wrapped in try/catch since VACUUM can be memory-intensive on large databases.
+    try {
+      await db.run('VACUUM');
+    } catch (err) {
+      console.error('VACUUM failed (non-fatal, will retry next cleanup):', err);
+    }
 
     return {
       probes: Number((probesResult as any)?.count ?? 0),
@@ -2756,8 +2906,11 @@ export class DataStore {
   async cacheNetworkStats(period: string, stats: NetworkStats): Promise<void> {
     const db = await this.ensureReady();
     await db.run(
-      `INSERT OR REPLACE INTO network_stats_cache (period, computed_at, stats_json)
-       VALUES (?, ?, ?)`,
+      `INSERT INTO network_stats_cache (period, computed_at, stats_json)
+       VALUES (?, ?, ?)
+       ON CONFLICT (period) DO UPDATE SET
+         computed_at = excluded.computed_at,
+         stats_json = excluded.stats_json`,
       period,
       stats.computedAt,
       JSON.stringify(stats)

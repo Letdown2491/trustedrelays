@@ -43,6 +43,11 @@ export interface ApiConfig {
   db: DataStore;
   // Optional: cors origins
   corsOrigins?: string[];
+  // Trust proxy headers (cf-connecting-ip / x-forwarded-for) for the client IP.
+  // Only enable behind a trusted reverse proxy; otherwise headers are spoofable.
+  trustProxy?: boolean;
+  // Max number of on-demand (/api/track) relays to retain; caps list growth.
+  maxRequestedRelays?: number;
 }
 
 /**
@@ -70,10 +75,12 @@ function jsonResponse<T>(data: T, status = 200): Response {
       version: 'v1.0',
     },
   };
-  return new Response(JSON.stringify(response, null, 2), {
+  return new Response(JSON.stringify(response), {
     status,
     headers: {
       'Content-Type': 'application/json',
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'strict-origin-when-cross-origin',
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type',
@@ -117,13 +124,63 @@ function errorResponse(message: string, status = 400): Response {
       version: 'v1.0',
     },
   };
-  return new Response(JSON.stringify(response, null, 2), {
+  return new Response(JSON.stringify(response), {
     status,
     headers: {
       'Content-Type': 'application/json',
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'strict-origin-when-cross-origin',
       'Access-Control-Allow-Origin': '*',
     },
   });
+}
+
+/**
+ * Returns true if a hostname points at a private, loopback, link-local or
+ * otherwise non-public address. Used to prevent SSRF via user-submitted relay
+ * URLs (e.g. ws://169.254.169.254 cloud metadata, ws://localhost:internal).
+ *
+ * Note: this blocks literal IPs and obvious internal names synchronously.
+ * DNS-rebinding (a public name resolving to a private IP) must additionally be
+ * guarded at connection time; see the prober's resolved-IP check.
+ */
+export function isBlockedHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, ''); // strip IPv6 brackets
+
+  // Internal / loopback names
+  if (host === 'localhost' || host.endsWith('.localhost')) return true;
+  if (host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.lan')) return true;
+
+  // IPv4 literal checks
+  const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const o = v4.slice(1).map(Number);
+    if (o.some(n => n > 255)) return true; // malformed -> block
+    const [a, b] = o;
+    if (a === 0) return true;                       // 0.0.0.0/8
+    if (a === 10) return true;                      // 10.0.0.0/8 private
+    if (a === 127) return true;                     // loopback
+    if (a === 169 && b === 254) return true;        // link-local / cloud metadata
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 private
+    if (a === 192 && b === 168) return true;        // 192.168.0.0/16 private
+    if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
+    if (a >= 224) return true;                       // multicast / reserved
+    return false;
+  }
+
+  // IPv6 literal checks
+  if (host.includes(':')) {
+    if (host === '::1' || host === '::') return true;     // loopback / unspecified
+    if (host.startsWith('fe80')) return true;             // link-local
+    if (host.startsWith('fc') || host.startsWith('fd')) return true; // ULA fc00::/7
+    if (host.startsWith('::ffff:')) {                     // IPv4-mapped
+      const mapped = host.slice(7);
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(mapped)) return isBlockedHost(mapped);
+    }
+    return false;
+  }
+
+  return false;
 }
 
 /**
@@ -153,6 +210,10 @@ function validateRelayUrl(urlParam: string | null): { valid: true; url: string }
     if (!parsed.hostname || parsed.hostname.length < 3) {
       return { valid: false, error: 'Invalid relay URL - missing or invalid hostname' };
     }
+    // Block private/loopback/link-local targets to prevent SSRF
+    if (isBlockedHost(parsed.hostname)) {
+      return { valid: false, error: 'Invalid relay URL - host not allowed' };
+    }
   } catch {
     return { valid: false, error: 'Invalid relay URL format' };
   }
@@ -163,6 +224,9 @@ function validateRelayUrl(urlParam: string | null): { valid: true; url: string }
 /**
  * Parse period parameter (24h, 7d, 30d, 90d) to days
  */
+// Canonical set of accepted period values for cache-keyed endpoints.
+const ALLOWED_PERIODS = new Set(['6h', '24h', '7d', '30d', '90d']);
+
 function parsePeriod(period: string): number {
   const match = period.match(/^(\d+)(h|d)$/);
   if (!match) return 7; // Default to 7 days
@@ -177,13 +241,19 @@ function parsePeriod(period: string): number {
 }
 
 /**
- * Serve static files from public folder
+ * Serve static files from public folder.
+ * Contents are read once and cached in-process (filenames are a fixed set), so
+ * hot static paths don't hit the disk on every request.
  */
+const staticFileCache = new Map<string, string>();
 async function serveStaticFile(filename: string, contentType: string): Promise<Response> {
   try {
-    const filePath = new URL(`../public/${filename}`, import.meta.url).pathname;
-    const file = Bun.file(filePath);
-    const content = await file.text();
+    let content = staticFileCache.get(filename);
+    if (content === undefined) {
+      const filePath = new URL(`../public/${filename}`, import.meta.url).pathname;
+      content = await Bun.file(filePath).text();
+      staticFileCache.set(filename, content);
+    }
     return new Response(content, {
       headers: {
         'Content-Type': contentType,
@@ -241,8 +311,10 @@ class RateLimiter {
     this.windowMs = windowMs;
     this.maxRequests = maxRequests;
     this.maxEntries = maxEntries;
-    // Clean up old entries every minute
-    setInterval(() => this.cleanup(), 60000);
+    // Clean up old entries every minute. unref() so this timer never keeps the
+    // process (or a test runner) alive on its own.
+    const timer = setInterval(() => this.cleanup(), 60000);
+    timer.unref?.();
   }
 
   isAllowed(ip: string): { allowed: boolean; remaining: number; resetIn: number } {
@@ -324,8 +396,9 @@ class ResponseCache {
 
   constructor(maxEntries: number = 1000) {
     this.maxEntries = maxEntries;
-    // Clean up expired entries every minute
-    setInterval(() => this.cleanup(), 60000);
+    // Clean up expired entries every minute; unref so it never blocks exit.
+    const timer = setInterval(() => this.cleanup(), 60000);
+    timer.unref?.();
   }
 
   get<T>(key: string): T | null {
@@ -392,14 +465,21 @@ const CACHE_TTL = {
 /**
  * Get client IP from request (Cloudflare Workers)
  */
-function getClientIp(req: Request): string {
-  // CF-Connecting-IP is set by Cloudflare and cannot be spoofed
-  const cfIp = req.headers.get('cf-connecting-ip');
-  if (cfIp) {
-    return cfIp;
+function getClientIp(req: Request, socketIp: string | undefined, trustProxy: boolean): string {
+  // Proxy headers are only honored when a trusted reverse proxy is the ingress;
+  // otherwise any client can spoof them to bypass per-IP rate limiting.
+  if (trustProxy) {
+    const cfIp = req.headers.get('cf-connecting-ip');
+    if (cfIp) return cfIp;
+    const xff = req.headers.get('x-forwarded-for');
+    if (xff) {
+      // Left-most entry is the original client when set by a trusted proxy.
+      const first = xff.split(',')[0]?.trim();
+      if (first) return first;
+    }
   }
-  // Fallback for local development
-  return 'unknown';
+  // Authoritative source: the actual TCP peer address.
+  return socketIp || 'unknown';
 }
 
 /**
@@ -529,15 +609,18 @@ function serveApiDocs(): Response {
  */
 export function startApiServer(config: ApiConfig): { stop: () => void } {
   const { port, host, db } = config;
+  const trustProxy = config.trustProxy ?? false;
+  const maxRequestedRelays = config.maxRequestedRelays;
 
   const server = Bun.serve({
     port,
     hostname: host,
     idleTimeout: 30, // Seconds before idle connection times out
 
-    async fetch(req) {
+    async fetch(req, server) {
       const url = new URL(req.url);
       const path = url.pathname;
+      const socketIp = server.requestIP(req)?.address;
 
       // Handle CORS preflight - open CORS is intentional for this public read-only API
       // Only GET requests are allowed, no credentials, no sensitive data
@@ -554,7 +637,7 @@ export function startApiServer(config: ApiConfig): { stop: () => void } {
 
       // Rate limiting for API endpoints (skip for dashboard and health)
       if (path.startsWith('/api') && path !== '/api/health') {
-        const clientIp = getClientIp(req);
+        const clientIp = getClientIp(req, socketIp, trustProxy);
         const rateCheck = rateLimiter.isAllowed(clientIp);
 
         if (!rateCheck.allowed) {
@@ -636,7 +719,7 @@ export function startApiServer(config: ApiConfig): { stop: () => void } {
 
         // List all relays with scores (expensive endpoint - stricter rate limit)
         if (path === '/api/relays') {
-          const clientIp = getClientIp(req);
+          const clientIp = getClientIp(req, socketIp, trustProxy);
           const expensiveRateCheck = expensiveRateLimiter.isAllowed(clientIp);
           if (!expensiveRateCheck.allowed) {
             return new Response(JSON.stringify({
@@ -794,13 +877,16 @@ export function startApiServer(config: ApiConfig): { stop: () => void } {
           }
 
           try {
-            await db.addRequestedRelay(validation.url, getClientIp(req));
+            await db.addRequestedRelay(validation.url, getClientIp(req, socketIp, trustProxy), maxRequestedRelays);
             return addRateLimitHeaders(jsonResponse({
               message: 'Relay added to tracking list',
               url: validation.url,
               note: 'Relay will be probed in the next cycle. If unreachable for 14+ days, it will be automatically removed.',
             }));
           } catch (err) {
+            if (err instanceof Error && err.message === 'Requested relay limit reached') {
+              return addRateLimitHeaders(errorResponse('Tracking list is full; try again later', 429));
+            }
             console.error('Failed to track relay:', err);
             return addRateLimitHeaders(errorResponse(sanitizeError(err), 500));
           }
@@ -827,7 +913,7 @@ export function startApiServer(config: ApiConfig): { stop: () => void } {
 
         // Get relay rankings (leaderboard)
         if (path === '/api/rankings') {
-          const clientIp = getClientIp(req);
+          const clientIp = getClientIp(req, socketIp, trustProxy);
           const expensiveRateCheck = expensiveRateLimiter.isAllowed(clientIp);
           if (!expensiveRateCheck.allowed) {
             return new Response(JSON.stringify({
@@ -884,7 +970,11 @@ export function startApiServer(config: ApiConfig): { stop: () => void } {
         // Get network-wide statistics
         if (path === '/api/network/stats') {
           try {
-            const periodParam = url.searchParams.get('period') || '6h';
+            // Restrict to a fixed allow-list so an attacker cannot iterate
+            // arbitrary period strings to bust the cache and force repeated
+            // expensive aggregation.
+            const rawPeriod = url.searchParams.get('period') || '6h';
+            const periodParam = ALLOWED_PERIODS.has(rawPeriod) ? rawPeriod : '6h';
             const periodDays = parsePeriod(periodParam);
 
             // Check cache first (keyed by period)

@@ -1,5 +1,14 @@
 import { nip19 } from 'nostr-tools';
 
+// Order of the secp256k1 curve. A valid private key scalar must be in [1, n-1];
+// values like all-zeros or all-Fs are well-formed hex but not valid keys.
+const SECP256K1_N = BigInt('0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141');
+
+function isValidScalarHex(hex: string): boolean {
+  const n = BigInt('0x' + hex);
+  return n > 0n && n < SECP256K1_N;
+}
+
 /**
  * Normalize a private key to hex format
  * Accepts both nsec (bech32) and hex formats
@@ -7,7 +16,11 @@ import { nip19 } from 'nostr-tools';
 export function normalizePrivateKey(key: string): string {
   // Already hex format (64 hex chars)
   if (/^[0-9a-f]{64}$/i.test(key)) {
-    return key.toLowerCase();
+    const lower = key.toLowerCase();
+    if (!isValidScalarHex(lower)) {
+      throw new Error('Private key is not a valid secp256k1 scalar');
+    }
+    return lower;
   }
 
   // nsec format (bech32)

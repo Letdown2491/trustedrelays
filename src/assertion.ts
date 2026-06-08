@@ -3,6 +3,7 @@ import { normalizeRelayUrl } from './prober.js';
 import { classifyPolicy, type PolicyClassification } from './policy-classifier.js';
 import { calculateWeightedObservations, getConfidenceLevel, calculateOfflineReliability } from './scorer.js';
 import type { JurisdictionInfo } from './jurisdiction.js';
+import { ALGORITHM_VERSION, ALGORITHM_URL } from './version.js';
 
 /**
  * Determine relay policy from relay type, NIP-11 info, and reports
@@ -26,9 +27,11 @@ function determinePolicy(
   };
 }
 
-// Default values (can be overridden via options)
-const DEFAULT_ALGORITHM_VERSION = 'v0.1.1';
-const DEFAULT_ALGORITHM_URL = 'https://github.com/Letdown2491/trustedrelays/blob/main/ALGORITHM.md';
+// Default values (can be overridden via options).
+// Sourced from the single version module so the algorithm version is identical
+// across assertions, config, the dashboard, and ALGORITHM.md.
+const DEFAULT_ALGORITHM_VERSION = ALGORITHM_VERSION;
+const DEFAULT_ALGORITHM_URL = ALGORITHM_URL;
 
 /**
  * Options for building an assertion
@@ -170,11 +173,14 @@ export function buildAssertion(
     if (jur.isHosting !== undefined) {
       assertion.isHosting = jur.isHosting;
     }
-    // Set network type based on jurisdiction detection
-    if (jur.isTor) {
+    // Determine network from the (normalized) URL suffix, which is
+    // authoritative, rather than overloading countryCode 'XX' (a real geoIP
+    // lookup can also return 'XX' for unknown, which previously got
+    // misclassified as I2P).
+    const host = url.replace(/^wss?:\/\//, '').split('/')[0].split(':')[0].toLowerCase();
+    if (jur.isTor || host.endsWith('.onion')) {
       assertion.network = 'tor';
-    } else if (jur.countryCode === 'XX') {
-      // XX is used for I2P as well
+    } else if (host.endsWith('.i2p')) {
       assertion.network = 'i2p';
     }
   }

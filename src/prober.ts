@@ -106,6 +106,8 @@ function wsToHttps(wsUrl: string): string {
 /**
  * Fetch NIP-11 relay information document
  */
+const NIP11_MAX_BYTES = 256 * 1024; // 256 KB cap on NIP-11 documents
+
 async function fetchNIP11(relayUrl: string, timeout = 5000): Promise<{ info: NIP11Info; fetchTime: number }> {
   const httpUrl = wsToHttps(relayUrl);
   const start = performance.now();
@@ -117,19 +119,68 @@ async function fetchNIP11(relayUrl: string, timeout = 5000): Promise<{ info: NIP
     const response = await fetch(httpUrl, {
       headers: { 'Accept': 'application/nostr+json' },
       signal: controller.signal,
+      // Do not follow redirects: a relay could redirect to an internal host
+      // (SSRF) or to an unrelated large resource.
+      redirect: 'manual',
     });
 
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
 
-    const info = await response.json() as NIP11Info;
+    // Reject non-JSON content types early to avoid parsing arbitrary bodies.
+    const contentType = response.headers.get('content-type') || '';
+    if (!/json/i.test(contentType)) {
+      throw new Error(`Unexpected content-type: ${contentType || 'none'}`);
+    }
+
+    // Enforce a hard size cap, honoring Content-Length when present and
+    // streaming-counting otherwise, so a malicious relay cannot exhaust memory.
+    const declaredLen = Number(response.headers.get('content-length'));
+    if (Number.isFinite(declaredLen) && declaredLen > NIP11_MAX_BYTES) {
+      throw new Error('NIP-11 document too large');
+    }
+
+    const text = await readCapped(response, NIP11_MAX_BYTES);
+    const info = JSON.parse(text) as NIP11Info;
     const fetchTime = performance.now() - start;
 
     return { info, fetchTime };
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+/**
+ * Read a response body as text, aborting once a byte cap is exceeded.
+ */
+async function readCapped(response: Response, maxBytes: number): Promise<string> {
+  const body = response.body;
+  if (!body) return await response.text();
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        total += value.length;
+        if (total > maxBytes) {
+          throw new Error('NIP-11 document too large');
+        }
+        chunks.push(value);
+      }
+    }
+  } finally {
+    try { await reader.cancel(); } catch { /* ignore */ }
+  }
+
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) { merged.set(c, offset); offset += c.length; }
+  return new TextDecoder().decode(merged);
 }
 
 /**
@@ -156,12 +207,32 @@ async function testWebSocketGeneral(
     let connectTime: number | undefined;
     let readTime: number | undefined;
     let readStart: number | undefined;
+    let settled = false;
 
     const ws = new WebSocket(relayUrl);
-    const timeoutId = setTimeout(() => {
-      ws.close();
-      reject(new Error('Connection timeout'));
-    }, timeout);
+    const timeoutId = setTimeout(() => fail(new Error('Connection timeout')), timeout);
+
+    // Single teardown path used by every resolve/reject branch so we never leak
+    // the socket, its timer, or its listeners.
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      ws.removeAllListeners();
+      try { ws.terminate(); } catch { /* already closed */ }
+      reject(err);
+    };
+    const succeed = (res: WebSocketTestResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      ws.removeAllListeners();
+      // The caller closes the returned socket; keep a no-op error handler so a
+      // late error event in the meantime does not throw (ws throws on
+      // unhandled 'error').
+      ws.on('error', () => {});
+      resolve(res);
+    };
 
     ws.on('open', () => {
       connectTime = performance.now() - start;
@@ -190,18 +261,16 @@ async function testWebSocketGeneral(
 
       // EOSE = relay accepts generic queries (open access)
       if (msg[0] === 'EOSE') {
-        clearTimeout(timeoutId);
-        resolve({ connectTime, readTime, accessLevel: 'open', ws });
+        succeed({ connectTime, readTime, accessLevel: 'open', ws });
         return;
       }
 
       // CLOSED = relay responded but rejected the query (restricted access)
       // This is still "reachable" - the relay is online and functioning
       if (msg[0] === 'CLOSED') {
-        clearTimeout(timeoutId);
         const reason = typeof msg[2] === 'string' ? msg[2] : '';
         const accessLevel = parseClosedReason(reason);
-        resolve({ connectTime, readTime, accessLevel, closedReason: reason, ws });
+        succeed({ connectTime, readTime, accessLevel, closedReason: reason, ws });
         return;
       }
 
@@ -209,10 +278,11 @@ async function testWebSocketGeneral(
       // (relay will typically send CLOSED after AUTH if we don't authenticate)
     });
 
-    ws.on('error', (err) => {
-      clearTimeout(timeoutId);
-      reject(err);
-    });
+    ws.on('error', (err) => fail(err instanceof Error ? err : new Error(String(err))));
+
+    // A clean close before EOSE/CLOSED means we never got a usable response;
+    // fail fast instead of waiting for the full timeout.
+    ws.on('close', () => fail(new Error('Connection closed before response')));
   });
 }
 
@@ -226,23 +296,32 @@ async function testWebSocketSpecialized(
 ): Promise<{ connectTime: number; ws: WebSocket }> {
   return new Promise((resolve, reject) => {
     const start = performance.now();
+    let settled = false;
 
     const ws = new WebSocket(relayUrl);
-    const timeoutId = setTimeout(() => {
-      ws.close();
-      reject(new Error('Connection timeout'));
-    }, timeout);
+    const timeoutId = setTimeout(() => fail(new Error('Connection timeout')), timeout);
+
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      ws.removeAllListeners();
+      try { ws.terminate(); } catch { /* already closed */ }
+      reject(err);
+    };
 
     ws.on('open', () => {
+      if (settled) return;
+      settled = true;
       const connectTime = performance.now() - start;
       clearTimeout(timeoutId);
+      ws.removeAllListeners();
+      ws.on('error', () => {}); // caller closes the socket; swallow late errors
       resolve({ connectTime, ws });
     });
 
-    ws.on('error', (err) => {
-      clearTimeout(timeoutId);
-      reject(err);
-    });
+    ws.on('error', (err) => fail(err instanceof Error ? err : new Error(String(err))));
+    ws.on('close', () => fail(new Error('Connection closed before open')));
   });
 }
 

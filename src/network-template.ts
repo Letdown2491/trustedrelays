@@ -15,8 +15,8 @@ export const NETWORK_HTML = `<!DOCTYPE html>
   <meta name="description" content="Nostr relay network health statistics and trends">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/styles.css?v=${BUILD_TIME}">
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha384-sHL9NAb7lN7rfvG5lfHpm643Xkcjzp4jFvuavGOndn6pjVqS6ny56CAt3nsEVT4H" crossorigin="anonymous">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha384-cxOPjt7s7Iz04uaHJceBmS+qpjv2JkIHNVcuOrM+YHwZOmJGBXI00mdUXEq65HTH" crossorigin="anonymous"></script>
   <style>
     /* Network page specific styles */
     .network-content {
@@ -418,8 +418,10 @@ export const NETWORK_HTML = `<!DOCTYPE html>
     };
 
     // Country code to flag emoji
+    function escHtml(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+
     function countryFlag(code) {
-      if (!code || code === 'Unknown') return '\\u{1F310}';
+      if (!code || !/^[A-Za-z]{2}$/.test(code)) return '\\u{1F310}';
       const codePoints = code.toUpperCase().split('').map(c => 127397 + c.charCodeAt(0));
       return String.fromCodePoint(...codePoints);
     }
@@ -513,7 +515,7 @@ export const NETWORK_HTML = `<!DOCTYPE html>
         const label = d.label || config.label || d.type;
         legend += '<div class="donut-legend-item">' +
           '<div class="donut-legend-dot" style="background:' + config.color + '"></div>' +
-          '<span class="donut-legend-label">' + label + '</span>' +
+          '<span class="donut-legend-label">' + escHtml(label) + '</span>' +
           '<span class="donut-legend-value">' + d.percent + '%</span>' +
           '</div>';
       }
@@ -628,7 +630,7 @@ export const NETWORK_HTML = `<!DOCTYPE html>
           opacity: 0.9
         });
 
-        const popupContent = '<div class="map-popup-title">' + countryFlag(code) + ' ' + data.countryName + '</div>' +
+        const popupContent = '<div class="map-popup-title">' + countryFlag(code) + ' ' + escHtml(data.countryName) + '</div>' +
           '<div class="map-popup-row"><span>Relays</span><span>' + data.relayCount + '</span></div>' +
           '<div class="map-popup-row"><span>Avg Score</span><span>' + avgScore.toFixed(0) + '</span></div>';
 

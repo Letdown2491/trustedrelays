@@ -1,6 +1,6 @@
 {
   "name": "trustedrelays",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Nostr Trusted Relay Assertion Provider",
   "license": "MIT",
   "type": "module",

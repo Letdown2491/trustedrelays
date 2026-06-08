@@ -105,19 +105,17 @@ const FREEDOM_SCORES: Record<string, number> = {
 };
 
 /**
- * Default score for countries not in the Freedom House report
- * Assumed to be moderately free (benefit of the doubt)
- */
-const DEFAULT_SCORE = 65;
-
-/**
- * Get freedom score for a country
+ * Get freedom score for a country.
+ * Returns null when the country is not in the Freedom House report so callers
+ * can treat it as "unknown" (consistent with a missing country code) rather
+ * than inventing a default that would score it better than truly-unknown.
  */
 export function getFreedomScore(countryCode: string | undefined | null): FreedomScore | null {
   if (!countryCode) return null;
 
   const code = countryCode.toUpperCase();
-  const score = FREEDOM_SCORES[code] ?? DEFAULT_SCORE;
+  const score = FREEDOM_SCORES[code];
+  if (score === undefined) return null;
 
   let category: 'free' | 'partly_free' | 'not_free';
   if (score >= 70) {

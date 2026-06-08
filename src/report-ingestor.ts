@@ -338,8 +338,13 @@ export class ReportIngestor {
       }
     }
 
-    // Store the report
-    await this.config.db.storeReport(report);
+    // Store the report. Only count and notify when a new row was actually
+    // inserted, so concurrent delivery of the same event from multiple relays
+    // does not double-count or fire the callback twice.
+    const inserted = await this.config.db.storeReport(report);
+    if (!inserted) {
+      return;
+    }
     this.reportCount++;
 
     // Notify callback

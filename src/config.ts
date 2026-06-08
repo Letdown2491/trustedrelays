@@ -1,5 +1,6 @@
-import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, chmodSync } from 'fs';
 import { isValidPrivateKey } from './key-utils.js';
+import { ALGORITHM_VERSION, ALGORITHM_URL } from './version.js';
 
 /**
  * Service configuration
@@ -82,6 +83,10 @@ export interface ServiceConfig {
     enabled: boolean;
     port: number;
     host: string;
+    // Trust the cf-connecting-ip / x-forwarded-for header for client IP.
+    // Only enable when a trusted reverse proxy (e.g. Cloudflare) is the real
+    // ingress; otherwise clients can spoof these headers to bypass rate limits.
+    trustProxy?: boolean;
   };
 }
 
@@ -90,8 +95,8 @@ export interface ServiceConfig {
  */
 export const DEFAULT_CONFIG: ServiceConfig = {
   provider: {
-    algorithmVersion: 'v0.1.1',
-    algorithmUrl: 'https://github.com/Letdown2491/trustedrelays/blob/main/ALGORITHM.md',
+    algorithmVersion: ALGORITHM_VERSION,
+    algorithmUrl: ALGORITHM_URL,
   },
 
   targets: {
@@ -171,14 +176,21 @@ export function loadConfig(configPath: string): ServiceConfig {
     return DEFAULT_CONFIG;
   }
 
+  let fileContent: string;
+  let fileConfig: unknown;
   try {
-    const fileContent = readFileSync(configPath, 'utf-8');
-    const fileConfig = JSON.parse(fileContent);
-    return mergeConfig(DEFAULT_CONFIG, fileConfig);
+    fileContent = readFileSync(configPath, 'utf-8');
   } catch (err) {
-    console.error(`Error loading config from ${configPath}:`, err);
-    return DEFAULT_CONFIG;
+    throw new Error(`Failed to read config from ${configPath}: ${(err as Error).message}`);
   }
+  try {
+    fileConfig = JSON.parse(fileContent);
+  } catch (err) {
+    // Fail fast: silently falling back to defaults could run with unintended
+    // targets/relays and publishing.enabled=true.
+    throw new Error(`Invalid JSON in config ${configPath}: ${(err as Error).message}`);
+  }
+  return mergeConfig(DEFAULT_CONFIG, fileConfig as Partial<ServiceConfig>);
 }
 
 /**
@@ -211,6 +223,9 @@ function mergeConfig(base: ServiceConfig, override: Partial<ServiceConfig>): Ser
   if (override.api) {
     result.api = { ...base.api, ...override.api };
   }
+  if (override.probing) {
+    result.probing = { ...base.probing, ...override.probing };
+  }
 
   return result;
 }
@@ -221,6 +236,12 @@ function mergeConfig(base: ServiceConfig, override: Partial<ServiceConfig>): Ser
 export function saveConfig(config: ServiceConfig, configPath: string): void {
   const content = JSON.stringify(config, null, 2);
   writeFileSync(configPath, content, 'utf-8');
+  // Config may contain a private key; restrict to owner read/write only.
+  try {
+    chmodSync(configPath, 0o600);
+  } catch {
+    // chmod is best-effort (e.g. unsupported FS); ignore failures.
+  }
 }
 
 /**

@@ -1010,6 +1010,17 @@ switch (command) {
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
 
+    // Catch otherwise-fatal async errors so the daemon logs and shuts down
+    // gracefully instead of crashing silently or being killed by the runtime.
+    process.on('unhandledRejection', (reason) => {
+      console.error('Unhandled promise rejection:', reason);
+      shutdown();
+    });
+    process.on('uncaughtException', (err) => {
+      console.error('Uncaught exception:', err);
+      shutdown();
+    });
+
     // Start service
     service.start().catch((err) => {
       console.error('Service failed to start:', err);
@@ -1023,10 +1034,11 @@ switch (command) {
     const port = portIdx !== -1 ? parseInt(args[portIdx + 1], 10) : 3000;
     const hostIdx = args.indexOf('--host');
     const host = hostIdx !== -1 ? args[hostIdx + 1] : 'localhost';
+    const trustProxy = args.includes('--trust-proxy');
 
     const db = new DataStore(DB_PATH);
 
-    const api = startApiServer({ port, host, db });
+    const api = startApiServer({ port, host, db, trustProxy });
 
     // Handle shutdown
     const shutdown = () => {
@@ -1056,7 +1068,15 @@ switch (command) {
       console.log('Edit the file to set your private key and customize settings.');
     } else if (subcommand === 'show') {
       const config = loadConfig(configPath);
-      console.log(JSON.stringify(config, null, 2));
+      // Redact the private key so it never lands in stdout/logs/screen-shares.
+      const redacted = {
+        ...config,
+        provider: {
+          ...config.provider,
+          privateKey: config.provider?.privateKey ? '***redacted***' : config.provider?.privateKey,
+        },
+      };
+      console.log(JSON.stringify(redacted, null, 2));
     } else if (subcommand === 'validate') {
       const config = loadConfig(configPath);
       const validation = validateConfig(config);

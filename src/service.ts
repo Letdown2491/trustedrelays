@@ -53,8 +53,10 @@ export class RelayTrustService {
   private apiServer: { stop: () => void } | null = null;
 
   private running = false;
-  private cycleTimer: ReturnType<typeof setInterval> | null = null;
-  private checkpointTimer: ReturnType<typeof setInterval> | null = null;
+  private cycleTimer: ReturnType<typeof setTimeout> | null = null;
+  private checkpointTimer: ReturnType<typeof setTimeout> | null = null;
+  private cycleInProgress = false;
+  private checkpointInProgress = false;
   private lastCleanupAt: number = 0;
   private lastCheckpointAt: number = 0;
 
@@ -140,6 +142,8 @@ export class RelayTrustService {
         port: this.config.api.port,
         host: this.config.api.host,
         db: this.db,
+        trustProxy: this.config.api.trustProxy ?? false,
+        maxRequestedRelays: this.config.targets?.maxRelays,
       });
       this.log('info', `API server started at http://${this.config.api.host}:${this.config.api.port}`);
     }
@@ -162,20 +166,49 @@ export class RelayTrustService {
     // Initial cycle: probe then publish
     await this.runCycle();
 
-    // Set up periodic cycle (probe → publish)
-    this.cycleTimer = setInterval(
-      () => this.runCycle(),
-      this.config.intervals.cycle * 1000
-    );
-
-    // Independent WAL checkpoint timer (every 5 minutes)
-    // Prevents WAL growth between hourly cycles while ingestors write continuously
-    this.checkpointTimer = setInterval(
-      () => this.checkpointDatabase(),
-      5 * 60 * 1000
-    );
+    // Set up periodic cycle (probe → publish) and WAL checkpoint using
+    // self-rescheduling timers. Unlike setInterval, these never overlap a slow
+    // run with the next one, and a thrown error never kills the loop.
+    this.scheduleCycle();
+    this.scheduleCheckpoint();
 
     this.log('info', `Service started. Cycle interval: ${this.config.intervals.cycle}s (probe → publish)`);
+  }
+
+  private scheduleCycle(): void {
+    if (!this.running) return;
+    this.cycleTimer = setTimeout(async () => {
+      if (this.running && !this.cycleInProgress) {
+        this.cycleInProgress = true;
+        try {
+          await this.runCycle();
+        } catch (err) {
+          this.log('error', `Cycle failed: ${err instanceof Error ? err.message : String(err)}`);
+        } finally {
+          this.cycleInProgress = false;
+        }
+      }
+      this.scheduleCycle();
+    }, this.config.intervals.cycle * 1000);
+  }
+
+  private scheduleCheckpoint(): void {
+    if (!this.running) return;
+    // Independent WAL checkpoint (every 5 minutes). Prevents WAL growth between
+    // cycles while ingestors write continuously.
+    this.checkpointTimer = setTimeout(async () => {
+      if (this.running && !this.checkpointInProgress) {
+        this.checkpointInProgress = true;
+        try {
+          await this.checkpointDatabase();
+        } catch (err) {
+          this.log('error', `Checkpoint failed: ${err instanceof Error ? err.message : String(err)}`);
+        } finally {
+          this.checkpointInProgress = false;
+        }
+      }
+      this.scheduleCheckpoint();
+    }, 5 * 60 * 1000);
   }
 
   /**
@@ -189,13 +222,13 @@ export class RelayTrustService {
     this.log('info', 'Stopping service...');
     this.running = false;
 
-    // Clear timers
+    // Clear timers (running=false above already prevents rescheduling)
     if (this.cycleTimer) {
-      clearInterval(this.cycleTimer);
+      clearTimeout(this.cycleTimer);
       this.cycleTimer = null;
     }
     if (this.checkpointTimer) {
-      clearInterval(this.checkpointTimer);
+      clearTimeout(this.checkpointTimer);
       this.checkpointTimer = null;
     }
 

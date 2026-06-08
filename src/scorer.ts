@@ -115,9 +115,11 @@ export function calculateWeightedObservations(
     return probeContribution;
   }
 
-  // Monitor diversity bonus: 1 + (monitorCount / 10)
-  // Range: 1.1 (1 monitor) to 2.8 (18 monitors)
-  const monitorBonus = 1 + (Math.max(1, monitorCount) / 10);
+  // Monitor diversity bonus: 1 + (monitorCount / 10), capped at 2.8.
+  // Range: 1.1 (1 monitor) to 2.8 (18+ monitors). The cap reflects diminishing
+  // returns so a very high monitor count can't keep inflating observation
+  // weight (and therefore confidence) without bound.
+  const monitorBonus = Math.min(2.8, 1 + (Math.max(1, monitorCount) / 10));
 
   // Time factor: 1 + (days / 30), capped at 30 days
   // Range: 1.0 (0 days) to 2.0 (30+ days)
@@ -518,7 +520,13 @@ export function computeCombinedReliabilityScore(
   const hasNip66 = nip66Stats !== null && nip66Stats.metricCount > 0;
   const hasPercentileScore = nip66Stats?.latencyScore !== null && nip66Stats?.latencyScore !== undefined;
 
-  // Calculate uptime from probes
+  // Calculate uptime from probes.
+  // TODO(uptime-bias): when there are no direct probes we assume 95 purely
+  // because NIP-66 monitors saw the relay. Monitors mostly report *reachable*
+  // observations, so this may overstate availability (survivorship bias).
+  // Revisit once we confirm whether monitors also emit downtime events; if so,
+  // derive this from monitor reachability instead of a flat 95. See ALGORITHM.md
+  // "Uptime Score" known-limitation note.
   const uptimeScore = hasProbes ? computeUptimeScore(probes) : (hasNip66 ? 95 : 50);
   const uptimePercent = hasProbes ? uptimeScore : undefined;
 
@@ -555,10 +563,18 @@ export function computeCombinedReliabilityScore(
   const connectScore = hasPercentileScore
     ? (nip66Stats!.connectPercentile ?? scoreLatency(probeLatency ?? nip66Latency))
     : scoreLatency(probeLatency ?? nip66Latency);
+  // Average read time over the consistent set of reachable probes that have a
+  // read measurement; guard against an empty set (avoid NaN / divide-by-zero).
+  const readTimes = hasProbes
+    ? probes.filter(p => p.reachable && p.readTime !== undefined).map(p => p.readTime!)
+    : [];
+  const avgReadMs = readTimes.length > 0
+    ? readTimes.reduce((a, b) => a + b, 0) / readTimes.length
+    : undefined;
   const readScore = hasPercentileScore
     ? (nip66Stats!.readPercentile ?? scoreLatency(nip66Stats?.avgRttRead ?? undefined))
     : (hasProbes
-      ? scoreLatency(probes.filter(p => p.reachable && p.readTime).map(p => p.readTime!).reduce((a, b) => a + b, 0) / probes.filter(p => p.readTime).length || undefined)
+      ? scoreLatency(avgReadMs)
       : scoreLatency(nip66Stats?.avgRttRead ?? undefined));
 
   // Compute overall reliability score using configured weights

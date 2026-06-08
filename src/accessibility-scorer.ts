@@ -1,5 +1,5 @@
 import type { NIP11Info, AccessibilityScore, EyesAlliance } from './types.js';
-import { calculateFreedomPenalty } from './freedom-scores.js';
+import { calculateFreedomPenalty, getFreedomScore } from './freedom-scores.js';
 
 // =============================================================================
 // Accessibility Scoring Constants
@@ -237,6 +237,12 @@ export function scoreLimitRestrictiveness(nip11?: NIP11Info): number {
 export function scoreJurisdiction(countryCode?: string | null): number {
   if (!countryCode) {
     return 75; // Unknown - assume moderately free
+  }
+
+  // Known country code but no Freedom House data: treat the same as unknown so
+  // an unlisted country isn't scored more leniently than a truly-unknown one.
+  if (!getFreedomScore(countryCode)) {
+    return 75;
   }
 
   const penalty = calculateFreedomPenalty(countryCode);

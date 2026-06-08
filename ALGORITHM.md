@@ -1,6 +1,6 @@
 # Scoring Algorithm Specification
 
-**Algorithm Version:** v0.2.0
+**Algorithm Version:** v0.3.0
 **Last Updated:** 2026-01-18
 
 This document describes the scoring methodology used to compute relay trust assertions.
@@ -73,6 +73,13 @@ uptime_score = (reachable_probes / total_probes) * 100
 | 90% | 90 |
 | 80% | 80 |
 | <50% | <50 |
+
+> **Known limitation (under review):** When a relay has *no* direct probe data
+> and only NIP-66 monitor data, uptime currently defaults to **95**. Because
+> monitors predominantly report *reachable* observations, this may overstate
+> availability (survivorship bias). This default is intentionally left unchanged
+> pending confirmation of whether monitors also emit downtime events; see the
+> `TODO` in `computeCombinedReliabilityScore` (`src/scorer.ts`).
 
 ### Resilience Score (20%)
 
@@ -201,6 +208,20 @@ latency_score = connect_percentile  (when rtt_read is NULL)
 ```
 
 This prevents relays from being unfairly penalized for not having read metrics.
+
+#### Displayed average latency (informational)
+
+Separately from the percentile-based `latency_score` above, the UI shows a raw
+`avgLatencyMs` value. When both direct-probe and monitor data exist, this
+**display value** blends the two connect-time sources:
+
+```
+avgLatencyMs = probe_connect_ms * 0.30 + monitor_rtt_open_ms * 0.70
+```
+
+This is a deliberate *source* blend (own probe vs. aggregated monitors), not the
+connect-vs-read weighting above which happens to share the same 0.30/0.70
+constants. It affects only the displayed number, never the computed score.
 
 #### Example
 
@@ -369,7 +390,7 @@ Base score: 100
 Deductions:
   -40: payment_required
   -30: auth_required
-  -5 to -15: min_pow_difficulty (penalty equals difficulty level, max 15)
+  -1 to -15: min_pow_difficulty (penalty equals difficulty level, capped at 15)
 ```
 
 Note: `restricted_writes` is NOT penalized. It indicates relay specialization (e.g., NIP-46 signing relays only accepting kinds 24133/24135), not access restriction. The real barriers to user access are auth and payment requirements.
@@ -562,7 +583,7 @@ NIP-66 metrics are weighted higher than raw probe counts because they represent:
 - Sustained observation over time
 
 ```
-monitorBonus = 1 + (monitorCount / 10)      // 1.1 to 2.8 for 1-18 monitors
+monitorBonus = min(2.8, 1 + (monitorCount / 10)) // 1.1 to 2.8 (capped at 18+ monitors)
 timeFactor = 1 + (min(periodDays, 30) / 30) // 1.0 to 2.0 for 0-30 days
 
 nip66Contribution = nip66Metrics * monitorBonus * timeFactor
