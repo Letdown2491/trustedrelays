@@ -157,7 +157,7 @@ async function queryRelayForAssertions(
 ): Promise<TrustAssertion[]> {
   return new Promise((resolve) => {
     const assertions: TrustAssertion[] = [];
-    const ws = new WebSocket(relayUrl);
+    const ws = new WebSocket(relayUrl, { maxPayload: 512 * 1024 });
     const subId = `nip85-${crypto.randomUUID()}`;
 
     const timeoutId = setTimeout(() => {

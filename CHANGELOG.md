@@ -1,5 +1,69 @@
 # Changelog
 
+## [0.3.0] - 2026-06-26
+
+> The scoring **algorithm version is unchanged (`v0.3.0`)** — this release is a
+> datastore migration plus security/performance hardening, with no changes to
+> scoring math, so published kind-30385 scores do not move.
+
+### Changed
+
+- **Migrated the data store from DuckDB to SQLite (`bun:sqlite`).** A corrupted
+  DuckDB ART index (`"Invalid node type for DeleteChild"`) was escalating into a
+  hard Bun segfault crash-loop via the `duckdb` native binding. DuckDB is an
+  analytical engine that fit this workload (continuous single-writer ingestion +
+  periodic analytics on a small host) poorly. `bun:sqlite` is built into Bun, so
+  there's no native addon — eliminating that crash class — with a much smaller
+  memory footprint (~1.2 GB → ~0.5 GB RSS) and WAL-based crash recovery.
+  - All `DataStore` method signatures are unchanged (an async shim wraps the
+    synchronous `bun:sqlite` API), so callers were untouched.
+  - Statistical aggregates with no SQLite equivalent were reimplemented:
+    `STDDEV_SAMP` / `REGR_SLOPE` as closed-form SQL, `MEDIAN` / `QUANTILE_CONT`
+    in JS over the (cached) network-stats datasets.
+  - Default database path is now `./data/trustedrelays.sqlite`.
+- **Per-table data retention + incremental auto-vacuum.** Retention is now
+  configurable per table (`database.retentionDays` for score_history/reports,
+  `database.probeRetentionDays`, `database.nip66RetentionDays`); the DB uses
+  `auto_vacuum=INCREMENTAL` so cleanup reclaims space without a multi-second
+  full-VACUUM stall.
+
+### Security
+
+- **Capped WebSocket frame size** (`maxPayload` 512 KB) on every relay
+  connection — a hostile relay can no longer send a ~100 MiB frame to OOM the host.
+- **SSRF hardening of the probe & operator-resolution paths.** Relay URLs from
+  untrusted events are now host-gated (`isBlockedHost`) and resolve-checked
+  (DNS-rebinding) before any HTTP/WebSocket; `.well-known/nostr.json` fetches are
+  redirect-pinned, size-capped, and content-type-checked.
+- **Monitor enrollment is gated.** kind-10166 announcements are signature-verified
+  and a new monitor is auto-trusted only when corroborated by ≥2 source relays
+  (`sources.minMonitorSources`), up to `sources.maxMonitors` — resisting Sybil
+  enrollment that would skew scores.
+- **API hardening.** `/api/untrack` requires an admin token
+  (`TRUSTEDRELAYS_ADMIN_TOKEN`); `/api/track` is behind the strict rate limiter;
+  `/api/metrics` is admin/loopback-gated and rate-limited; mutating endpoints
+  reject cross-origin requests (CSRF); CSV export neutralizes formula injection;
+  GeoIP lookups skip private IPs; config load warns on world-readable perms.
+
+### Performance
+
+- **Read models are precomputed off the request path.** The daemon computes the
+  relay list, rankings and network-stats snapshots once per cycle;
+  `/api/relays`, `/api/rankings` and `/api/network/stats` serve them from memory
+  (the ~16 s cold rebuild that blocked the event loop is gone).
+- **Analytics queries rewritten** from `ROW_NUMBER()` full-table window scans to
+  `GROUP BY MAX(timestamp)` covering-index joins, plus composite indexes on
+  `score_history` and `nip66_metrics` (multi-second queries → sub-second).
+- **Continuous probe/WoT worker pool** replaces fixed-batch barriers, so one slow
+  relay no longer idles the other concurrency slots.
+- **Eliminated N+1 query patterns** in the publish cycle (bulk
+  `getAllProbes`/`getAllReports`) and removed redundant per-event ingestion writes.
+
+### Removed
+
+- The `duckdb-async` dependency and the one-time DuckDB→SQLite conversion script
+  (migration complete).
+
 ## [0.2.0] - 2026-06-07
 
 First versioned release. Includes a full security/correctness/performance audit,

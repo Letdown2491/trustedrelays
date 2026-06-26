@@ -1,7 +1,54 @@
-import { Database } from 'duckdb-async';
-import type { ProbeResult, RelayType, OperatorResolution, VerificationMethod, RelayReport, ReportType, RelayReportStats, RelayAssertion, NetworkStats } from './types.js';
+import { Database as SQLiteDatabase } from 'bun:sqlite';
+import type { ProbeResult, RelayType, OperatorResolution, VerificationMethod, RelayReport, ReportType, RelayReportStats, RelayAssertion, NetworkStats, Nip66PolicySignals } from './types.js';
 import type { JurisdictionInfo } from './jurisdiction.js';
 import { normalizeRelayUrl } from './prober.js';
+
+/**
+ * Thin async-shaped adapter over bun:sqlite's synchronous API. Keeping the
+ * `run`/`all`/`exec` surface (and the `Promise` return types) lets every
+ * DataStore method keep its existing `await db.run(...)` / `await db.all(...)`
+ * call shape, so the migration off DuckDB stays contained to this file.
+ */
+interface DbAdapter {
+  run(sql: string, ...params: unknown[]): Promise<void>;
+  all(sql: string, ...params: unknown[]): Promise<any[]>;
+  exec(sql: string): Promise<void>;
+}
+
+/**
+ * bun:sqlite rejects `undefined` bindings (DuckDB silently treated them as
+ * NULL). Normalize so the many call sites that pass `value ?? null` — and the
+ * occasional one that doesn't — both bind cleanly.
+ */
+function normalizeBindings(params: unknown[]): unknown[] {
+  return params.map((p) => (p === undefined ? null : p));
+}
+
+/**
+ * Continuous percentile with linear interpolation, matching DuckDB's
+ * QUANTILE_CONT / MEDIAN (q=0.5). Input must be sorted ascending. SQLite has no
+ * percentile aggregate, so these are computed in JS over the (small, cached)
+ * network-stats datasets.
+ */
+function percentileCont(sortedAsc: number[], q: number): number | null {
+  const n = sortedAsc.length;
+  if (n === 0) return null;
+  if (n === 1) return sortedAsc[0];
+  const pos = (n - 1) * q;
+  const lo = Math.floor(pos);
+  const hi = Math.ceil(pos);
+  if (lo === hi) return sortedAsc[lo];
+  return sortedAsc[lo] + (sortedAsc[hi] - sortedAsc[lo]) * (pos - lo);
+}
+
+/** Sample standard deviation (n−1 denominator), matching DuckDB STDDEV_SAMP. */
+function sampleStddev(values: number[]): number | null {
+  const n = values.length;
+  if (n < 2) return null;
+  const mean = values.reduce((a, b) => a + b, 0) / n;
+  const variance = values.reduce((a, b) => a + (b - mean) * (b - mean), 0) / (n - 1);
+  return Math.sqrt(variance);
+}
 
 /**
  * Safely parse JSON, returning undefined on error
@@ -16,7 +63,84 @@ function safeJsonParse<T>(json: string | null | undefined): T | undefined {
   }
 }
 
-const SCHEMA = `
+/**
+ * Tally NIP-66 policy signals (R/k/T tags) from a set of latest-per-monitor
+ * rows for a single relay. Each requirement is decided by majority among the
+ * monitors that expressed an opinion; ties and no-votes yield `undefined` so
+ * callers can distinguish "observed false" from "not observed". Shared by the
+ * single-relay and bulk aggregation paths.
+ */
+function tallyNip66PolicySignals(
+  rows: Array<{ requirements: unknown; relay_type: unknown; rejected_kinds: unknown; topics?: unknown }>
+): Nip66PolicySignals {
+  const reqKeys = ['auth', 'payment', 'writes', 'pow'] as const;
+  const yes: Record<string, number> = { auth: 0, payment: 0, writes: 0, pow: 0 };
+  const no: Record<string, number> = { auth: 0, payment: 0, writes: 0, pow: 0 };
+  let kindRestrictYes = 0;
+  let kindRestrictTotal = 0;
+  const relayTypeVotes: Map<string, number> = new Map();
+  // Distinct topics, deduped case-insensitively but preserving first-seen casing.
+  const topicSeen = new Map<string, string>();
+  const MAX_TOPICS = 25;
+
+  for (const row of rows) {
+    const requirements = safeJsonParse<string[]>(row.requirements as string) ?? [];
+    const reqSet = new Set(requirements.map((r) => r.toLowerCase()));
+    for (const key of reqKeys) {
+      if (reqSet.has(key)) yes[key]++;
+      else if (reqSet.has(`!${key}`)) no[key]++;
+    }
+
+    const rejectedKinds = safeJsonParse<number[]>(row.rejected_kinds as string);
+    if (rejectedKinds !== undefined) {
+      kindRestrictTotal++;
+      if (rejectedKinds.length > 0) kindRestrictYes++;
+    }
+
+    if (row.relay_type) {
+      const t = row.relay_type as string;
+      relayTypeVotes.set(t, (relayTypeVotes.get(t) ?? 0) + 1);
+    }
+
+    const topics = safeJsonParse<string[]>(row.topics as string) ?? [];
+    for (const topic of topics) {
+      const trimmed = topic.trim();
+      if (!trimmed || topicSeen.size >= MAX_TOPICS) continue;
+      const k = trimmed.toLowerCase();
+      if (!topicSeen.has(k)) topicSeen.set(k, trimmed);
+    }
+  }
+
+  const majority = (key: typeof reqKeys[number]): boolean | undefined => {
+    const total = yes[key] + no[key];
+    if (total === 0) return undefined;
+    if (yes[key] > no[key]) return true;
+    if (no[key] > yes[key]) return false;
+    return undefined; // tie: no clear verdict
+  };
+
+  let relayType: string | undefined;
+  let bestVotes = 0;
+  for (const [type, votes] of relayTypeVotes) {
+    if (votes > bestVotes) {
+      bestVotes = votes;
+      relayType = type;
+    }
+  }
+
+  return {
+    monitorCount: rows.length,
+    authRequired: majority('auth'),
+    paymentRequired: majority('payment'),
+    restrictedWrites: majority('writes'),
+    powRequired: majority('pow'),
+    kindRestrictions: kindRestrictTotal === 0 ? undefined : kindRestrictYes * 2 > kindRestrictTotal,
+    relayType,
+    topics: topicSeen.size > 0 ? Array.from(topicSeen.values()) : undefined,
+  };
+}
+
+export const SCHEMA = `
   CREATE TABLE IF NOT EXISTS probes (
     url VARCHAR NOT NULL,
     timestamp BIGINT NOT NULL,
@@ -46,12 +170,21 @@ const SCHEMA = `
     rtt_write INTEGER,
     network VARCHAR,
     supported_nips VARCHAR,
-    geohash VARCHAR
+    geohash VARCHAR,
+    relay_type VARCHAR,
+    requirements VARCHAR,
+    topics VARCHAR,
+    accepted_kinds VARCHAR,
+    rejected_kinds VARCHAR
   );
 
-  CREATE INDEX IF NOT EXISTS idx_nip66_relay ON nip66_metrics(relay_url);
-  CREATE INDEX IF NOT EXISTS idx_nip66_monitor ON nip66_metrics(monitor_pubkey);
   CREATE INDEX IF NOT EXISTS idx_nip66_timestamp ON nip66_metrics(timestamp);
+  -- Composite covering indexes for the two hot query shapes over the ~1.4M-row
+  -- table: latest-per-(monitor,relay) lookups, and the per-relay RTT aggregate.
+  -- These supersede single-column relay_url / monitor_pubkey indexes (which were
+  -- prefixes of these and are dropped in initInner).
+  CREATE INDEX IF NOT EXISTS idx_nip66_monitor_relay_ts ON nip66_metrics(monitor_pubkey, relay_url, timestamp);
+  CREATE INDEX IF NOT EXISTS idx_nip66_relay_ts_rtt ON nip66_metrics(relay_url, timestamp, monitor_pubkey, rtt_open, rtt_read, rtt_write);
 
   CREATE TABLE IF NOT EXISTS trusted_monitors (
     pubkey VARCHAR PRIMARY KEY,
@@ -125,6 +258,10 @@ const SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS idx_score_history_relay ON score_history(relay_url);
   CREATE INDEX IF NOT EXISTS idx_score_history_timestamp ON score_history(timestamp);
+  -- Covering index for the per-relay rolling-average / trend analytics: lets
+  -- GROUP BY relay_url over a timestamp window read score index-only (no table
+  -- row fetches), turning multi-second full scans into sub-second lookups.
+  CREATE INDEX IF NOT EXISTS idx_score_history_relay_ts_score ON score_history(relay_url, timestamp, score);
 
   CREATE TABLE IF NOT EXISTS relay_jurisdictions (
     relay_url VARCHAR PRIMARY KEY,
@@ -156,7 +293,8 @@ const SCHEMA = `
 `;
 
 export class DataStore {
-  private db: Database | null = null;
+  private db: DbAdapter | null = null;
+  private sqlite: SQLiteDatabase | null = null;
   private dbPath: string;
   private initPromise: Promise<void> | null = null;
   private initError: Error | null = null;
@@ -180,294 +318,47 @@ export class DataStore {
   }
 
   private async initInner(): Promise<void> {
-    this.db = await Database.create(this.dbPath, {
-      max_memory: '512MB',
-      threads: '2',
-    });
-    // Run migrations first to rename columns in existing tables
-    await this.runMigrations();
-    // Then create/update schema (IF NOT EXISTS won't affect migrated tables)
+    const sqlite = new SQLiteDatabase(this.dbPath, { create: true });
+    this.sqlite = sqlite;
+    // PRAGMAs tuned for a small, memory-constrained host. WAL gives durable
+    // crash recovery with good write throughput; NORMAL sync is safe under WAL.
+    sqlite.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = NORMAL;
+      PRAGMA busy_timeout = 5000;
+      PRAGMA temp_store = FILE;
+      PRAGMA cache_size = -16000;
+      PRAGMA foreign_keys = ON;
+    `);
+    // Use incremental auto-vacuum so cleanup can reclaim deleted pages cheaply
+    // (PRAGMA incremental_vacuum) instead of a full, event-loop-blocking VACUUM.
+    // Changing the mode only takes effect after a VACUUM, so convert once on a
+    // database that predates this (auto_vacuum NONE=0 / FULL=1). No-op once
+    // already INCREMENTAL (2). The one-time conversion VACUUM can take ~20s on a
+    // large legacy DB — a single startup cost.
+    const avMode = (sqlite.query('PRAGMA auto_vacuum').get() as { auto_vacuum?: number } | undefined)?.auto_vacuum;
+    sqlite.exec('PRAGMA auto_vacuum = INCREMENTAL');
+    if (avMode !== 2) {
+      console.log('[db] converting to incremental auto_vacuum (one-time VACUUM)...');
+      sqlite.exec('VACUUM');
+    }
+
+    this.db = {
+      run: async (sql, ...params) => { sqlite.query(sql).run(...(normalizeBindings(params) as any)); },
+      all: async (sql, ...params) => sqlite.query(sql).all(...(normalizeBindings(params) as any)),
+      exec: async (sql) => { sqlite.exec(sql); },
+    };
+    // Fresh databases (and the one-time DuckDB→SQLite conversion) carry the
+    // final schema; create any missing tables/indexes. The old DuckDB-era data
+    // migrations no longer apply — the production data was converted clean.
     await this.db.exec(SCHEMA);
+
+    // Drop single-column nip66 indexes that are now strict prefixes of the
+    // composite covering indexes above (redundant; just add write overhead).
+    await this.db.exec('DROP INDEX IF EXISTS idx_nip66_relay; DROP INDEX IF EXISTS idx_nip66_monitor;');
   }
 
-  /**
-   * Run database migrations for schema changes
-   */
-  private async runMigrations(): Promise<void> {
-    if (!this.db) return;
-
-    // Migration 1: Rename 'openness' column to 'accessibility'
-    // Use table recreation to avoid dependency issues with indexes
-    await this.migrateOpennessToAccessibility();
-
-    // Migration 2: Add access_level and closed_reason columns to probes
-    await this.migrateProbesAccessLevel();
-
-    // Migration 3: Normalize operator WoT data into separate operators table
-    await this.migrateOperatorWotToSeparateTable();
-
-    // Migration 4: Repair tables created under an older schema that are missing
-    // their declared PRIMARY KEY. CREATE TABLE IF NOT EXISTS cannot retrofit a
-    // PK, so on such databases every ON CONFLICT upsert (nip66_metrics,
-    // operators, relay_reports) silently fails and inserts go un-deduplicated.
-    await this.repairMissingUniqueConstraints();
-  }
-
-  /**
-   * Ensure each table that should be uniquely keyed actually has a UNIQUE/PK
-   * index. On older databases the declared PRIMARY KEY may be absent (it cannot
-   * be added retroactively via CREATE TABLE IF NOT EXISTS). A UNIQUE INDEX
-   * satisfies DuckDB's ON CONFLICT requirement and enforces the same
-   * uniqueness, without an expensive full table rebuild. Duplicate rows are
-   * removed first (keeping the earliest) so the unique index can be created.
-   */
-  private async repairMissingUniqueConstraints(): Promise<void> {
-    if (!this.db) return;
-
-    const targets: Array<{ table: string; index: string; cols: string[] }> = [
-      { table: 'probes', index: 'uq_probes_key', cols: ['url', 'timestamp'] },
-      { table: 'nip66_metrics', index: 'uq_nip66_metrics_key', cols: ['event_id'] },
-      { table: 'operators', index: 'uq_operators_key', cols: ['pubkey'] },
-      { table: 'relay_reports', index: 'uq_relay_reports_key', cols: ['event_id'] },
-      { table: 'score_history', index: 'uq_score_history_key', cols: ['relay_url', 'timestamp'] },
-    ];
-
-    for (const t of targets) {
-      try {
-        // Migrations run before the SCHEMA's CREATE TABLE statements, so on a
-        // fresh/partial database a target may not exist yet — SCHEMA will then
-        // create it with its declared PRIMARY KEY, so there's nothing to repair.
-        const exists = await this.db.all(
-          `SELECT 1 FROM information_schema.tables WHERE table_name = ?`,
-          t.table
-        );
-        if (exists.length === 0) continue;
-
-        // Already protected? (fresh DBs have the real PRIMARY KEY; previously
-        // repaired DBs have our unique index.)
-        const cons = await this.db.all(
-          `SELECT 1 FROM duckdb_constraints()
-           WHERE table_name = ? AND constraint_type IN ('PRIMARY KEY', 'UNIQUE')`,
-          t.table
-        );
-        const uniqIdx = await this.db.all(
-          `SELECT 1 FROM duckdb_indexes() WHERE table_name = ? AND is_unique = true`,
-          t.table
-        );
-        if (cons.length > 0 || uniqIdx.length > 0) continue;
-
-        const cols = t.cols.join(', ');
-        // Dedup (keep earliest physical row per key) then add the unique index,
-        // atomically so we never end up half-deduped without the index.
-        await this.runInTransaction(`
-          DELETE FROM ${t.table}
-          WHERE rowid NOT IN (SELECT min(rowid) FROM ${t.table} GROUP BY ${cols});
-
-          CREATE UNIQUE INDEX ${t.index} ON ${t.table}(${cols});
-        `);
-        console.log(`[migration] repaired missing unique key on ${t.table}(${cols})`);
-      } catch (err) {
-        // Don't take the whole startup down for one table; log loudly so it's
-        // visible. The table simply remains in its prior state.
-        console.error(`[migration] failed to repair unique key on ${t.table}:`, err);
-      }
-    }
-  }
-
-  /**
-   * Run a multi-statement DDL block atomically. If any statement fails the
-   * whole block is rolled back, so a migration can never leave the schema in a
-   * half-applied state (e.g. table dropped but replacement not yet renamed).
-   */
-  private async runInTransaction(sql: string): Promise<void> {
-    if (!this.db) throw new Error('Database not initialized');
-    await this.db.exec('BEGIN TRANSACTION;');
-    try {
-      await this.db.exec(sql);
-      await this.db.exec('COMMIT;');
-    } catch (err) {
-      try { await this.db.exec('ROLLBACK;'); } catch { /* best effort */ }
-      throw err;
-    }
-  }
-
-  /**
-   * Add access_level and closed_reason columns to probes table
-   */
-  private async migrateProbesAccessLevel(): Promise<void> {
-    if (!this.db) return;
-
-    // Check if access_level column already exists
-    try {
-      await this.db.all(`SELECT access_level FROM probes LIMIT 1`);
-      // Column exists, no migration needed
-    } catch {
-      // Column doesn't exist, add it
-      try {
-        await this.db.exec(`ALTER TABLE probes ADD COLUMN access_level VARCHAR`);
-        await this.db.exec(`ALTER TABLE probes ADD COLUMN closed_reason VARCHAR`);
-      } catch {
-        // Ignore errors if columns already exist
-      }
-    }
-  }
-
-  /**
-   * Migrate 'openness' column to 'accessibility' using table recreation
-   * This avoids DuckDB's dependency errors from indexes
-   */
-  private async migrateOpennessToAccessibility(): Promise<void> {
-    if (!this.db) return;
-
-    // Detect old schema separately from running the migration, so that a real
-    // migration failure propagates (fail-fast) instead of being swallowed by
-    // the same catch used for "column absent".
-    let assertionsNeedMigration = false;
-    try {
-      await this.db.all(`SELECT openness FROM published_assertions LIMIT 1`);
-      assertionsNeedMigration = true;
-    } catch {
-      // Column/table doesn't exist - no migration needed
-    }
-    if (assertionsNeedMigration) {
-      await this.runInTransaction(`
-        CREATE TABLE published_assertions_new AS
-        SELECT
-          relay_url,
-          event_id,
-          score,
-          reliability,
-          quality,
-          openness AS accessibility,
-          confidence,
-          published_at
-        FROM published_assertions;
-
-        DROP TABLE published_assertions;
-
-        ALTER TABLE published_assertions_new RENAME TO published_assertions;
-
-        CREATE INDEX IF NOT EXISTS idx_published_at ON published_assertions(published_at);
-      `);
-    }
-
-    // Same for score_history
-    let historyNeedsMigration = false;
-    try {
-      await this.db.all(`SELECT openness FROM score_history LIMIT 1`);
-      historyNeedsMigration = true;
-    } catch {
-      // Column/table doesn't exist - no migration needed
-    }
-    if (historyNeedsMigration) {
-      await this.runInTransaction(`
-        CREATE TABLE score_history_new AS
-        SELECT
-          relay_url,
-          timestamp,
-          score,
-          reliability,
-          quality,
-          openness AS accessibility,
-          operator_trust,
-          confidence,
-          observations
-        FROM score_history;
-
-        DROP TABLE score_history;
-
-        ALTER TABLE score_history_new RENAME TO score_history;
-
-        CREATE INDEX IF NOT EXISTS idx_score_history_relay ON score_history(relay_url);
-        CREATE INDEX IF NOT EXISTS idx_score_history_timestamp ON score_history(timestamp);
-      `);
-    }
-  }
-
-  /**
-   * Migration 3: Move WoT data from operator_mappings to separate operators table
-   * This normalizes the schema so WoT scores are stored per operator (pubkey)
-   * rather than per relay URL
-   */
-  private async migrateOperatorWotToSeparateTable(): Promise<void> {
-    if (!this.db) return;
-
-    // Check if operator_mappings has WoT columns (old denormalized schema)
-    let hasWotColumns = false;
-    try {
-      await this.db.all(`SELECT wot_score FROM operator_mappings LIMIT 1`);
-      hasWotColumns = true;
-    } catch {
-      // WoT columns don't exist in operator_mappings
-    }
-
-    // Create operators table if it doesn't exist
-    try {
-      await this.db.exec(`
-        CREATE TABLE IF NOT EXISTS operators (
-          pubkey VARCHAR PRIMARY KEY,
-          wot_score INTEGER,
-          wot_confidence VARCHAR,
-          wot_provider_count INTEGER,
-          wot_updated_at BIGINT
-        )
-      `);
-    } catch {
-      // Table already exists
-    }
-
-    // Migrate data from operator_mappings to operators if old schema exists
-    if (hasWotColumns) {
-      // Insert distinct operators with their WoT scores
-      // Use the most recent wot_updated_at for each operator
-      try {
-        await this.db.exec(`
-          INSERT INTO operators (pubkey, wot_score, wot_confidence, wot_provider_count, wot_updated_at)
-          SELECT DISTINCT
-            operator_pubkey,
-            FIRST_VALUE(wot_score) OVER (PARTITION BY operator_pubkey ORDER BY wot_updated_at DESC NULLS LAST),
-            FIRST_VALUE(wot_confidence) OVER (PARTITION BY operator_pubkey ORDER BY wot_updated_at DESC NULLS LAST),
-            FIRST_VALUE(wot_provider_count) OVER (PARTITION BY operator_pubkey ORDER BY wot_updated_at DESC NULLS LAST),
-            MAX(wot_updated_at) OVER (PARTITION BY operator_pubkey)
-          FROM operator_mappings
-          WHERE operator_pubkey IS NOT NULL
-          AND wot_score IS NOT NULL
-          ON CONFLICT (pubkey) DO UPDATE SET
-            wot_score = COALESCE(excluded.wot_score, operators.wot_score),
-            wot_confidence = COALESCE(excluded.wot_confidence, operators.wot_confidence),
-            wot_provider_count = COALESCE(excluded.wot_provider_count, operators.wot_provider_count),
-            wot_updated_at = GREATEST(COALESCE(excluded.wot_updated_at, 0), COALESCE(operators.wot_updated_at, 0))
-        `);
-      } catch (e) {
-        // Migration might fail on empty table or other edge cases
-        console.warn('WoT migration insert failed (may be expected on first run):', e);
-      }
-
-      // Recreate operator_mappings without WoT columns (atomic: never leave the
-      // table dropped without its replacement renamed in).
-      await this.runInTransaction(`
-        CREATE TABLE operator_mappings_new AS
-        SELECT
-          relay_url,
-          operator_pubkey,
-          verification_method,
-          verified_at,
-          confidence,
-          nip11_pubkey,
-          dns_pubkey,
-          wellknown_pubkey
-        FROM operator_mappings;
-
-        DROP TABLE operator_mappings;
-
-        ALTER TABLE operator_mappings_new RENAME TO operator_mappings;
-
-        CREATE INDEX IF NOT EXISTS idx_operator_pubkey ON operator_mappings(operator_pubkey);
-      `);
-    }
-  }
-
-  private async ensureReady(): Promise<Database> {
+  private async ensureReady(): Promise<DbAdapter> {
     // Await initialization on every call. The promise is retained (not nulled)
     // so concurrent and later callers all observe the same settled result;
     // awaiting an already-settled promise is effectively free.
@@ -532,7 +423,7 @@ export class DataStore {
     return rows.map((row: any) => ({
       url: row.url,
       timestamp: Number(row.timestamp),
-      reachable: row.reachable,
+      reachable: !!row.reachable,
       relayType: row.relay_type as RelayType,
       accessLevel: row.access_level ?? undefined,
       closedReason: row.closed_reason ?? undefined,
@@ -561,7 +452,7 @@ export class DataStore {
     return {
       url: row.url,
       timestamp: Number(row.timestamp),
-      reachable: row.reachable,
+      reachable: !!row.reachable,
       relayType: row.relay_type as RelayType,
       accessLevel: row.access_level ?? undefined,
       closedReason: row.closed_reason ?? undefined,
@@ -662,12 +553,18 @@ export class DataStore {
     network?: string;
     supportedNips?: number[];
     geohash?: string;
+    relayType?: string;
+    requirements?: string[];
+    topics?: string[];
+    acceptedKinds?: number[];
+    rejectedKinds?: number[];
   }): Promise<void> {
     const db = await this.ensureReady();
     await db.run(
       `INSERT INTO nip66_metrics
-       (event_id, relay_url, monitor_pubkey, timestamp, rtt_open, rtt_read, rtt_write, network, supported_nips, geohash)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       (event_id, relay_url, monitor_pubkey, timestamp, rtt_open, rtt_read, rtt_write, network, supported_nips, geohash,
+        relay_type, requirements, topics, accepted_kinds, rejected_kinds)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (event_id) DO UPDATE SET
          relay_url = excluded.relay_url,
          monitor_pubkey = excluded.monitor_pubkey,
@@ -677,7 +574,12 @@ export class DataStore {
          rtt_write = excluded.rtt_write,
          network = excluded.network,
          supported_nips = excluded.supported_nips,
-         geohash = excluded.geohash`,
+         geohash = excluded.geohash,
+         relay_type = excluded.relay_type,
+         requirements = excluded.requirements,
+         topics = excluded.topics,
+         accepted_kinds = excluded.accepted_kinds,
+         rejected_kinds = excluded.rejected_kinds`,
       metric.eventId,
       metric.relayUrl,
       metric.monitorPubkey,
@@ -687,7 +589,12 @@ export class DataStore {
       metric.rttWrite ?? null,
       metric.network ?? null,
       metric.supportedNips ? JSON.stringify(metric.supportedNips) : null,
-      metric.geohash ?? null
+      metric.geohash ?? null,
+      metric.relayType ?? null,
+      metric.requirements ? JSON.stringify(metric.requirements) : null,
+      metric.topics ? JSON.stringify(metric.topics) : null,
+      metric.acceptedKinds ? JSON.stringify(metric.acceptedKinds) : null,
+      metric.rejectedKinds ? JSON.stringify(metric.rejectedKinds) : null
     );
   }
 
@@ -705,6 +612,11 @@ export class DataStore {
     network?: string;
     supportedNips?: number[];
     geohash?: string;
+    relayType?: string;
+    requirements?: string[];
+    topics?: string[];
+    acceptedKinds?: number[];
+    rejectedKinds?: number[];
   }>> {
     const db = await this.ensureReady();
     const sinceTimestamp = Math.floor(Date.now() / 1000) - (sinceDays * 86400);
@@ -726,6 +638,11 @@ export class DataStore {
       network: row.network ?? undefined,
       supportedNips: safeJsonParse<number[]>(row.supported_nips),
       geohash: row.geohash ?? undefined,
+      relayType: row.relay_type ?? undefined,
+      requirements: safeJsonParse<string[]>(row.requirements),
+      topics: safeJsonParse<string[]>(row.topics),
+      acceptedKinds: safeJsonParse<number[]>(row.accepted_kinds),
+      rejectedKinds: safeJsonParse<number[]>(row.rejected_kinds),
     }));
   }
 
@@ -856,6 +773,100 @@ export class DataStore {
       firstSeen: basicRow.first_seen ? Number(basicRow.first_seen) : null,
       lastSeen: basicRow.last_seen ? Number(basicRow.last_seen) : null,
     };
+  }
+
+  /**
+   * Aggregate monitor-observed policy signals (NIP-66 `R`/`k`/`T` tags) for a
+   * relay. Takes the latest metric from each active (non-stale) trusted monitor
+   * and resolves each requirement by majority vote among the monitors that
+   * expressed an opinion. Returns `undefined` for a key when no monitor voted,
+   * so callers can distinguish "observed false" from "not observed".
+   */
+  async getNip66PolicySignals(relayUrl: string, sinceDays: number = 30): Promise<Nip66PolicySignals> {
+    const db = await this.ensureReady();
+    const sinceTimestamp = Math.floor(Date.now() / 1000) - (sinceDays * 86400);
+    const staleThreshold = Math.floor(Date.now() / 1000) - (30 * 86400);
+
+    // Latest metric per active monitor for this relay (same shape as the
+    // percentile path in getNip66Stats: active monitors only, newest row per).
+    const rows = await db.all(
+      `WITH active_monitors AS (
+        SELECT pubkey FROM trusted_monitors
+        WHERE last_seen IS NULL OR last_seen >= ?
+      ),
+      latest_metrics AS (
+        SELECT
+          m.requirements,
+          m.relay_type,
+          m.rejected_kinds,
+          m.topics,
+          ROW_NUMBER() OVER (
+            PARTITION BY m.monitor_pubkey
+            ORDER BY m.timestamp DESC
+          ) as rn
+        FROM nip66_metrics m
+        WHERE m.relay_url = ?
+          AND m.timestamp >= ?
+          AND m.monitor_pubkey IN (SELECT pubkey FROM active_monitors)
+      )
+      SELECT requirements, relay_type, rejected_kinds, topics
+      FROM latest_metrics
+      WHERE rn = 1`,
+      staleThreshold,
+      relayUrl,
+      sinceTimestamp
+    );
+
+    return tallyNip66PolicySignals(rows as any[]);
+  }
+
+  /**
+   * Bulk version of getNip66PolicySignals: aggregates policy signals for ALL
+   * relays in a single query (latest metric per monitor per relay, via one
+   * window-function pass), then tallies each relay's majority verdict in JS.
+   * Lets the batch publisher pre-fetch once instead of querying per relay.
+   */
+  async getAllNip66PolicySignals(sinceDays: number = 30): Promise<Map<string, Nip66PolicySignals>> {
+    const db = await this.ensureReady();
+    const sinceTimestamp = Math.floor(Date.now() / 1000) - (sinceDays * 86400);
+    const staleThreshold = Math.floor(Date.now() / 1000) - (30 * 86400);
+
+    const rows = await db.all(
+      `WITH active_monitors AS (
+        SELECT pubkey FROM trusted_monitors
+        WHERE last_seen IS NULL OR last_seen >= ?
+      ),
+      latest AS (
+        -- Latest (monitor,relay) timestamps via GROUP BY MAX over the
+        -- (monitor_pubkey, relay_url, timestamp) covering index; far cheaper
+        -- than a ROW_NUMBER() window scan of the whole table.
+        SELECT monitor_pubkey, relay_url, MAX(timestamp) AS ts
+        FROM nip66_metrics
+        WHERE timestamp >= ?
+          AND monitor_pubkey IN (SELECT pubkey FROM active_monitors)
+        GROUP BY monitor_pubkey, relay_url
+      )
+      SELECT m.relay_url, m.requirements, m.relay_type, m.rejected_kinds, m.topics
+      FROM nip66_metrics m
+      JOIN latest l ON m.monitor_pubkey = l.monitor_pubkey
+        AND m.relay_url = l.relay_url AND m.timestamp = l.ts`,
+      staleThreshold,
+      sinceTimestamp
+    );
+
+    // Group the latest-per-monitor rows by relay, then tally each relay once.
+    const grouped = new Map<string, Array<{ requirements: unknown; relay_type: unknown; rejected_kinds: unknown; topics: unknown }>>();
+    for (const row of rows as any[]) {
+      const list = grouped.get(row.relay_url);
+      if (list) list.push(row);
+      else grouped.set(row.relay_url, [row]);
+    }
+
+    const result = new Map<string, Nip66PolicySignals>();
+    for (const [url, relayRows] of grouped) {
+      result.set(url, tallyNip66PolicySignals(relayRows));
+    }
+    return result;
   }
 
   /**
@@ -1050,6 +1061,32 @@ export class DataStore {
       now,
       now
     );
+  }
+
+  /**
+   * Batch-apply buffered monitor stats (last_seen / event_count) in one
+   * transaction. Used by the ingestor to avoid a per-event write.
+   */
+  async flushMonitorStats(updates: Map<string, { count: number; lastSeen: number }>): Promise<void> {
+    if (updates.size === 0) return;
+    const db = await this.ensureReady();
+    await db.exec('BEGIN');
+    try {
+      for (const [pubkey, { count, lastSeen }] of updates) {
+        await db.run(
+          `INSERT INTO trusted_monitors (pubkey, name, added_at, last_seen, event_count)
+           VALUES (?, NULL, ?, ?, ?)
+           ON CONFLICT (pubkey) DO UPDATE SET
+             last_seen = MAX(trusted_monitors.last_seen, excluded.last_seen),
+             event_count = trusted_monitors.event_count + ?`,
+          pubkey, lastSeen, lastSeen, count, count
+        );
+      }
+      await db.exec('COMMIT');
+    } catch (err) {
+      try { await db.exec('ROLLBACK'); } catch { /* best effort */ }
+      throw err;
+    }
   }
 
   /**
@@ -1288,6 +1325,37 @@ export class DataStore {
       timestamp: Number(row.timestamp),
       reporterTrustWeight: row.reporter_trust_weight ?? undefined,
     }));
+  }
+
+  /**
+   * Bulk: all reports within the window, grouped by relay_url. Avoids an N+1
+   * of getReports() per relay in the publish loop.
+   */
+  async getAllReports(sinceDays: number = 90): Promise<Map<string, RelayReport[]>> {
+    const db = await this.ensureReady();
+    const sinceTimestamp = Math.floor(Date.now() / 1000) - (sinceDays * 86400);
+
+    const rows = await db.all(
+      `SELECT * FROM relay_reports WHERE timestamp >= ? ORDER BY relay_url, timestamp DESC`,
+      sinceTimestamp
+    );
+
+    const result = new Map<string, RelayReport[]>();
+    for (const row of rows as any[]) {
+      const report: RelayReport = {
+        eventId: row.event_id,
+        relayUrl: row.relay_url,
+        reporterPubkey: row.reporter_pubkey,
+        reportType: row.report_type as ReportType,
+        content: row.content ?? '',
+        timestamp: Number(row.timestamp),
+        reporterTrustWeight: row.reporter_trust_weight ?? undefined,
+      };
+      const arr = result.get(row.relay_url);
+      if (arr) arr.push(report);
+      else result.set(row.relay_url, [report]);
+    }
+    return result;
   }
 
   /**
@@ -1742,8 +1810,8 @@ export class DataStore {
       isp: row.isp ?? undefined,
       asn: row.asn ?? undefined,
       asOrg: row.as_org ?? undefined,
-      isHosting: row.is_hosting ?? undefined,
-      isTor: row.is_tor ?? undefined,
+      isHosting: row.is_hosting != null ? !!row.is_hosting : undefined,
+      isTor: row.is_tor != null ? !!row.is_tor : undefined,
       resolvedAt: Number(row.resolved_at),
     };
   }
@@ -1809,7 +1877,7 @@ export class DataStore {
       result.set(row.url, {
         url: row.url,
         timestamp: Number(row.timestamp),
-        reachable: row.reachable,
+        reachable: !!row.reachable,
         relayType: row.relay_type as RelayType,
         connectTime: row.connect_time ?? undefined,
         readTime: row.read_time ?? undefined,
@@ -1845,7 +1913,7 @@ export class DataStore {
       const probe: ProbeResult = {
         url: row.url,
         timestamp: Number(row.timestamp),
-        reachable: row.reachable,
+        reachable: !!row.reachable,
         relayType: row.relay_type ?? undefined,
         accessLevel: row.access_level ?? undefined,
         closedReason: row.closed_reason ?? undefined,
@@ -1980,30 +2048,27 @@ export class DataStore {
 
     // Percentile calculation for ALL relays using PERCENT_RANK() window function.
     // This replaces the previous O(N^2) self-join approach with O(N log N) per partition,
-    // significantly reducing DuckDB memory usage during query execution.
+    // significantly reducing memory usage during query execution.
     const percentileRows = await db.all(`
       WITH active_monitors AS (
         SELECT pubkey FROM trusted_monitors
         WHERE last_seen IS NULL OR last_seen >= ?
       ),
-      latest_metrics AS (
-        SELECT
-          monitor_pubkey,
-          relay_url,
-          rtt_open,
-          rtt_read,
-          ROW_NUMBER() OVER (
-            PARTITION BY monitor_pubkey, relay_url
-            ORDER BY timestamp DESC
-          ) as rn
+      latest AS (
+        -- Latest (monitor,relay) timestamps via GROUP BY MAX over the covering
+        -- (monitor_pubkey, relay_url, timestamp) index — avoids a ROW_NUMBER()
+        -- window scan of the whole nip66_metrics table.
+        SELECT monitor_pubkey, relay_url, MAX(timestamp) AS ts
         FROM nip66_metrics
         WHERE timestamp >= ?
           AND monitor_pubkey IN (SELECT pubkey FROM active_monitors)
+        GROUP BY monitor_pubkey, relay_url
       ),
       latest_only AS (
-        SELECT monitor_pubkey, relay_url, rtt_open, rtt_read
-        FROM latest_metrics
-        WHERE rn = 1
+        SELECT m.monitor_pubkey, m.relay_url, m.rtt_open, m.rtt_read
+        FROM nip66_metrics m
+        JOIN latest l ON m.monitor_pubkey = l.monitor_pubkey
+          AND m.relay_url = l.relay_url AND m.timestamp = l.ts
       ),
       qualifying_monitors AS (
         SELECT monitor_pubkey
@@ -2070,8 +2135,8 @@ export class DataStore {
         isp: row.isp ?? undefined,
         asn: row.asn ?? undefined,
         asOrg: row.as_org ?? undefined,
-        isHosting: row.is_hosting ?? undefined,
-        isTor: row.is_tor ?? undefined,
+        isHosting: row.is_hosting != null ? !!row.is_hosting : undefined,
+        isTor: row.is_tor != null ? !!row.is_tor : undefined,
         resolvedAt: Number(row.resolved_at),
       });
     }
@@ -2173,22 +2238,16 @@ export class DataStore {
   }>> {
     const db = await this.ensureReady();
 
-    // Get the most recent score snapshot for each relay using window functions
+    // Most recent score snapshot per relay. GROUP BY MAX(timestamp) over the
+    // score_history PK (relay_url, timestamp) + join uses the covering index;
+    // ~30x cheaper than a ROW_NUMBER() window scan of the whole table.
     const rows = await db.all(`
-      WITH ranked AS (
-        SELECT
-          relay_url,
-          score,
-          reliability,
-          quality,
-          accessibility,
-          timestamp,
-          ROW_NUMBER() OVER (PARTITION BY relay_url ORDER BY timestamp DESC) as rn
-        FROM score_history
-      )
-      SELECT relay_url, score, reliability, quality, accessibility, timestamp
-      FROM ranked
-      WHERE rn = 1
+      SELECT sh.relay_url, sh.score, sh.reliability, sh.quality, sh.accessibility, sh.timestamp
+      FROM score_history sh
+      JOIN (
+        SELECT relay_url, MAX(timestamp) AS ts
+        FROM score_history GROUP BY relay_url
+      ) m ON sh.relay_url = m.relay_url AND sh.timestamp = m.ts
     `);
 
     const result = new Map();
@@ -2299,40 +2358,59 @@ export class DataStore {
    * @param retentionDays Number of days to retain (default 90)
    * @returns Number of rows deleted from each table
    */
-  async cleanupOldData(retentionDays: number = 90): Promise<{
+  async cleanupOldData(opts: {
+    scoreHistoryDays?: number;
+    reportDays?: number;
+    probeDays?: number;
+    nip66Days?: number;
+  } | number = {}): Promise<{
     probes: number;
     nip66Metrics: number;
     reports: number;
     scoreHistory: number;
   }> {
     const db = await this.ensureReady();
-    const cutoff = Math.floor(Date.now() / 1000) - (retentionDays * 86400);
+    // Back-compat: a bare number means "same window for everything".
+    const o = typeof opts === 'number'
+      ? { scoreHistoryDays: opts, reportDays: opts, probeDays: opts, nip66Days: opts }
+      : opts;
+    const scoreHistoryDays = o.scoreHistoryDays ?? 90;
+    const reportDays = o.reportDays ?? 90;
+    const probeDays = o.probeDays ?? 45;
+    const nip66Days = o.nip66Days ?? 45;
 
-    // Get counts before deletion for reporting (parameterized queries)
-    const [probesResult] = await db.all(`SELECT COUNT(*) as count FROM probes WHERE timestamp < ?`, cutoff);
-    const [nip66Result] = await db.all(`SELECT COUNT(*) as count FROM nip66_metrics WHERE timestamp < ?`, cutoff);
-    const [reportsResult] = await db.all(`SELECT COUNT(*) as count FROM relay_reports WHERE timestamp < ?`, cutoff);
-    const [historyResult] = await db.all(`SELECT COUNT(*) as count FROM score_history WHERE timestamp < ?`, cutoff);
+    const now = Math.floor(Date.now() / 1000);
+    const cut = (days: number) => now - days * 86400;
+    const probeCut = cut(probeDays);
+    const nip66Cut = cut(nip66Days);
+    const reportCut = cut(reportDays);
+    const historyCut = cut(scoreHistoryDays);
 
-    // Delete old data (parameterized queries)
-    await db.run(`DELETE FROM probes WHERE timestamp < ?`, cutoff);
-    await db.run(`DELETE FROM nip66_metrics WHERE timestamp < ?`, cutoff);
-    await db.run(`DELETE FROM relay_reports WHERE timestamp < ?`, cutoff);
-    await db.run(`DELETE FROM score_history WHERE timestamp < ?`, cutoff);
+    // Counts before deletion (for reporting), each with its own window.
+    const [probesResult] = await db.all(`SELECT COUNT(*) as count FROM probes WHERE timestamp < ?`, probeCut);
+    const [nip66Result] = await db.all(`SELECT COUNT(*) as count FROM nip66_metrics WHERE timestamp < ?`, nip66Cut);
+    const [reportsResult] = await db.all(`SELECT COUNT(*) as count FROM relay_reports WHERE timestamp < ?`, reportCut);
+    const [historyResult] = await db.all(`SELECT COUNT(*) as count FROM score_history WHERE timestamp < ?`, historyCut);
+
+    // Delete old data per table (parameterized).
+    await db.run(`DELETE FROM probes WHERE timestamp < ?`, probeCut);
+    await db.run(`DELETE FROM nip66_metrics WHERE timestamp < ?`, nip66Cut);
+    await db.run(`DELETE FROM relay_reports WHERE timestamp < ?`, reportCut);
+    await db.run(`DELETE FROM score_history WHERE timestamp < ?`, historyCut);
 
     // Strip nip11_json from probes older than 7 days to reduce DB size.
     // NIP-11 data is only needed from recent probes; older probes only need
     // reachability and timing data for scoring.
-    const nip11Cutoff = Math.floor(Date.now() / 1000) - (7 * 86400);
+    const nip11Cutoff = now - (7 * 86400);
     await db.run(`UPDATE probes SET nip11_json = NULL WHERE timestamp < ? AND nip11_json IS NOT NULL`, nip11Cutoff);
 
-    // VACUUM reclaims disk space from deleted/updated rows.
-    // Without this, the database file only grows and never shrinks.
-    // Wrapped in try/catch since VACUUM can be memory-intensive on large databases.
+    // Reclaim freed pages incrementally (the DB uses auto_vacuum=INCREMENTAL).
+    // This truncates freelist pages back to the OS without the multi-second,
+    // event-loop-blocking full-database rebuild a plain VACUUM performs.
     try {
-      await db.run('VACUUM');
+      await db.run('PRAGMA incremental_vacuum');
     } catch (err) {
-      console.error('VACUUM failed (non-fatal, will retry next cleanup):', err);
+      console.error('incremental_vacuum failed (non-fatal, will retry next cleanup):', err);
     }
 
     return {
@@ -2344,7 +2422,7 @@ export class DataStore {
   }
 
   // ============================================================================
-  // ANALYTICS METHODS - Advanced analytics queries using DuckDB features
+  // ANALYTICS METHODS - Advanced analytics queries using SQL window functions
   // ============================================================================
 
   /**
@@ -2397,24 +2475,18 @@ export class DataStore {
   }>> {
     const db = await this.ensureReady();
 
-    // Get the most recent score snapshot for each relay
+    // Most recent score snapshot per relay via GROUP BY MAX(timestamp) + join
+    // (covering-index lookup over the score_history PK; ~30x cheaper than a
+    // ROW_NUMBER() window scan of the whole table).
     const rows = await db.all(`
-      WITH ranked AS (
-        SELECT
-          relay_url,
-          score,
-          reliability,
-          quality,
-          accessibility,
-          observations,
-          timestamp,
-          ROW_NUMBER() OVER (PARTITION BY relay_url ORDER BY timestamp DESC) as rn
-        FROM score_history
-      )
-      SELECT relay_url as url, score, reliability, quality, accessibility, observations, timestamp as last_updated
-      FROM ranked
-      WHERE rn = 1
-      ORDER BY score DESC NULLS LAST
+      SELECT sh.relay_url as url, sh.score, sh.reliability, sh.quality, sh.accessibility,
+             sh.observations, sh.timestamp as last_updated
+      FROM score_history sh
+      JOIN (
+        SELECT relay_url, MAX(timestamp) AS ts
+        FROM score_history GROUP BY relay_url
+      ) m ON sh.relay_url = m.relay_url AND sh.timestamp = m.ts
+      ORDER BY sh.score DESC NULLS LAST
     `);
 
     return rows.map((row: any) => ({
@@ -2467,7 +2539,7 @@ export class DataStore {
   }
 
   /**
-   * Get rolling averages for all relays using DuckDB window functions
+   * Get rolling averages for all relays using SQL aggregates
    * More efficient than computing in JavaScript for large datasets
    */
   async getAllRollingAverages(): Promise<Map<string, {
@@ -2482,39 +2554,47 @@ export class DataStore {
     const days30 = now - 30 * 86400;
     const days90 = now - 90 * 86400;
 
+    // SQLite has no STDDEV_SAMP. Compute the sample variance in SQL via the
+    // closed form (SUM(x²) − SUM(x)²/n) / (n−1) and take the square root in JS
+    // (sqrt() is an optional SQLite math-extension function we don't rely on).
     const rows = await db.all(`
       WITH base AS (
         SELECT
           relay_url,
           score,
-          timestamp
+          CASE WHEN timestamp >= ? THEN score END AS score7,
+          CASE WHEN timestamp >= ? THEN score END AS score30
         FROM score_history
         WHERE score IS NOT NULL AND timestamp >= ?
       )
       SELECT
         relay_url,
-        AVG(CASE WHEN timestamp >= ? THEN score END) as rolling_7d,
-        AVG(CASE WHEN timestamp >= ? THEN score END) as rolling_30d,
+        AVG(score7) as rolling_7d,
+        AVG(score30) as rolling_30d,
         AVG(score) as rolling_90d,
-        STDDEV_SAMP(CASE WHEN timestamp >= ? THEN score END) as volatility
+        CASE WHEN COUNT(score30) > 1
+          THEN (SUM(score30 * score30) - SUM(score30) * SUM(score30) / COUNT(score30))
+               / (COUNT(score30) - 1)
+        END as volatility_var
       FROM base
       GROUP BY relay_url
-    `, days90, days7, days30, days30);
+    `, days7, days30, days90);
 
     const result = new Map();
     for (const row of rows as any[]) {
+      const variance = row.volatility_var;
       result.set(row.relay_url, {
         rolling7d: row.rolling_7d !== null ? Math.round(row.rolling_7d) : null,
         rolling30d: row.rolling_30d !== null ? Math.round(row.rolling_30d) : null,
         rolling90d: row.rolling_90d !== null ? Math.round(row.rolling_90d) : null,
-        volatility: row.volatility !== null ? Math.round(row.volatility * 10) / 10 : null,
+        volatility: variance != null ? Math.round(Math.sqrt(Math.max(0, variance)) * 10) / 10 : null,
       });
     }
     return result;
   }
 
   /**
-   * Get trend analysis data for all relays using DuckDB
+   * Get trend analysis data for all relays using SQL
    * Returns first/last scores and slope for trend detection
    */
   async getAllTrendData(periodDays: number = 30): Promise<Map<string, {
@@ -2528,50 +2608,42 @@ export class DataStore {
     const db = await this.ensureReady();
     const periodStart = Math.floor(Date.now() / 1000) - (periodDays * 86400);
 
-    // Get first and last scores, plus compute linear regression slope
+    // Single GROUP BY pass over the period computes the per-relay regression
+    // sums (closed-form least-squares slope), point count, and the first/last
+    // timestamps; the scores AT those timestamps are then fetched with two
+    // covering-index (PK) joins. This avoids the previous two ROW_NUMBER window
+    // sorts + a second full scan (~7.7s → sub-second with the covering index).
     const rows = await db.all(`
-      WITH period_data AS (
-        SELECT
-          relay_url,
-          score,
-          timestamp,
-          ROW_NUMBER() OVER (PARTITION BY relay_url ORDER BY timestamp ASC) as rn_asc,
-          ROW_NUMBER() OVER (PARTITION BY relay_url ORDER BY timestamp DESC) as rn_desc,
-          COUNT(*) OVER (PARTITION BY relay_url) as total_count
+      WITH pts AS (
+        SELECT relay_url, timestamp, score, (timestamp - ?) / 86400.0 AS x
         FROM score_history
         WHERE timestamp >= ? AND score IS NOT NULL
       ),
-      first_last AS (
+      agg AS (
         SELECT
           relay_url,
-          MAX(CASE WHEN rn_asc = 1 THEN score END) as first_score,
-          MAX(CASE WHEN rn_desc = 1 THEN score END) as last_score,
-          MAX(CASE WHEN rn_asc = 1 THEN timestamp END) as first_timestamp,
-          MAX(CASE WHEN rn_desc = 1 THEN timestamp END) as last_timestamp,
-          MAX(total_count) as data_points
-        FROM period_data
+          MIN(timestamp) AS first_ts,
+          MAX(timestamp) AS last_ts,
+          COUNT(*) AS data_points,
+          SUM(x) AS sx, SUM(score) AS sy, SUM(x * score) AS sxy, SUM(x * x) AS sxx
+        FROM pts
         GROUP BY relay_url
-      ),
-      regression AS (
-        SELECT
-          relay_url,
-          REGR_SLOPE(score, (timestamp - ?) / 86400.0) as slope
-        FROM score_history
-        WHERE timestamp >= ? AND score IS NOT NULL
-        GROUP BY relay_url
-        HAVING COUNT(*) >= 2
       )
       SELECT
-        fl.relay_url,
-        fl.first_score,
-        fl.last_score,
-        fl.first_timestamp,
-        fl.last_timestamp,
-        fl.data_points,
-        r.slope
-      FROM first_last fl
-      LEFT JOIN regression r ON fl.relay_url = r.relay_url
-    `, periodStart, periodStart, periodStart);
+        a.relay_url,
+        fs.score AS first_score,
+        ls.score AS last_score,
+        a.first_ts AS first_timestamp,
+        a.last_ts AS last_timestamp,
+        a.data_points,
+        CASE WHEN a.data_points >= 2
+          THEN (a.data_points * a.sxy - a.sx * a.sy)
+               / NULLIF(a.data_points * a.sxx - a.sx * a.sx, 0)
+        END AS slope
+      FROM agg a
+      JOIN score_history fs ON fs.relay_url = a.relay_url AND fs.timestamp = a.first_ts
+      JOIN score_history ls ON ls.relay_url = a.relay_url AND ls.timestamp = a.last_ts
+    `, periodStart, periodStart);
 
     const result = new Map();
     for (const row of rows as any[]) {
@@ -2658,7 +2730,7 @@ export class DataStore {
   // ============================================================================
 
   /**
-   * Compute comprehensive network statistics using DuckDB analytical functions.
+   * Compute comprehensive network statistics using SQL analytical functions.
    * This is computationally expensive - results should be cached.
    */
   async computeNetworkStats(periodDays: number = 7): Promise<NetworkStats> {
@@ -2667,60 +2739,70 @@ export class DataStore {
     const periodStart = now - (periodDays * 86400);
     const prevPeriodStart = periodStart - (periodDays * 86400);
 
-    // Get latest scores for each relay
-    const summaryRows = await db.all(`
-      WITH latest_scores AS (
-        SELECT relay_url, score, reliability, quality, accessibility, timestamp,
-          ROW_NUMBER() OVER (PARTITION BY relay_url ORDER BY timestamp DESC) as rn
-        FROM score_history WHERE score IS NOT NULL
-      ),
-      current AS (SELECT * FROM latest_scores WHERE rn = 1)
-      SELECT
-        COUNT(*) as total_relays,
-        AVG(score) as avg_score,
-        MEDIAN(score) as median_score,
-        QUANTILE_CONT(score, 0.25) as p25,
-        QUANTILE_CONT(score, 0.75) as p75,
-        STDDEV_SAMP(score) as stddev,
-        SUM(CASE WHEN score >= 70 THEN 1 ELSE 0 END) as healthy_count,
-        SUM(CASE WHEN score >= 50 AND score < 70 THEN 1 ELSE 0 END) as degraded_count,
-        SUM(CASE WHEN score < 50 THEN 1 ELSE 0 END) as poor_count,
-        AVG(reliability) as avg_reliability,
-        AVG(quality) as avg_quality,
-        AVG(accessibility) as avg_accessibility
-      FROM current
-    `);
+    // Fetch the latest score row per relay ONCE (joined with jurisdiction) and
+    // derive the summary, percentiles, distribution and geographic breakdown
+    // from it in JS. Using GROUP BY MAX(timestamp) over the score_history
+    // PRIMARY KEY (relay_url, timestamp) — without a non-indexed WHERE on it —
+    // lets SQLite use the covering index, which is ~30x cheaper than a
+    // ROW_NUMBER() window scan of the whole table, and collapses four
+    // full-table passes into one.
+    const latestRows = (await db.all(`
+      SELECT sh.relay_url, sh.score, sh.reliability, sh.quality, sh.accessibility,
+             j.country_code, j.country_name
+      FROM score_history sh
+      JOIN (
+        SELECT relay_url, MAX(timestamp) AS ts
+        FROM score_history GROUP BY relay_url
+      ) m ON sh.relay_url = m.relay_url AND sh.timestamp = m.ts
+      LEFT JOIN relay_jurisdictions j ON sh.relay_url = j.relay_url
+      WHERE sh.score IS NOT NULL
+    `)) as any[];
 
-    const summary = (summaryRows[0] as any) || {};
+    const num = (v: any) => Number(v ?? 0);
+    const totalScored = latestRows.length;
+    const avg = (sel: (r: any) => number) =>
+      totalScored ? latestRows.reduce((a, r) => a + sel(r), 0) / totalScored : 0;
 
-    // Score distribution histogram
-    const distributionRows = await db.all(`
-      WITH latest_scores AS (
-        SELECT relay_url, score,
-          ROW_NUMBER() OVER (PARTITION BY relay_url ORDER BY timestamp DESC) as rn
-        FROM score_history WHERE score IS NOT NULL
-      )
-      SELECT
-        CASE
-          WHEN score >= 90 THEN '90-100'
-          WHEN score >= 80 THEN '80-89'
-          WHEN score >= 70 THEN '70-79'
-          WHEN score >= 60 THEN '60-69'
-          WHEN score >= 50 THEN '50-59'
-          ELSE '<50'
-        END as bucket,
-        COUNT(*) as count
-      FROM latest_scores WHERE rn = 1
-      GROUP BY 1
-      ORDER BY 1 DESC
-    `);
+    // Summary aggregates (AVG/health counts) in JS.
+    const summary = {
+      total_relays: totalScored,
+      avg_score: avg((r) => num(r.score)),
+      healthy_count: latestRows.filter((r) => num(r.score) >= 70).length,
+      degraded_count: latestRows.filter((r) => num(r.score) >= 50 && num(r.score) < 70).length,
+      poor_count: latestRows.filter((r) => num(r.score) < 50).length,
+      avg_reliability: avg((r) => num(r.reliability)),
+      avg_quality: avg((r) => num(r.quality)),
+      avg_accessibility: avg((r) => num(r.accessibility)),
+    };
 
-    // Network trend over time (daily averages)
+    // Median / quartiles / stddev have no SQLite aggregate — compute in JS.
+    const currentScores = latestRows
+      .map((r) => Number(r.score))
+      .filter((s) => Number.isFinite(s))
+      .sort((a, b) => a - b);
+    const medianScore = percentileCont(currentScores, 0.5);
+    const p25Score = percentileCont(currentScores, 0.25);
+    const p75Score = percentileCont(currentScores, 0.75);
+    const stddevScore = sampleStddev(currentScores);
+
+    // Distribution histogram in JS.
+    const bucketOf = (s: number) =>
+      s >= 90 ? '90-100' : s >= 80 ? '80-89' : s >= 70 ? '70-79' : s >= 60 ? '60-69' : s >= 50 ? '50-59' : '<50';
+    const distCounts = new Map<string, number>();
+    for (const r of latestRows) {
+      const b = bucketOf(num(r.score));
+      distCounts.set(b, (distCounts.get(b) ?? 0) + 1);
+    }
+    const distributionRows = ['90-100', '80-89', '70-79', '60-69', '50-59', '<50']
+      .filter((b) => distCounts.has(b))
+      .map((b) => ({ bucket: b, count: distCounts.get(b)! }));
+
+    // Network trend over time (daily averages). Per-day median is computed in
+    // JS (no SQLite percentile aggregate) from the raw daily scores below.
     const trendRows = await db.all(`
       SELECT
         CAST(timestamp / 86400 AS INTEGER) * 86400 as day,
         AVG(score) as avg_score,
-        MEDIAN(score) as median_score,
         COUNT(DISTINCT relay_url) as relay_count
       FROM score_history
       WHERE timestamp >= ? AND score IS NOT NULL
@@ -2728,29 +2810,46 @@ export class DataStore {
       ORDER BY 1
     `, periodStart);
 
+    // Collect per-day scores once and compute each day's median in JS.
+    const trendScoreRows = await db.all(`
+      SELECT CAST(timestamp / 86400 AS INTEGER) * 86400 as day, score
+      FROM score_history
+      WHERE timestamp >= ? AND score IS NOT NULL
+    `, periodStart);
+    const scoresByDay = new Map<number, number[]>();
+    for (const r of trendScoreRows as any[]) {
+      const day = Number(r.day);
+      const arr = scoresByDay.get(day);
+      if (arr) arr.push(Number(r.score));
+      else scoresByDay.set(day, [Number(r.score)]);
+    }
+    const trendMedianByDay = new Map<number, number | null>();
+    for (const [day, scores] of scoresByDay) {
+      scores.sort((a, b) => a - b);
+      trendMedianByDay.set(day, percentileCont(scores, 0.5));
+    }
+
     // Compare with previous period for "vs last week" stats
     const compareRows = await db.all(`
-      WITH current_scores AS (
-        SELECT relay_url, score,
-          ROW_NUMBER() OVER (PARTITION BY relay_url ORDER BY timestamp DESC) as rn
-        FROM score_history
-        WHERE timestamp >= ? AND score IS NOT NULL
-      ),
-      prev_scores AS (
-        SELECT relay_url, score,
-          ROW_NUMBER() OVER (PARTITION BY relay_url ORDER BY timestamp DESC) as rn
-        FROM score_history
-        WHERE timestamp >= ? AND timestamp < ? AND score IS NOT NULL
-      ),
-      current_agg AS (
-        SELECT AVG(score) as avg_score, COUNT(*) as cnt,
-          SUM(CASE WHEN score >= 70 THEN 1 ELSE 0 END) as healthy
-        FROM current_scores WHERE rn = 1
+      WITH current_agg AS (
+        SELECT AVG(sh.score) as avg_score, COUNT(*) as cnt,
+          SUM(CASE WHEN sh.score >= 70 THEN 1 ELSE 0 END) as healthy
+        FROM score_history sh
+        JOIN (
+          SELECT relay_url, MAX(timestamp) AS ts
+          FROM score_history WHERE timestamp >= ? GROUP BY relay_url
+        ) m ON sh.relay_url = m.relay_url AND sh.timestamp = m.ts
+        WHERE sh.score IS NOT NULL
       ),
       prev_agg AS (
-        SELECT AVG(score) as avg_score, COUNT(*) as cnt,
-          SUM(CASE WHEN score >= 70 THEN 1 ELSE 0 END) as healthy
-        FROM prev_scores WHERE rn = 1
+        SELECT AVG(sh.score) as avg_score, COUNT(*) as cnt,
+          SUM(CASE WHEN sh.score >= 70 THEN 1 ELSE 0 END) as healthy
+        FROM score_history sh
+        JOIN (
+          SELECT relay_url, MAX(timestamp) AS ts
+          FROM score_history WHERE timestamp >= ? AND timestamp < ? GROUP BY relay_url
+        ) m ON sh.relay_url = m.relay_url AND sh.timestamp = m.ts
+        WHERE sh.score IS NOT NULL
       )
       SELECT
         c.avg_score as current_avg,
@@ -2764,25 +2863,26 @@ export class DataStore {
 
     const compare = (compareRows[0] as any) || {};
 
-    // Geographic breakdown
-    const geoRows = await db.all(`
-      WITH latest_scores AS (
-        SELECT relay_url, score, reliability,
-          ROW_NUMBER() OVER (PARTITION BY relay_url ORDER BY timestamp DESC) as rn
-        FROM score_history WHERE score IS NOT NULL
-      )
-      SELECT
-        COALESCE(j.country_code, 'Unknown') as country_code,
-        COALESCE(j.country_name, 'Unknown') as country_name,
-        COUNT(*) as relay_count,
-        AVG(s.score) as avg_score,
-        AVG(s.reliability) as avg_reliability
-      FROM latest_scores s
-      LEFT JOIN relay_jurisdictions j ON s.relay_url = j.relay_url
-      WHERE s.rn = 1
-      GROUP BY j.country_code, j.country_name
-      ORDER BY relay_count DESC
-    `);
+    // Geographic breakdown, derived in JS from the latest-per-relay set above
+    // (jurisdiction was joined into latestRows), keyed by country.
+    const geoMap = new Map<string, { country_code: string; country_name: string; scores: number[]; reliabilities: number[] }>();
+    for (const r of latestRows) {
+      const code = r.country_code ?? 'Unknown';
+      const name = r.country_name ?? 'Unknown';
+      let g = geoMap.get(code);
+      if (!g) { g = { country_code: code, country_name: name, scores: [], reliabilities: [] }; geoMap.set(code, g); }
+      g.scores.push(num(r.score));
+      g.reliabilities.push(num(r.reliability));
+    }
+    const geoRows = Array.from(geoMap.values())
+      .map((g) => ({
+        country_code: g.country_code,
+        country_name: g.country_name,
+        relay_count: g.scores.length,
+        avg_score: g.scores.reduce((a, b) => a + b, 0) / g.scores.length,
+        avg_reliability: g.reliabilities.reduce((a, b) => a + b, 0) / g.reliabilities.length,
+      }))
+      .sort((a, b) => b.relay_count - a.relay_count);
 
     // Top movers (biggest score changes)
     const moversRows = await db.all(`
@@ -2807,10 +2907,11 @@ export class DataStore {
     // Churn analysis
     const churnRows = await db.all(`
       WITH latest_probes AS (
+        -- Only MIN/MAX(timestamp) per url is needed (churn windows), which the
+        -- probes PK (url, timestamp) serves as a covering index. Aggregating
+        -- reachable/total here would force a full row read (~10x slower).
         SELECT url, MAX(timestamp) as last_seen,
-          MIN(timestamp) as first_seen,
-          SUM(CASE WHEN reachable THEN 1 ELSE 0 END) as reachable_count,
-          COUNT(*) as total_count
+          MIN(timestamp) as first_seen
         FROM probes
         GROUP BY url
       )
@@ -2832,10 +2933,10 @@ export class DataStore {
       summary: {
         totalRelays,
         avgScore: Math.round((summary.avg_score ?? 0) * 10) / 10,
-        medianScore: Math.round(summary.median_score ?? 0),
-        p25Score: Math.round(summary.p25 ?? 0),
-        p75Score: Math.round(summary.p75 ?? 0),
-        stddev: Math.round((summary.stddev ?? 0) * 10) / 10,
+        medianScore: Math.round(medianScore ?? 0),
+        p25Score: Math.round(p25Score ?? 0),
+        p75Score: Math.round(p75Score ?? 0),
+        stddev: Math.round((stddevScore ?? 0) * 10) / 10,
         healthyCount: Number(summary.healthy_count ?? 0),
         healthyPercent: totalRelays > 0 ? Math.round((Number(summary.healthy_count ?? 0) / totalRelays) * 100) : 0,
         degradedCount: Number(summary.degraded_count ?? 0),
@@ -2861,7 +2962,7 @@ export class DataStore {
       trend: trendRows.map((r: any) => ({
         timestamp: Number(r.day),
         avgScore: Math.round((r.avg_score ?? 0) * 10) / 10,
-        medianScore: Math.round(r.median_score ?? 0),
+        medianScore: Math.round(trendMedianByDay.get(Number(r.day)) ?? 0),
         relayCount: Number(r.relay_count),
       })),
       geographic: geoRows.map((r: any) => ({
@@ -2964,17 +3065,17 @@ export class DataStore {
   }
 
   /**
-   * Checkpoint the WAL file to prevent stale WAL issues.
-   * Uses FORCE CHECKPOINT to push through even with active readers.
+   * Checkpoint the WAL file to prevent unbounded WAL growth.
+   * TRUNCATE pushes committed pages into the main DB and resets the WAL file.
    * Should be called periodically and before shutdown.
    *
-   * @param force - If true, use FORCE CHECKPOINT (default: true)
+   * @param force - retained for API compatibility (TRUNCATE is always used)
    * @returns true if checkpoint succeeded, false otherwise
    */
-  async checkpoint(force: boolean = true): Promise<boolean> {
+  async checkpoint(_force: boolean = true): Promise<boolean> {
     const db = await this.ensureReady();
     try {
-      await db.run(force ? 'FORCE CHECKPOINT' : 'CHECKPOINT');
+      await db.run('PRAGMA wal_checkpoint(TRUNCATE)');
       return true;
     } catch (err) {
       console.error('Checkpoint failed:', err);
@@ -2988,7 +3089,7 @@ export class DataStore {
    */
   getWalFileSize(): number {
     try {
-      const walPath = this.dbPath + '.wal';
+      const walPath = this.dbPath + '-wal';
       const fs = require('fs');
       const stats = fs.statSync(walPath);
       return stats.size;
@@ -3016,14 +3117,16 @@ export class DataStore {
   }
 
   async close(): Promise<void> {
-    if (this.db) {
-      // Force checkpoint before closing to flush WAL
+    if (this.sqlite) {
+      // Checkpoint + truncate the WAL before closing so we don't leave a stale
+      // WAL behind for the next open.
       try {
-        await this.db.run('FORCE CHECKPOINT');
+        this.sqlite.exec('PRAGMA wal_checkpoint(TRUNCATE)');
       } catch {
         // Ignore checkpoint errors during close
       }
-      await this.db.close();
+      this.sqlite.close();
+      this.sqlite = null;
       this.db = null;
     }
   }

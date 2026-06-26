@@ -1,7 +1,8 @@
 import { promises as dns } from 'dns';
 import type { OperatorResolution, VerificationMethod, NIP11Info, TrustAssertionProvider } from './types.js';
 import { VERIFICATION_CONFIDENCE, CORROBORATED_CONFIDENCE } from './types.js';
-import { normalizeRelayUrl } from './prober.js';
+import { normalizeRelayUrl, readCapped } from './prober.js';
+import { isBlockedHost, resolvesToSafeHost } from './net-guard.js';
 import { getTrustScore } from './wot-client.js';
 
 /**
@@ -71,7 +72,16 @@ async function checkDnsTxt(domain: string): Promise<string | null> {
  * Check .well-known/nostr.json for operator pubkey
  * Looks for: { "relay": { "pubkey": "<hex>" } }
  */
+const WELLKNOWN_MAX_BYTES = 64 * 1024; // 64 KB cap on .well-known/nostr.json
+
 async function checkWellKnown(domain: string): Promise<string | null> {
+  // SSRF guard: domain comes from untrusted relay metadata. Refuse internal/
+  // private/metadata hosts (name check + DNS-rebinding resolve check) before
+  // any outbound fetch.
+  if (isBlockedHost(domain) || !(await resolvesToSafeHost(domain))) {
+    return null;
+  }
+
   const url = `https://${domain}/.well-known/nostr.json`;
 
   try {
@@ -83,6 +93,9 @@ async function checkWellKnown(domain: string): Promise<string | null> {
       headers: {
         'Accept': 'application/json',
       },
+      // Don't follow redirects: a relay domain could redirect to an internal
+      // host (SSRF) or an unrelated large resource.
+      redirect: 'manual',
     });
 
     clearTimeout(timeout);
@@ -91,7 +104,16 @@ async function checkWellKnown(domain: string): Promise<string | null> {
       return null;
     }
 
-    const json = await response.json();
+    // Reject non-JSON early and cap the body to avoid memory exhaustion.
+    const contentType = response.headers.get('content-type') || '';
+    if (!/json/i.test(contentType)) {
+      return null;
+    }
+    const declaredLen = Number(response.headers.get('content-length'));
+    if (Number.isFinite(declaredLen) && declaredLen > WELLKNOWN_MAX_BYTES) {
+      return null;
+    }
+    const json = JSON.parse(await readCapped(response, WELLKNOWN_MAX_BYTES));
 
     // Check for relay.pubkey
     if (json?.relay?.pubkey && typeof json.relay.pubkey === 'string') {
@@ -201,10 +223,17 @@ export async function resolveOperator(
     confidence: 0,
   };
 
-  // Extract NIP-11 pubkey
+  // Extract NIP-11 pubkey (administrative contact = candidate operator)
   const nip11Pubkey = isValidPubkey(nip11?.pubkey) ? nip11.pubkey.toLowerCase() : undefined;
   if (nip11Pubkey) {
     resolution.nip11Pubkey = nip11Pubkey;
+  }
+
+  // Extract NIP-11 `self` (relay's own identity). Surfaced for reference only;
+  // deliberately NOT fed into operator verification below.
+  const relayIdentityPubkey = isValidPubkey(nip11?.self) ? nip11.self.toLowerCase() : undefined;
+  if (relayIdentityPubkey) {
+    resolution.relayIdentityPubkey = relayIdentityPubkey;
   }
 
   // Fetch DNS and well-known in parallel for efficiency
@@ -346,6 +375,11 @@ export function formatOperatorResolution(resolution: OperatorResolution): string
 
   if (sources.length > 1) {
     lines.push(`Sources: ${sources.join(', ')}`);
+  }
+
+  // Show relay's own identity (NIP-11 `self`), distinct from the operator
+  if (resolution.relayIdentityPubkey) {
+    lines.push(`Relay identity (self): ${resolution.relayIdentityPubkey.slice(0, 16)}...`);
   }
 
   // Show WoT trust score if available

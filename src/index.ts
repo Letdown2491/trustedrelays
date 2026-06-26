@@ -22,7 +22,7 @@ const DEFAULT_RELAYS = [
 ];
 
 const DATA_DIR = './data';
-const DB_PATH = `${DATA_DIR}/trustedrelays.db`;
+const DB_PATH = `${DATA_DIR}/trustedrelays.sqlite`;
 
 // Ensure data directory exists
 mkdirSync(DATA_DIR, { recursive: true });
@@ -110,8 +110,10 @@ async function probeCommand(relayUrls: string[], options: { store?: boolean } = 
 
       // Get NIP-66 stats if available
       let nip66Stats = null;
+      let nip66Signals = undefined;
       if (db) {
         nip66Stats = await db.getNip66Stats(url, 365);
+        nip66Signals = await db.getNip66PolicySignals(url);
         if (nip66Stats.metricCount > 0) {
           console.log(`\n--- NIP-66 Monitor Data ---`);
           console.log(`Metrics: ${nip66Stats.metricCount} from ${nip66Stats.monitorCount} monitor(s)`);
@@ -187,6 +189,7 @@ async function probeCommand(relayUrls: string[], options: { store?: boolean } = 
       const assertion = buildAssertion(url, probes, score, operatorResolution, qualityScore, accessibilityScore, {
         reports,
         jurisdiction,
+        nip66Signals,
       });
 
       // Store score snapshot for history
@@ -480,7 +483,7 @@ async function nip66StatsCommand(relayUrls: string[]) {
   const db = new DataStore(DB_PATH);
 
   try {
-    // Limit to 20 relays to avoid DuckDB/Bun NAPI crashes with large result sets
+    // Cap the default listing to 20 relays to keep CLI output manageable.
     const urls = relayUrls.length > 0 ? relayUrls : await db.getNip66RelayUrls(20);
 
     if (urls.length === 0) {
@@ -584,6 +587,7 @@ async function publishCommand(relayUrls: string[], options: { force?: boolean } 
       // Get historical data
       const probes = await db.getProbes(url, 30);
       const nip66Stats = await db.getNip66Stats(url, 365);
+      const nip66Signals = await db.getNip66PolicySignals(url);
       const reports = await db.getReports(url, 90);
 
       // Get jurisdiction
@@ -599,7 +603,7 @@ async function publishCommand(relayUrls: string[], options: { force?: boolean } 
       const accessibilityScore = computeAccessibilityScore(probe.nip11, jurisdiction?.countryCode);
 
       // Build assertion
-      const assertion = buildAssertion(url, probes.length > 0 ? probes : [probe], score, operatorResolution, qualityScore, accessibilityScore, { reports, jurisdiction });
+      const assertion = buildAssertion(url, probes.length > 0 ? probes : [probe], score, operatorResolution, qualityScore, accessibilityScore, { reports, jurisdiction, nip66Signals });
 
       console.log('\n--- Assertion ---');
       console.log(formatAssertion(assertion));

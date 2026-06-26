@@ -54,7 +54,13 @@ Notable options:
 |-----|---------|-------------|
 | `publishing.enabled` | `false` | Publish kind-30385 assertions |
 | `targets.maxRelays` | `500` | Cap on tracked relays (also limits `/api/track`) |
+| `database.retentionDays` | `90` | Retention for `score_history` / reports (keep ≥ the 90-day analytics window) |
+| `database.probeRetentionDays` | `45` | Retention for raw probe rows |
+| `database.nip66RetentionDays` | `45` | Retention for NIP-66 metrics |
+| `sources.minMonitorSources` | `2` | Distinct source relays that must announce a new monitor before it's auto-trusted (Sybil corroboration) |
+| `sources.maxMonitors` | `200` | Cap on total auto-trusted monitors |
 | `api.trustProxy` | `false` | Trust `cf-connecting-ip` / `x-forwarded-for` for the client IP. **Enable only when behind a trusted reverse proxy** (e.g. Cloudflare); otherwise these headers are spoofable and rate limiting can be bypassed. |
+| `api.corsOrigins` | — | Allowlist of origins permitted to call mutating endpoints cross-origin |
 
 For the standalone `api` command, pass `--trust-proxy` to enable the same behavior.
 
@@ -64,6 +70,7 @@ For the standalone `api` command, pass `--trust-proxy` to enable the same behavi
 |----------|-------------|
 | `NOSTR_PRIVATE_KEY` | Private key for signing (nsec or hex) |
 | `NOSTR_PUBLISH_RELAYS` | Comma-separated publish relays |
+| `TRUSTEDRELAYS_ADMIN_TOKEN` | Bearer token required for admin endpoints (`/api/untrack`, and `/api/metrics` from non-loopback). If unset, those are disabled / loopback-only. |
 
 ## Deployment
 

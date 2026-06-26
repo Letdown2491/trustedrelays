@@ -1,4 +1,4 @@
-import type { NIP11Info, RelayPolicy, RelayType, RelayReport } from './types.js';
+import type { NIP11Info, Nip66PolicySignals, RelayPolicy, RelayType, RelayReport } from './types.js';
 
 /**
  * Policy classification result with reasoning
@@ -15,6 +15,9 @@ export interface PolicyClassification {
     kindRestrictions: boolean;
     hasModeration: boolean;
   };
+  // True when a monitor-observed (NIP-66) signal contradicted the relay's
+  // self-claimed NIP-11 limitation. The observation wins for the indicator.
+  observedConflict?: boolean;
 }
 
 /**
@@ -29,7 +32,8 @@ export interface PolicyClassification {
 export function classifyPolicy(
   nip11?: NIP11Info,
   relayType?: RelayType,
-  reports?: RelayReport[]
+  reports?: RelayReport[],
+  observed?: Nip66PolicySignals
 ): PolicyClassification {
   const reasons: string[] = [];
   const indicators = {
@@ -113,6 +117,46 @@ export function classifyPolicy(
     reasons.push(`${recentSpamReports.length} recent spam reports (may indicate weak moderation)`);
   }
 
+  // Apply monitor-observed NIP-66 signals. Observations are harder to fake than
+  // a self-published NIP-11 document, so when they contradict the claim the
+  // observation wins for the indicator; agreement raises confidence.
+  let observedConflict = false;
+  let observedCorroborations = 0;
+  if (observed) {
+    const checks: Array<{
+      key: keyof Pick<typeof indicators, 'authRequired' | 'paymentRequired' | 'restrictedWrites' | 'powRequired'>;
+      value: boolean | undefined;
+      label: string;
+    }> = [
+      { key: 'authRequired', value: observed.authRequired, label: 'auth' },
+      { key: 'paymentRequired', value: observed.paymentRequired, label: 'payment' },
+      { key: 'restrictedWrites', value: observed.restrictedWrites, label: 'restricted writes' },
+      { key: 'powRequired', value: observed.powRequired, label: 'PoW' },
+    ];
+    for (const { key, value, label } of checks) {
+      if (value === undefined) continue;
+      if (value === indicators[key]) {
+        if (value) observedCorroborations++;
+      } else {
+        indicators[key] = value;
+        observedConflict = true;
+        reasons.push(
+          value
+            ? `Monitors observe ${label} required despite NIP-11 not claiming it`
+            : `Monitors do not observe ${label} despite NIP-11 claiming it`
+        );
+      }
+    }
+
+    // 'k' tag: finally populates the kind-restriction indicator NIP-11 can't express.
+    if (observed.kindRestrictions) {
+      if (!indicators.kindRestrictions) {
+        reasons.push(`${observed.monitorCount} monitor(s) observe kind restrictions`);
+      }
+      indicators.kindRestrictions = true;
+    }
+  }
+
   // Classify based on indicators
   let policy: RelayPolicy;
   let confidence: number;
@@ -126,7 +170,7 @@ export function classifyPolicy(
     }
   }
   // Moderated: Has some restrictions or moderation indicators
-  else if (indicators.restrictedWrites || indicators.hasModeration || indicators.powRequired) {
+  else if (indicators.restrictedWrites || indicators.hasModeration || indicators.powRequired || indicators.kindRestrictions) {
     policy = 'moderated';
     confidence = 70;
     if (indicators.restrictedWrites && indicators.hasModeration) {
@@ -146,11 +190,19 @@ export function classifyPolicy(
     reasons.push('No limitation info in NIP-11 (lower confidence)');
   }
 
+  // Monitor observations that corroborate the claimed restrictions raise
+  // confidence (+5 each, capped); a claimed-vs-observed conflict is noted.
+  if (observedCorroborations > 0) {
+    confidence = Math.min(98, confidence + observedCorroborations * 5);
+    reasons.push(`${observedCorroborations} restriction(s) corroborated by monitor observations`);
+  }
+
   return {
     policy,
     confidence,
     reasons,
     indicators,
+    observedConflict,
   };
 }
 

@@ -131,6 +131,10 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
             <option value="low">&lt;40 Poor</option>
           </select>
         </div>
+        <div class="filter-group-drawer">
+          <label class="filter-label-drawer">Topic</label>
+          <input type="text" id="filter-topic" placeholder="e.g. nostr, dev" autocomplete="off">
+        </div>
       </div>
     </div>
     <div class="filter-drawer-footer">
@@ -386,6 +390,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       if (params.has('score')) document.getElementById('filter-score').value = params.get('score');
       if (params.has('country')) document.getElementById('filter-country').value = params.get('country');
       if (params.has('secure')) document.getElementById('filter-secure').value = params.get('secure');
+      if (params.has('topic')) document.getElementById('filter-topic').value = params.get('topic');
       if (params.has('sort')) sortCol = params.get('sort');
       if (params.has('asc')) sortAsc = params.get('asc') === '1';
 
@@ -407,12 +412,14 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       const score = document.getElementById('filter-score').value;
       const country = document.getElementById('filter-country').value;
       const secure = document.getElementById('filter-secure').value;
+      const topic = document.getElementById('filter-topic').value;
 
       if (search) params.set('q', search);
       if (policy) params.set('policy', policy);
       if (score) params.set('score', score);
       if (country) params.set('country', country);
       if (secure) params.set('secure', secure);
+      if (topic) params.set('topic', topic);
       if (sortCol !== 'score') params.set('sort', sortCol);
       if (sortAsc) params.set('asc', '1');
 
@@ -533,6 +540,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
         document.getElementById('filter-score').value,
         document.getElementById('filter-country').value,
         document.getElementById('filter-secure').value,
+        document.getElementById('filter-topic').value,
         selectedNips.sort().join(','),
         sortCol,
         sortAsc,
@@ -546,6 +554,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       const scoreFilter = document.getElementById('filter-score').value;
       const country = document.getElementById('filter-country').value;
       const secure = document.getElementById('filter-secure').value;
+      const topic = document.getElementById('filter-topic').value.trim().toLowerCase();
 
       // Performance: use cached result if filters unchanged
       const key = getFilterKey();
@@ -554,6 +563,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       cachedFiltered = allRelays.filter(r => {
         if (search && !r.url.toLowerCase().includes(search) && !(r.name && r.name.toLowerCase().includes(search))) return false;
         if (policy && r.policy !== policy) return false;
+        if (topic && !(r.topics && r.topics.some(t => t.toLowerCase().includes(topic)))) return false;
         if (country && r.countryCode !== country) return false;
         if (secure === 'secure' && !r.isSecure) return false;
         if (secure === 'insecure' && r.isSecure) return false;
@@ -635,7 +645,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
           '<div class="relay-url-primary">' + statusDot + insecureIcon + escHtml(displayUrl) + favoriteStar + '</div>' +
           descLine +
         '</td>' +
-        '<td class="hide-mobile">' + (r.policy ? '<span class="tag tag-' + r.policy + '" title="' + policyTitle + '">' + r.policy + '</span>' : '<span class="score-val dim">-</span>') + '</td>' +
+        '<td class="hide-mobile">' + (r.policy ? '<span class="tag tag-' + r.policy + '" title="' + policyTitle + '">' + r.policy + '</span>' + (r.policyDiscrepancy ? '<span class="policy-discrepancy" title="Monitor-observed behavior differs from this relay\\'s NIP-11 self-description">⚠</span>' : '') : '<span class="score-val dim">-</span>') + '</td>' +
         '<td class="col-loc hide-mobile"><span class="loc" title="Server location">' + flag + (r.countryCode || '-') + '</span></td>' +
         '<td class="col-conf hide-tablet"><span class="conf-badge ' + confClass + '" title="' + confTitle + '">' + r.confidence + '</span></td>' +
         '<td class="col-score hide-tablet" title="Connection stability and response time"><span class="score-val">' + (r.reliability ?? '-') + '</span></td>' +
@@ -919,7 +929,11 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       const data = getFiltered(); // Already sorted via cache
       const headers = ['url','name','score','reliability','quality','accessibility','policy','confidence','country','secure','observations'];
       const rows = data.map(r => [r.url, r.name||'', r.score, r.reliability, r.quality, r.accessibility, r.policy||'', r.confidence, r.countryCode||'', r.isSecure, r.observations]);
-      const csv = [headers.join(','), ...rows.map(r => r.map(v => '"' + String(v).replace(/"/g,'""') + '"').join(','))].join('\\n');
+      // Neutralize CSV formula injection: a relay-controlled cell starting with
+      // = + - @ (or tab/CR) is prefixed with a single quote so spreadsheets
+      // don't evaluate it as a formula.
+      const csvCell = v => { let s = String(v); if (/^[=+\\-@\\t\\r]/.test(s)) s = "'" + s; return '"' + s.replace(/"/g, '""') + '"'; };
+      const csv = [headers.join(','), ...rows.map(r => r.map(csvCell).join(','))].join('\\n');
       downloadFile(csv, 'trustedrelays.csv', 'text/csv');
     }
 
@@ -1121,13 +1135,18 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       html += '<div class="detail-group-title">Relay Info</div>';
       html += '<div class="detail-group-grid">';
       html += '<div class="detail-row" title="Relay classification: general, nip46 (remote signing), or specialized"><span class="detail-key">Type</span><span class="detail-val">' + escHtml(d.relayType || '-') + '</span></div>';
-      html += '<div class="detail-row" title="Access policy: open, moderated, curated, or specialized"><span class="detail-key">Policy</span><span class="detail-val">' + escHtml(d.policy?.classification || '-') + '</span></div>';
+      const policyDiscrepancyBadge = d.policy?.observedConflict ? ' <span class="policy-discrepancy" title="Monitor-observed behavior differs from this relay\\'s NIP-11 self-description">⚠ observed differs</span>' : '';
+      html += '<div class="detail-row" title="Access policy: open, moderated, curated, or specialized"><span class="detail-key">Policy</span><span class="detail-val">' + escHtml(d.policy?.classification || '-') + policyDiscrepancyBadge + '</span></div>';
       if (d.nip11?.software) {
         const sw = d.nip11.software.split('/').pop()?.split('#')[0] || d.nip11.software;
         html += '<div class="detail-row" title="Relay software reported via NIP-11"><span class="detail-key">Software</span><span class="detail-val">' + escHtml(sw) + '</span></div>';
       }
       const accessLabel = d.accessLevel === 'open' ? '' : d.accessLevel === 'auth_required' ? ' (auth required)' : d.accessLevel === 'payment_required' ? ' (payment required)' : d.accessLevel === 'restricted' ? ' (restricted)' : '';
       html += '<div class="detail-row" title="Current reachability status from most recent probe"><span class="detail-key">Status</span><span class="detail-val ' + (d.reachable ? 'online' : 'offline') + '">' + (d.reachable ? 'Online' + accessLabel : 'Offline') + '</span></div>';
+      if (d.topics && d.topics.length > 0) {
+        const topicChips = d.topics.map(t => '<span class="topic-chip">' + escHtml(t) + '</span>').join('');
+        html += '<div class="detail-row" title="Topics observed by NIP-66 monitors"><span class="detail-key">Topics</span><span class="detail-val topic-chips">' + topicChips + '</span></div>';
+      }
       html += '</div></div>';
 
       // Group 2: Operator
@@ -1305,6 +1324,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       document.getElementById('filter-score').value = '';
       document.getElementById('filter-country').value = '';
       document.getElementById('filter-secure').value = '';
+      document.getElementById('filter-topic').value = '';
       selectedNips = [];
       updateNipButtonText();
       updateFilterResultCount();
@@ -1322,10 +1342,12 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       const scoreFilter = document.getElementById('filter-score').value;
       const country = document.getElementById('filter-country').value;
       const secure = document.getElementById('filter-secure').value;
+      const topic = document.getElementById('filter-topic').value.trim().toLowerCase();
 
       return allRelays.filter(r => {
         if (search && !r.url.toLowerCase().includes(search) && !(r.name && r.name.toLowerCase().includes(search))) return false;
         if (policy && r.policy !== policy) return false;
+        if (topic && !(r.topics && r.topics.some(t => t.toLowerCase().includes(topic)))) return false;
         if (country && r.countryCode !== country) return false;
         if (secure === 'secure' && !r.isSecure) return false;
         if (secure === 'insecure' && r.isSecure) return false;
@@ -1353,9 +1375,14 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       const score = document.getElementById('filter-score').value;
       const country = document.getElementById('filter-country').value;
       const secure = document.getElementById('filter-secure').value;
+      const topic = document.getElementById('filter-topic').value.trim();
 
       if (policy) {
         chips.push(createChip('Policy', policy, 'filter-policy'));
+        count++;
+      }
+      if (topic) {
+        chips.push(createChip('Topic', topic, 'filter-topic'));
         count++;
       }
       if (score) {
@@ -1606,6 +1633,8 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
     ['filter-policy', 'filter-score', 'filter-country', 'filter-secure'].forEach(id => {
       document.getElementById(id).addEventListener('change', updateFilterResultCount);
     });
+    // Topic is a free-text input, so update live on input
+    document.getElementById('filter-topic').addEventListener('input', updateFilterResultCount);
 
     // Filters (main table filtering on search)
     document.getElementById('search').addEventListener('input', () => {

@@ -32,7 +32,7 @@ A system for computing and publishing NIP-XX relay trust assertions (kind 30385)
 │                                ▼                                             │
 │                    ┌───────────────────────┐                                 │
 │                    │     database.ts       │                                 │
-│                    │      (DuckDB)         │                                 │
+│                    │      (SQLite)         │                                 │
 │                    └───────────┬───────────┘                                 │
 └────────────────────────────────┼─────────────────────────────────────────────┘
                                  │
@@ -95,7 +95,7 @@ trustedrelays/
 │   ├── index.ts              # CLI entry point
 │   ├── config.ts             # Configuration management
 │   ├── types.ts              # TypeScript interfaces
-│   ├── database.ts           # DuckDB data store
+│   ├── database.ts           # SQLite data store (bun:sqlite)
 │   │
 │   ├── prober.ts             # Direct relay probing
 │   ├── ingestor.ts           # NIP-66 monitor data ingestion
@@ -119,13 +119,13 @@ trustedrelays/
 │   ├── service.ts            # Daemon orchestration
 │   └── api.ts                # HTTP API & dashboard
 │
-├── data/                     # DuckDB database files
+├── data/                     # SQLite database files
 ├── mockups/                  # UI design mockups
 ├── package.json
 └── tsconfig.json
 ```
 
-## Database Schema (DuckDB)
+## Database Schema (SQLite)
 
 ```sql
 -- Direct probe results
@@ -547,3 +547,31 @@ server {
     }
 }
 ```
+
+## Performance & data lifecycle
+
+- **Precomputed read models.** The daemon computes the relay-list, rankings, and
+  network-stats snapshots once per cycle (`refreshPrecomputed` in `api.ts`); the
+  `/api/relays`, `/api/rankings`, and `/api/network/stats` handlers serve those
+  in-memory snapshots, so no heavy aggregation runs on the request path.
+- **Indexing.** Latest-per-entity reads use `GROUP BY MAX(timestamp)` joins over
+  the table primary keys plus composite covering indexes
+  (`idx_score_history_relay_ts_score`, `idx_nip66_*`).
+- **Retention.** A daily cleanup prunes per table (`database.*RetentionDays`) and
+  reclaims space via `PRAGMA incremental_vacuum` (the DB is created with
+  `auto_vacuum=INCREMENTAL`).
+- **Concurrency.** Probing and WoT refresh use a continuous worker pool (no
+  fixed-batch head-of-line blocking).
+
+## Known limitations / future work
+
+- **Synchronous SQLite blocks the event loop during the daemon's own heavy
+  computes** (e.g. the once-per-cycle snapshot refresh). The user-facing request
+  path is already off this path via precompute; moving the DB to a worker thread
+  would remove the remaining in-cycle blocking.
+- **Per-cycle scores are computed twice** (publish + snapshot refresh); these
+  could be unified to compute once per cycle.
+- **Operator verification relies on the self-reported NIP-11 pubkey** (DNS-TXT /
+  well-known adoption is near-zero in practice), so the attributed web-of-trust
+  score is not proof of key control. A `nip11_signed` challenge is a possible
+  future upgrade for operators who want verified status.

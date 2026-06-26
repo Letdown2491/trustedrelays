@@ -1,4 +1,4 @@
-import type { ProbeResult, ReliabilityScore, RelayAssertion, RelayPolicy, UnsignedEvent, OperatorResolution, QualityScore, AccessibilityScore, RelayReport } from './types.js';
+import type { ProbeResult, ReliabilityScore, RelayAssertion, RelayPolicy, UnsignedEvent, OperatorResolution, QualityScore, AccessibilityScore, RelayReport, Nip66PolicySignals } from './types.js';
 import { normalizeRelayUrl } from './prober.js';
 import { classifyPolicy, type PolicyClassification } from './policy-classifier.js';
 import { calculateWeightedObservations, getConfidenceLevel, calculateOfflineReliability } from './scorer.js';
@@ -10,7 +10,8 @@ import { ALGORITHM_VERSION, ALGORITHM_URL } from './version.js';
  */
 function determinePolicy(
   probes: ProbeResult[],
-  reports?: RelayReport[]
+  reports?: RelayReport[],
+  nip66Signals?: Nip66PolicySignals
 ): { policy: RelayPolicy | undefined; classification?: PolicyClassification } {
   const latestProbe = probes[probes.length - 1];
 
@@ -18,7 +19,8 @@ function determinePolicy(
   const classification = classifyPolicy(
     latestProbe.nip11,
     latestProbe.relayType,
-    reports
+    reports,
+    nip66Signals
   );
 
   return {
@@ -42,6 +44,8 @@ export interface BuildAssertionOptions {
   accessibilityScore?: AccessibilityScore;
   reports?: RelayReport[];
   jurisdiction?: JurisdictionInfo;
+  // Monitor-observed policy signals (NIP-66 R/k/T), aggregated by the caller
+  nip66Signals?: Nip66PolicySignals;
   // Algorithm metadata (from config)
   algorithmVersion?: string;
   algorithmUrl?: string;
@@ -109,7 +113,7 @@ export function buildAssertion(
   }
 
   // Determine policy using classifier
-  const { policy, classification } = determinePolicy(probes, options?.reports);
+  const { policy, classification } = determinePolicy(probes, options?.reports, options?.nip66Signals);
 
   // Compute overall score as weighted average: Reliability 40%, Quality 35%, Accessibility 25%
   // If currently offline: use decayed score based on how long offline
@@ -158,6 +162,9 @@ export function buildAssertion(
     assertion.policy = policy;
     if (classification) {
       assertion.policyConfidence = classification.confidence;
+      if (classification.observedConflict) {
+        assertion.policyDiscrepancy = true;
+      }
     }
   }
 
@@ -249,6 +256,11 @@ export function assertionToEvent(assertion: RelayAssertion): UnsignedEvent {
   if (assertion.policyConfidence !== undefined) {
     tags.push(['policy_confidence', assertion.policyConfidence.toString()]);
   }
+  if (assertion.policyDiscrepancy) {
+    // Relay's self-claimed NIP-11 limitation disagreed with monitor-observed
+    // behavior; classification trusted the observation.
+    tags.push(['policy_discrepancy', 'true']);
+  }
 
   // Jurisdiction tags
   if (assertion.countryCode) {
@@ -290,7 +302,8 @@ export function formatAssertion(assertion: RelayAssertion): string {
 
   if (assertion.policy) {
     const policyConf = assertion.policyConfidence ? ` (${assertion.policyConfidence}% confidence)` : '';
-    lines.push(`Policy: ${assertion.policy}${policyConf}`);
+    const discrepancy = assertion.policyDiscrepancy ? ' [observed behavior differs from NIP-11 claim]' : '';
+    lines.push(`Policy: ${assertion.policy}${policyConf}${discrepancy}`);
   }
 
   // Jurisdiction

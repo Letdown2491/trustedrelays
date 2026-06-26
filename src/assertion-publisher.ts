@@ -178,7 +178,7 @@ async function publishToRelay(
       resolve(result);
     };
 
-    const ws = new WebSocket(relayUrl);
+    const ws = new WebSocket(relayUrl, { maxPayload: 512 * 1024 });
 
     const timeoutId = setTimeout(() => {
       safeResolve({ success: false, error: 'timeout' });

@@ -1,4 +1,5 @@
 import { DataStore } from './database.js';
+import { isBlockedHost } from './net-guard.js';
 import { buildAssertion, assertionToEvent } from './assertion.js';
 import { computeCombinedReliabilityScore, calculateWeightedObservations, getConfidenceLevel, calculateOfflineReliability } from './scorer.js';
 import { computeQualityScore } from './quality-scorer.js';
@@ -48,6 +49,9 @@ export interface ApiConfig {
   trustProxy?: boolean;
   // Max number of on-demand (/api/track) relays to retain; caps list growth.
   maxRequestedRelays?: number;
+  // Optional: operational metrics snapshot provider (supplied by the service
+  // when it hosts the API). Returns a plain JSON-serializable object.
+  getMetrics?: () => object;
 }
 
 /**
@@ -96,7 +100,7 @@ function sanitizeError(err: unknown): string {
   if (err instanceof Error) {
     const msg = err.message.toLowerCase();
     // Database errors
-    if (msg.includes('database') || msg.includes('sqlite') || msg.includes('duckdb')) {
+    if (msg.includes('database') || msg.includes('sqlite')) {
       return 'Database error';
     }
     // File system errors
@@ -144,44 +148,9 @@ function errorResponse(message: string, status = 400): Response {
  * DNS-rebinding (a public name resolving to a private IP) must additionally be
  * guarded at connection time; see the prober's resolved-IP check.
  */
-export function isBlockedHost(hostname: string): boolean {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, ''); // strip IPv6 brackets
-
-  // Internal / loopback names
-  if (host === 'localhost' || host.endsWith('.localhost')) return true;
-  if (host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.lan')) return true;
-
-  // IPv4 literal checks
-  const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (v4) {
-    const o = v4.slice(1).map(Number);
-    if (o.some(n => n > 255)) return true; // malformed -> block
-    const [a, b] = o;
-    if (a === 0) return true;                       // 0.0.0.0/8
-    if (a === 10) return true;                      // 10.0.0.0/8 private
-    if (a === 127) return true;                     // loopback
-    if (a === 169 && b === 254) return true;        // link-local / cloud metadata
-    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 private
-    if (a === 192 && b === 168) return true;        // 192.168.0.0/16 private
-    if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
-    if (a >= 224) return true;                       // multicast / reserved
-    return false;
-  }
-
-  // IPv6 literal checks
-  if (host.includes(':')) {
-    if (host === '::1' || host === '::') return true;     // loopback / unspecified
-    if (host.startsWith('fe80')) return true;             // link-local
-    if (host.startsWith('fc') || host.startsWith('fd')) return true; // ULA fc00::/7
-    if (host.startsWith('::ffff:')) {                     // IPv4-mapped
-      const mapped = host.slice(7);
-      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(mapped)) return isBlockedHost(mapped);
-    }
-    return false;
-  }
-
-  return false;
-}
+// Re-exported from the shared SSRF guard (imported above) so existing importers
+// and tests that reference it from this module keep working.
+export { isBlockedHost };
 
 /**
  * Validate and normalize relay URL
@@ -451,7 +420,10 @@ class ResponseCache {
 }
 
 // Global response cache
-const responseCache = new ResponseCache(50);
+// Sized so the handful of expensive global-aggregate keys (relays, rankings,
+// network-stats) aren't evicted by churn of per-URL keys (relay scores,
+// analytics:<url>) under load.
+const responseCache = new ResponseCache(500);
 
 // Cache TTLs
 const CACHE_TTL = {
@@ -461,6 +433,17 @@ const CACHE_TTL = {
   STATS: 60000,         // 60 seconds
   COUNTRIES: 60000,     // 60 seconds
 };
+
+// Read-model snapshots precomputed by the daemon once per cycle (see
+// refreshPrecomputed). The /api/relays, /api/rankings and /api/network/stats
+// handlers serve these directly so the ~16s rebuild never runs on a request.
+// Null until the first refresh; handlers fall back to on-demand compute then.
+let precomputed: {
+  relays: any[];
+  rankings: object;
+  networkStats: Map<string, object>;
+  computedAt: number;
+} | null = null;
 
 /**
  * Get client IP from request (Cloudflare Workers)
@@ -480,6 +463,45 @@ function getClientIp(req: Request, socketIp: string | undefined, trustProxy: boo
   }
   // Authoritative source: the actual TCP peer address.
   return socketIp || 'unknown';
+}
+
+// Admin token for state-mutating maintenance endpoints (e.g. /api/untrack).
+// When unset, those endpoints are disabled rather than open to anyone.
+const ADMIN_TOKEN = process.env.TRUSTEDRELAYS_ADMIN_TOKEN || '';
+
+/** Constant-time string comparison (avoids timing oracles on the token). */
+function safeTokenEqual(a: string, b: string): boolean {
+  if (a.length !== b.length || a.length === 0) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+/** Extract a bearer token from the Authorization header or ?token= param. */
+function extractToken(req: Request, url: URL): string {
+  const auth = req.headers.get('authorization') || '';
+  const bearer = auth.replace(/^Bearer\s+/i, '');
+  if (bearer && bearer !== auth) return bearer;
+  return url.searchParams.get('token') || '';
+}
+
+/**
+ * CSRF guard for state-mutating endpoints: reject a request whose Origin header
+ * is cross-site (a browser sets Origin on cross-origin requests). Requests with
+ * no Origin (curl / server-to-server API clients) and same-origin browser
+ * requests are allowed, as are any explicitly configured CORS origins.
+ */
+function isDisallowedCrossOrigin(req: Request, allowed?: string[]): boolean {
+  const origin = req.headers.get('origin');
+  if (!origin) return false; // non-browser or same-origin fetch — allow
+  if (allowed && allowed.includes(origin)) return false;
+  const host = req.headers.get('host');
+  try {
+    if (host && new URL(origin).host === host) return false; // same-origin
+  } catch {
+    return true; // malformed Origin — block
+  }
+  return true;
 }
 
 /**
@@ -592,6 +614,13 @@ function serveApiDocs(): Response {
         description: 'Health check endpoint',
         parameters: [],
         example: '/api/health'
+      },
+      {
+        path: '/api/metrics',
+        method: 'GET',
+        description: 'Operational metrics (probe/publish/ingest counters, uptime, memory) for monitoring',
+        parameters: [],
+        example: '/api/metrics'
       }
     ]
   };
@@ -607,7 +636,7 @@ function serveApiDocs(): Response {
 /**
  * Start the API server
  */
-export function startApiServer(config: ApiConfig): { stop: () => void } {
+export function startApiServer(config: ApiConfig): { stop: () => void; port: number } {
   const { port, host, db } = config;
   const trustProxy = config.trustProxy ?? false;
   const maxRequestedRelays = config.maxRequestedRelays;
@@ -635,8 +664,9 @@ export function startApiServer(config: ApiConfig): { stop: () => void } {
         });
       }
 
-      // Rate limiting for API endpoints (skip for dashboard and health)
-      if (path.startsWith('/api') && path !== '/api/health') {
+      // Rate limiting for API endpoints (skip for dashboard and health).
+      // /api/metrics is handled below with its own rate-limit + access gate.
+      if (path.startsWith('/api') && path !== '/api/health' && path !== '/api/metrics') {
         const clientIp = getClientIp(req, socketIp, trustProxy);
         const rateCheck = rateLimiter.isAllowed(clientIp);
 
@@ -702,21 +732,6 @@ export function startApiServer(config: ApiConfig): { stop: () => void } {
           }
         }
 
-        // Health check (also accessible without rate limit above)
-        if (path === '/api/health') {
-          const mem = process.memoryUsage();
-          return addRateLimitHeaders(jsonResponse({
-            status: 'ok',
-            timestamp: Date.now(),
-            memory: {
-              heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024),
-              heapTotalMB: Math.round(mem.heapTotal / 1024 / 1024),
-              rssMB: Math.round(mem.rss / 1024 / 1024),
-              externalMB: Math.round(mem.external / 1024 / 1024),
-            },
-          }));
-        }
-
         // List all relays with scores (expensive endpoint - stricter rate limit)
         if (path === '/api/relays') {
           const clientIp = getClientIp(req, socketIp, trustProxy);
@@ -740,7 +755,11 @@ export function startApiServer(config: ApiConfig): { stop: () => void } {
           }
 
           try {
-            // Check cache first
+            // Serve the daemon-precomputed snapshot (off the request path).
+            if (precomputed) {
+              return addRateLimitHeaders(jsonResponse(precomputed.relays));
+            }
+            // Cold-start fallback (before the first cycle refresh).
             const cacheKey = 'relays';
             let relays = responseCache.get<any[]>(cacheKey);
             if (!relays) {
@@ -871,9 +890,30 @@ export function startApiServer(config: ApiConfig): { stop: () => void } {
 
         // Track a relay (on-demand tracking)
         if (path === '/api/track') {
+          if (isDisallowedCrossOrigin(req, config.corsOrigins)) {
+            return addRateLimitHeaders(errorResponse('Cross-origin request not allowed', 403));
+          }
           const validation = validateRelayUrl(url.searchParams.get('url'));
           if (!validation.valid) {
             return addRateLimitHeaders(errorResponse(validation.error));
+          }
+
+          // Writes a probe target; gate with the strict per-IP limiter so it
+          // can't be used to flood the tracking list / probe queue.
+          const trackRateCheck = expensiveRateLimiter.isAllowed(getClientIp(req, socketIp, trustProxy));
+          if (!trackRateCheck.allowed) {
+            return new Response(JSON.stringify({
+              success: false,
+              error: 'Rate limit exceeded for this endpoint. Try again later.',
+              meta: { resetIn: trackRateCheck.resetIn },
+            }), {
+              status: 429,
+              headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Retry-After': trackRateCheck.resetIn.toString(),
+              },
+            });
           }
 
           try {
@@ -892,8 +932,19 @@ export function startApiServer(config: ApiConfig): { stop: () => void } {
           }
         }
 
-        // Untrack a relay
+        // Untrack a relay — admin-only maintenance action. Without auth this was
+        // an IDOR: any anonymous client could delete any tracked relay by URL.
         if (path === '/api/untrack') {
+          if (isDisallowedCrossOrigin(req, config.corsOrigins)) {
+            return addRateLimitHeaders(errorResponse('Cross-origin request not allowed', 403));
+          }
+          if (!ADMIN_TOKEN) {
+            return addRateLimitHeaders(errorResponse('Untrack is disabled (no admin token configured)', 403));
+          }
+          if (!safeTokenEqual(extractToken(req, url), ADMIN_TOKEN)) {
+            return addRateLimitHeaders(errorResponse('Unauthorized', 401));
+          }
+
           const validation = validateRelayUrl(url.searchParams.get('url'));
           if (!validation.valid) {
             return addRateLimitHeaders(errorResponse(validation.error));
@@ -934,7 +985,11 @@ export function startApiServer(config: ApiConfig): { stop: () => void } {
           }
 
           try {
-            // Check cache first
+            // Serve the daemon-precomputed snapshot (off the request path).
+            if (precomputed) {
+              return addRateLimitHeaders(jsonResponse(precomputed.rankings));
+            }
+            // Cold-start fallback (before the first cycle refresh).
             const cacheKey = 'rankings';
             let rankings = responseCache.get<object>(cacheKey);
             if (!rankings) {
@@ -955,10 +1010,39 @@ export function startApiServer(config: ApiConfig): { stop: () => void } {
             return addRateLimitHeaders(errorResponse(validation.error));
           }
 
+          // getRelayAnalytics fans out network-wide full-table scans, so it is
+          // gated by the expensive limiter and cached per-URL to prevent an
+          // attacker-chosen URL from amplifying into an event-loop DoS.
+          const clientIp = getClientIp(req, socketIp, trustProxy);
+          const analyticsRateCheck = expensiveRateLimiter.isAllowed(clientIp);
+          if (!analyticsRateCheck.allowed) {
+            return new Response(JSON.stringify({
+              success: false,
+              error: 'Rate limit exceeded for this endpoint. Try again later.',
+              meta: { resetIn: analyticsRateCheck.resetIn },
+            }), {
+              status: 429,
+              headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'X-RateLimit-Limit': '10',
+                'X-RateLimit-Remaining': '0',
+                'X-RateLimit-Reset': analyticsRateCheck.resetIn.toString(),
+                'Retry-After': analyticsRateCheck.resetIn.toString(),
+              },
+            });
+          }
+
           try {
-            const analytics = await getRelayAnalytics(db, validation.url);
+            const cacheKey = `analytics:${validation.url}`;
+            let analytics = responseCache.get<object>(cacheKey);
             if (!analytics) {
-              return addRateLimitHeaders(errorResponse('Relay not found', 404));
+              const computed = await getRelayAnalytics(db, validation.url);
+              if (!computed) {
+                return addRateLimitHeaders(errorResponse('Relay not found', 404));
+              }
+              analytics = computed;
+              responseCache.set(cacheKey, analytics, CACHE_TTL.RELAY_DETAIL);
             }
             return addRateLimitHeaders(jsonResponse(analytics));
           } catch (err) {
@@ -977,7 +1061,13 @@ export function startApiServer(config: ApiConfig): { stop: () => void } {
             const periodParam = ALLOWED_PERIODS.has(rawPeriod) ? rawPeriod : '6h';
             const periodDays = parsePeriod(periodParam);
 
-            // Check cache first (keyed by period)
+            // Serve the daemon-precomputed snapshot (off the request path).
+            const pre = precomputed?.networkStats.get(periodParam);
+            if (pre) {
+              return addRateLimitHeaders(jsonResponse(pre));
+            }
+
+            // Cold-start fallback (before the first cycle refresh).
             const statsCacheKey = `network-stats:${periodParam}`;
             let stats = responseCache.get<object>(statsCacheKey);
             if (!stats) {
@@ -1024,9 +1114,50 @@ export function startApiServer(config: ApiConfig): { stop: () => void } {
         return serveStaticFile('styles.css', 'text/css');
       }
 
-      // Health check (no rate limit)
-      if (path === '/health') {
-        return jsonResponse({ status: 'ok', timestamp: Date.now() });
+      // Health check (no rate limit). Handled here, outside the rate-limit
+      // block, so the exemption above actually reaches a handler.
+      if (path === '/health' || path === '/api/health') {
+        const mem = process.memoryUsage();
+        return jsonResponse({
+          status: 'ok',
+          timestamp: Date.now(),
+          memory: {
+            heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024),
+            heapTotalMB: Math.round(mem.heapTotal / 1024 / 1024),
+            rssMB: Math.round(mem.rss / 1024 / 1024),
+            externalMB: Math.round(mem.external / 1024 / 1024),
+          },
+        });
+      }
+
+      // Operational metrics for monitoring/scraping (no rate limit). In-memory
+      // service counters plus process memory; service is null when the API runs
+      // standalone without the daemon.
+      if (path === '/api/metrics') {
+        // Exposes internal counters + process memory. Rate-limit it (it was
+        // previously exempt), and require the admin token when configured;
+        // otherwise restrict to loopback so it isn't public.
+        const metricsRate = rateLimiter.isAllowed(getClientIp(req, socketIp, trustProxy));
+        if (!metricsRate.allowed) {
+          return errorResponse('Rate limit exceeded. Try again later.', 429);
+        }
+        const peer = (socketIp ?? '').replace(/^::ffff:/, '');
+        const isLoopback = peer === '::1' || peer.startsWith('127.');
+        const authed = ADMIN_TOKEN ? safeTokenEqual(extractToken(req, url), ADMIN_TOKEN) : isLoopback;
+        if (!authed) {
+          return errorResponse('Unauthorized', 401);
+        }
+        const mem = process.memoryUsage();
+        return jsonResponse({
+          timestamp: Date.now(),
+          service: config.getMetrics ? config.getMetrics() : null,
+          memory: {
+            heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024),
+            heapTotalMB: Math.round(mem.heapTotal / 1024 / 1024),
+            rssMB: Math.round(mem.rss / 1024 / 1024),
+            externalMB: Math.round(mem.external / 1024 / 1024),
+          },
+        });
       }
 
       return errorResponse('Not found', 404);
@@ -1036,19 +1167,20 @@ export function startApiServer(config: ApiConfig): { stop: () => void } {
   console.log(`API server running at http://${host}:${port}`);
   console.log(`Dashboard: http://${host}:${port}/dashboard`);
 
-  // Pre-warm the relay list cache after server is ready
+  // Pre-warm the precomputed read-model snapshots after server is ready, so
+  // the API serves them immediately rather than rebuilding on the first request.
   setTimeout(async () => {
     try {
-      const relays = await getRelayList(db);
-      responseCache.set('relays', relays, CACHE_TTL.RELAY_LIST);
-      console.log(`Cache pre-warmed with ${relays.length} relays`);
+      await refreshPrecomputed(db);
+      console.log(`Read-model snapshots pre-warmed (${precomputed?.relays.length ?? 0} relays)`);
     } catch (err) {
-      console.error('Failed to pre-warm cache:', err);
+      console.error('Failed to pre-warm snapshots:', err);
     }
   }, 2000);
 
   return {
     stop: () => server.stop(),
+    port: server.port ?? port,
   };
 }
 
@@ -1143,6 +1275,8 @@ async function getRelayList(db: DataStore): Promise<Array<{
   accessLevel: string;
   relayType: string;
   policy: string | null;
+  policyDiscrepancy: boolean;
+  topics: string[];
   countryCode: string | null;
   countryName: string | null;
   region: string | null;
@@ -1163,6 +1297,7 @@ async function getRelayList(db: DataStore): Promise<Array<{
     allLatestProbes,
     allProbes,
     nip66Stats,
+    nip66Signals,
     jurisdictions,
     operatorResolutions,
     scoreTrends,
@@ -1170,6 +1305,7 @@ async function getRelayList(db: DataStore): Promise<Array<{
     db.getAllLatestProbes(),
     db.getAllProbes(30),
     db.getAllNip66Stats(90),
+    db.getAllNip66PolicySignals(90),
     db.getAllJurisdictions(),
     db.getAllOperatorResolutions(),
     db.getAllScoreTrends(7),
@@ -1208,7 +1344,8 @@ async function getRelayList(db: DataStore): Promise<Array<{
     const accessibilityVal = accessibilityScore.overall;
 
     // Get policy - pass empty array for reports since we only have stats
-    const policy = classifyPolicy(latestProbe.nip11, latestProbe.relayType, []);
+    const signals = nip66Signals.get(url);
+    const policy = classifyPolicy(latestProbe.nip11, latestProbe.relayType, [], signals);
 
     // Calculate weighted observations for confidence
     const nip66MetricCount = nip66?.metricCount ?? 0;
@@ -1265,6 +1402,8 @@ async function getRelayList(db: DataStore): Promise<Array<{
       accessLevel: latestProbe.accessLevel ?? 'unknown',
       relayType: latestProbe.relayType ?? 'unknown',
       policy: policy.policy,
+      policyDiscrepancy: policy.observedConflict ?? false,
+      topics: signals?.topics ?? [],
       countryCode: jurisdiction?.countryCode ?? null,
       countryName: jurisdiction?.countryName ?? null,
       region: jurisdiction?.region ?? null,
@@ -1292,9 +1431,10 @@ async function getRelayList(db: DataStore): Promise<Array<{
  */
 async function getRelayDetails(db: DataStore, url: string): Promise<object | null> {
   // Fetch all data in parallel
-  const [probes, nip66Stats, reports, jurisdiction, history, trend, operatorResolutionCached] = await Promise.all([
+  const [probes, nip66Stats, nip66Signals, reports, jurisdiction, history, trend, operatorResolutionCached] = await Promise.all([
     db.getProbes(url, 30),
     db.getNip66Stats(url, 365),
+    db.getNip66PolicySignals(url),
     db.getReports(url, 90),
     db.getJurisdiction(url),
     db.getScoreHistory(url, 30),
@@ -1310,11 +1450,12 @@ async function getRelayDetails(db: DataStore, url: string): Promise<object | nul
   // WoT scores are refreshed daily by the service, so we just use cached data
   let operatorResolution: OperatorResolution | null = operatorResolutionCached;
   if (!operatorResolution && latestProbe.nip11?.pubkey) {
-    // Resolve operator on-demand with WoT lookup and cache it
+    // Resolve operator on-demand and cache it, but do NOT fetch WoT here: the
+    // 10s NIP-85 lookup must not sit on a user request path. WoT is populated
+    // by the daemon's background resolver and surfaced via the cached row.
     try {
       operatorResolution = await resolveOperator(url, latestProbe.nip11, {
-        fetchTrustScore: true,
-        nip85Timeout: 10000,
+        fetchTrustScore: false,
       });
       if (operatorResolution.operatorPubkey) {
         await db.storeOperatorResolution(operatorResolution);
@@ -1328,7 +1469,7 @@ async function getRelayDetails(db: DataStore, url: string): Promise<object | nul
   const score = computeCombinedReliabilityScore(probes, nip66Stats);
   const qualityScore = computeQualityScore(latestProbe.nip11, url, operatorResolution);
   const accessibilityScore = computeAccessibilityScore(latestProbe.nip11, jurisdiction?.countryCode);
-  const policy = classifyPolicy(latestProbe.nip11, latestProbe.relayType, reports);
+  const policy = classifyPolicy(latestProbe.nip11, latestProbe.relayType, reports, nip66Signals);
 
   // Calculate uptime from probe history
   const reachableProbesList = probes.filter(p => p.reachable);
@@ -1389,7 +1530,9 @@ async function getRelayDetails(db: DataStore, url: string): Promise<object | nul
       confidence: policy.confidence,
       reasons: policy.reasons,
       indicators: policy.indicators,
+      observedConflict: policy.observedConflict ?? false,
     },
+    topics: nip66Signals?.topics ?? [],
     operator: operatorResolution ? {
       pubkey: operatorResolution.operatorPubkey,
       verificationMethod: operatorResolution.verificationMethod,
@@ -1425,9 +1568,10 @@ async function getRelayDetails(db: DataStore, url: string): Promise<object | nul
  */
 async function getRelayAssertion(db: DataStore, url: string): Promise<UnsignedEvent | null> {
   // Fetch all data in parallel
-  const [probes, nip66Stats, reports, jurisdiction, operatorResolutionCached] = await Promise.all([
+  const [probes, nip66Stats, nip66Signals, reports, jurisdiction, operatorResolutionCached] = await Promise.all([
     db.getProbes(url, 30),
     db.getNip66Stats(url, 365),
+    db.getNip66PolicySignals(url),
     db.getReports(url, 90),
     db.getJurisdiction(url),
     db.getOperatorResolution(url),
@@ -1461,7 +1605,7 @@ async function getRelayAssertion(db: DataStore, url: string): Promise<UnsignedEv
     operatorResolution ?? undefined,
     qualityScore,
     accessibilityScore,
-    { reports, jurisdiction: jurisdiction ?? undefined }
+    { reports, jurisdiction: jurisdiction ?? undefined, nip66Signals }
   );
 
   return assertionToEvent(assertion);
@@ -1868,4 +2012,23 @@ async function computeNetworkStatsFromRelays(
     operatorTrust,
     dataAgeDays,
   };
+}
+
+/**
+ * Precompute the read-model snapshots (relay list, rankings, network stats per
+ * period) off the HTTP request path. The daemon calls this once per cycle so
+ * /api/relays, /api/rankings and /api/network/stats are served from memory
+ * instead of running the ~16s rebuild on a user request. Also mirrors into
+ * responseCache for any code paths that still read it.
+ */
+export async function refreshPrecomputed(db: DataStore): Promise<void> {
+  const relays = await getRelayList(db);
+  const rankings = await getRelayRankings(db);
+  const networkStats = new Map<string, object>();
+  for (const period of ALLOWED_PERIODS) {
+    networkStats.set(period, await computeNetworkStatsFromRelays(db, relays, parsePeriod(period)));
+  }
+  precomputed = { relays, rankings, networkStats, computedAt: Date.now() };
+  responseCache.set('relays', relays, CACHE_TTL.RELAY_LIST);
+  responseCache.set('rankings', rankings, CACHE_TTL.RELAY_LIST);
 }

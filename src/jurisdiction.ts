@@ -1,5 +1,6 @@
 import { promises as dns } from 'dns';
 import { normalizeRelayUrl } from './prober.js';
+import { isBlockedHost } from './net-guard.js';
 
 /**
  * Simple rate limiter for ip-api.com (45 requests per minute)
@@ -111,6 +112,12 @@ async function queryGeoIP(ip: string): Promise<{
   asOrg?: string;
   isHosting?: boolean;
 } | null> {
+  // Never send internal/private/loopback/metadata IPs to the external geo
+  // service (and they'd never geolocate usefully anyway).
+  if (isBlockedHost(ip)) {
+    return null;
+  }
+
   try {
     // Respect rate limit before making request
     await ipApiRateLimiter.acquire();

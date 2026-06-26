@@ -4,7 +4,8 @@
 export interface NIP11Info {
   name?: string;
   description?: string;
-  pubkey?: string;
+  pubkey?: string;      // administrative contact pubkey
+  self?: string;        // relay's own identity pubkey, independent of the admin (added upstream)
   contact?: string;
   supported_nips?: number[];
   software?: string;
@@ -36,6 +37,24 @@ export interface NIP11Info {
   }>;
   relay_countries?: string[];  // ISO 3166-1 alpha-2 country codes
   payments_url?: string;
+}
+
+/**
+ * Monitor-observed policy signals aggregated from NIP-66 kind 30166 events
+ * (the `R`, `k`, and `T` tags). Each boolean is the majority verdict across
+ * the latest metric from each active (non-stale) trusted monitor, or
+ * `undefined` when no monitor reported a vote on that key. These are observed
+ * facts, distinct from the relay's self-claimed NIP-11 `limitation` values.
+ */
+export interface Nip66PolicySignals {
+  monitorCount: number;        // active monitors contributing a latest metric
+  authRequired?: boolean;      // 'R' tag: auth / !auth
+  paymentRequired?: boolean;   // 'R' tag: payment / !payment
+  restrictedWrites?: boolean;  // 'R' tag: writes / !writes
+  powRequired?: boolean;       // 'R' tag: pow / !pow
+  kindRestrictions?: boolean;  // 'k' tag: majority observed rejected kinds
+  relayType?: string;          // 'T' tag: majority PascalCase relay type
+  topics?: string[];           // 't' tag: distinct topics observed across monitors
 }
 
 /**
@@ -190,6 +209,10 @@ export interface OperatorResolution {
   nip11Pubkey?: string;
   dnsPubkey?: string;
   wellknownPubkey?: string;
+  // Relay's own identity pubkey from NIP-11 `self`. This is the relay's
+  // signing key, NOT the operator — kept separate so it is never conflated
+  // with operator verification.
+  relayIdentityPubkey?: string;
   // Corroboration tracking
   corroboratedSources?: VerificationMethod[];  // Which sources agreed on the pubkey
   sourcesDisagree?: boolean;  // True if sources provided conflicting pubkeys
@@ -219,6 +242,9 @@ export interface RelayAssertion {
   operatorTrust?: number;  // WoT trust score from NIP-85 assertions
   policy?: RelayPolicy;
   policyConfidence?: number;  // Confidence in policy classification
+  // True when monitor-observed behavior (NIP-66) contradicted the relay's
+  // self-claimed NIP-11 limitation; the observation won for classification.
+  policyDiscrepancy?: boolean;
   relayType?: RelayType;
   algorithm: string;
   algorithmUrl?: string;

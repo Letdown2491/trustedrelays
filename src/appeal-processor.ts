@@ -222,7 +222,7 @@ async function queryRelayForAppeals(
 ): Promise<RelayAppeal[]> {
   return new Promise((resolve) => {
     const appeals: RelayAppeal[] = [];
-    const ws = new WebSocket(sourceRelay);
+    const ws = new WebSocket(sourceRelay, { maxPayload: 512 * 1024 });
     const subId = `appeal-${crypto.randomUUID()}`;
 
     const timeoutId = setTimeout(() => {

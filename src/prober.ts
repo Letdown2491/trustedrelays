@@ -1,4 +1,5 @@
 import { WebSocket } from 'ws';
+import { isBlockedHost, resolvesToSafeHost } from './net-guard.js';
 import type { NIP11Info, ProbeResult, RelayType, AccessLevel } from './types.js';
 
 /**
@@ -154,7 +155,7 @@ async function fetchNIP11(relayUrl: string, timeout = 5000): Promise<{ info: NIP
 /**
  * Read a response body as text, aborting once a byte cap is exceeded.
  */
-async function readCapped(response: Response, maxBytes: number): Promise<string> {
+export async function readCapped(response: Response, maxBytes: number): Promise<string> {
   const body = response.body;
   if (!body) return await response.text();
 
@@ -209,7 +210,7 @@ async function testWebSocketGeneral(
     let readStart: number | undefined;
     let settled = false;
 
-    const ws = new WebSocket(relayUrl);
+    const ws = new WebSocket(relayUrl, { maxPayload: 512 * 1024 });
     const timeoutId = setTimeout(() => fail(new Error('Connection timeout')), timeout);
 
     // Single teardown path used by every resolve/reject branch so we never leak
@@ -219,6 +220,11 @@ async function testWebSocketGeneral(
       settled = true;
       clearTimeout(timeoutId);
       ws.removeAllListeners();
+      // terminate() on a still-CONNECTING socket makes ws emit an async 'error'
+      // ("closed before the connection is established"); the try/catch only
+      // catches sync throws, so keep a no-op error handler or that late event
+      // crashes the process (ws throws on unhandled 'error').
+      ws.on('error', () => {});
       try { ws.terminate(); } catch { /* already closed */ }
       reject(err);
     };
@@ -298,7 +304,7 @@ async function testWebSocketSpecialized(
     const start = performance.now();
     let settled = false;
 
-    const ws = new WebSocket(relayUrl);
+    const ws = new WebSocket(relayUrl, { maxPayload: 512 * 1024 });
     const timeoutId = setTimeout(() => fail(new Error('Connection timeout')), timeout);
 
     const fail = (err: Error) => {
@@ -306,6 +312,9 @@ async function testWebSocketSpecialized(
       settled = true;
       clearTimeout(timeoutId);
       ws.removeAllListeners();
+      // See testWebSocket.fail: keep a no-op error handler so the async 'error'
+      // emitted by terminate() on a CONNECTING socket doesn't crash the process.
+      ws.on('error', () => {});
       try { ws.terminate(); } catch { /* already closed */ }
       reject(err);
     };
@@ -343,6 +352,26 @@ export async function probeRelay(relayUrl: string): Promise<ProbeResult> {
     reachable: false,
     relayType: 'unknown',
   };
+
+  // SSRF guard: relay URLs originate from untrusted Nostr events. Refuse to
+  // probe loopback/private/link-local/metadata hosts before any outbound
+  // HTTP (NIP-11) or WebSocket connection. This is the single chokepoint for
+  // the probe pipeline.
+  let probeHost = '';
+  try { probeHost = new URL(url).hostname; } catch { /* malformed handled below */ }
+  if (!probeHost || isBlockedHost(probeHost)) {
+    result.error = 'blocked or invalid host';
+    result.accessLevel = 'unknown';
+    return result;
+  }
+  // DNS-rebinding mitigation: a public name could resolve to a private/metadata
+  // IP. Verify resolved addresses are public before any fetch/WebSocket. Skip
+  // for Tor (.onion is not DNS-resolvable and can't reach an internal host).
+  if (!isTor && !(await resolvesToSafeHost(probeHost))) {
+    result.error = 'host resolves to a blocked or unresolvable address';
+    result.accessLevel = 'unknown';
+    return result;
+  }
 
   // Fetch NIP-11 first (needed to detect relay type)
   try {
@@ -383,11 +412,4 @@ export async function probeRelay(relayUrl: string): Promise<ProbeResult> {
   }
 
   return result;
-}
-
-/**
- * Probe multiple relays
- */
-export async function probeRelays(relayUrls: string[]): Promise<ProbeResult[]> {
-  return Promise.all(relayUrls.map(probeRelay));
 }

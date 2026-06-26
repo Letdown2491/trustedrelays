@@ -226,6 +226,12 @@ tr.clickable { cursor: pointer; }
   font-size: 11px;
   cursor: help;
 }
+.policy-discrepancy {
+  color: var(--orange);
+  font-size: 11px;
+  cursor: help;
+  margin-left: 4px;
+}
 .score-val {
   font-variant-numeric: tabular-nums;
   font-size: 13px;
@@ -297,6 +303,15 @@ tr.clickable { cursor: pointer; }
 .tag-moderated { background: rgba(100, 130, 160, 0.15); color: #a8bcd0; }
 .tag-curated { background: rgba(140, 120, 160, 0.15); color: #baa8c8; }
 .tag-specialized { background: rgba(100, 130, 160, 0.15); color: #a8bcd0; }
+.topic-chips { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.topic-chip {
+  display: inline-block;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  background: rgba(120, 130, 150, 0.15);
+  color: var(--text-secondary);
+}
 .conf-badge {
   font-size: 10px;
   font-weight: 500;

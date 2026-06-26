@@ -1,6 +1,6 @@
 {
   "name": "trustedrelays",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Nostr Trusted Relay Assertion Provider",
   "license": "MIT",
   "type": "module",
@@ -10,7 +10,6 @@
     "test": "bun test"
   },
   "dependencies": {
-    "duckdb-async": "^1.4.2",
     "nostr-tools": "^2.10.4",
     "ws": "^8.18.0"
   },

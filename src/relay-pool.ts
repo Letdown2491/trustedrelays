@@ -84,7 +84,7 @@ class RelayConnection {
 
     return new Promise((resolve, reject) => {
       try {
-        this.ws = new WebSocket(this.url);
+        this.ws = new WebSocket(this.url, { maxPayload: 512 * 1024 });
 
         const connectTimeout = setTimeout(() => {
           if (!this.connected) {

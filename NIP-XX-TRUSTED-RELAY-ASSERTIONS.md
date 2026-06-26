@@ -95,6 +95,7 @@ A parameterized replaceable event with `d` tag containing the relay's canonical 
 |-----|--------|-------------|
 | `policy` | string | `open`, `moderated`, `curated`, or `specialized` |
 | `policy_confidence` | 0-100 | Confidence in policy classification |
+| `policy_discrepancy` | `true` | Present only when monitor-observed behavior (NIP-66) contradicted the relay's self-claimed NIP-11 limitation; the observation was used for classification |
 
 ### Jurisdiction Tags
 

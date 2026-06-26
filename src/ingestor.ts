@@ -34,6 +34,12 @@ export interface ParsedNip66Metric {
   network?: string;
   supportedNips?: number[];
   geohash?: string;
+  // NIP-66 tags added upstream after the initial implementation:
+  relayType?: string;          // 'T' tag: PascalCase relay type, e.g. "PrivateInbox"
+  requirements?: string[];     // 'R' tag: NIP-11 limitation keys, '!'-prefixed when false (e.g. "auth", "!payment")
+  topics?: string[];           // 't' tag: relay topics
+  acceptedKinds?: number[];    // 'k' tag: kinds the relay accepts
+  rejectedKinds?: number[];    // 'k' tag: kinds the relay rejects ('!'-prefixed upstream)
 }
 
 /**
@@ -56,6 +62,15 @@ const RTT_MAX = 60000;
 const NIP_MIN = 1;
 const NIP_MAX = 65535;
 
+// Event kind bounds: 0 to 65535 (NIP-01 range)
+const KIND_MIN = 0;
+const KIND_MAX = 65535;
+
+// Defensive caps on a single event's tag fan-out (the 512KB WebSocket frame
+// cap already bounds total size; these bound per-field memory/array growth).
+const MAX_TAGS = 1000;
+const MAX_ARRAY_VALUES = 256;
+
 /**
  * Parse a NIP-66 kind 30166 event into a structured metric
  */
@@ -75,8 +90,9 @@ export function parseNip66Event(event: Event): ParsedNip66Metric | null {
     timestamp: event.created_at,
   };
 
-  // Parse RTT tags with bounds validation
-  for (const tag of event.tags) {
+  // Parse RTT tags with bounds validation (cap the number of tags processed).
+  const tags = event.tags.length > MAX_TAGS ? event.tags.slice(0, MAX_TAGS) : event.tags;
+  for (const tag of tags) {
     switch (tag[0]) {
       case 'rtt-open':
         metric.rttOpen = parseBoundedInt(tag[1], RTT_MIN, RTT_MAX);
@@ -102,8 +118,53 @@ export function parseNip66Event(event: Event): ParsedNip66Metric | null {
       case 'g':
         metric.geohash = tag[1];
         break;
+      case 'T':
+        // Relay type (PascalCase). Single value; last non-empty wins.
+        if (tag[1]) metric.relayType = tag[1];
+        break;
+      case 'R':
+        // Requirements mirroring NIP-11 limitations (auth/writes/pow/payment),
+        // negated with a '!' prefix. Repeated per the spec; also tolerate
+        // comma-separated for robustness. Raw tokens are preserved.
+        if (tag[1]) {
+          if (!metric.requirements) metric.requirements = [];
+          metric.requirements.push(
+            ...tag[1].split(',').map((r) => r.trim()).filter((r) => r.length > 0)
+          );
+        }
+        break;
+      case 't':
+        // Relay topic. One topic per tag.
+        if (tag[1]) {
+          if (!metric.topics) metric.topics = [];
+          metric.topics.push(tag[1].trim());
+        }
+        break;
+      case 'k': {
+        // Accepted/unaccepted kinds; unaccepted are '!'-prefixed.
+        if (!tag[1]) break;
+        for (const raw of tag[1].split(',').map((k) => k.trim())) {
+          if (!raw) continue;
+          const rejected = raw.startsWith('!');
+          const kind = parseBoundedInt(rejected ? raw.slice(1) : raw, KIND_MIN, KIND_MAX);
+          if (kind === undefined) continue;
+          if (rejected) {
+            (metric.rejectedKinds ??= []).push(kind);
+          } else {
+            (metric.acceptedKinds ??= []).push(kind);
+          }
+        }
+        break;
+      }
     }
   }
+
+  // Cap each parsed array so a hostile/buggy event can't bloat memory or the DB.
+  if (metric.supportedNips && metric.supportedNips.length > MAX_ARRAY_VALUES) metric.supportedNips.length = MAX_ARRAY_VALUES;
+  if (metric.requirements && metric.requirements.length > MAX_ARRAY_VALUES) metric.requirements.length = MAX_ARRAY_VALUES;
+  if (metric.topics && metric.topics.length > MAX_ARRAY_VALUES) metric.topics.length = MAX_ARRAY_VALUES;
+  if (metric.acceptedKinds && metric.acceptedKinds.length > MAX_ARRAY_VALUES) metric.acceptedKinds.length = MAX_ARRAY_VALUES;
+  if (metric.rejectedKinds && metric.rejectedKinds.length > MAX_ARRAY_VALUES) metric.rejectedKinds.length = MAX_ARRAY_VALUES;
 
   return metric;
 }
@@ -120,6 +181,11 @@ export class MonitorIngestor {
   private eventCount = 0;
   private trustedSet: Set<string>;
   private verbose: boolean;
+  // Monitor stats (last_seen/event_count) are approximate and were written
+  // once per ingested event. Buffer them and flush periodically to avoid a
+  // second DB write per event during reconnect bursts (P-M2).
+  private monitorStatBuffer: Map<string, { count: number; lastSeen: number }> = new Map();
+  private statsFlushTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: MonitorIngestorConfig) {
     this.config = config;
@@ -143,8 +209,24 @@ export class MonitorIngestor {
       }
     }
 
+    // Periodically flush buffered monitor stats (every 15s).
+    this.statsFlushTimer = setInterval(() => { void this.flushMonitorStats(); }, 15000);
+    this.statsFlushTimer.unref?.();
+
     for (const relayUrl of this.config.sourceRelays) {
       this.connectToRelay(relayUrl);
+    }
+  }
+
+  /** Drain the buffered monitor-stat counters into the DB in one batch. */
+  private async flushMonitorStats(): Promise<void> {
+    if (this.monitorStatBuffer.size === 0) return;
+    const batch = this.monitorStatBuffer;
+    this.monitorStatBuffer = new Map();
+    try {
+      await this.config.db.flushMonitorStats(batch);
+    } catch (err) {
+      if (this.verbose) console.error('Failed to flush monitor stats:', err);
     }
   }
 
@@ -153,6 +235,13 @@ export class MonitorIngestor {
    */
   stop(): void {
     this.running = false;
+
+    if (this.statsFlushTimer) {
+      clearInterval(this.statsFlushTimer);
+      this.statsFlushTimer = null;
+    }
+    // Best-effort final flush of buffered monitor stats.
+    void this.flushMonitorStats();
 
     for (const [url, ws] of this.connections) {
       const subId = this.subscriptionIds.get(url);
@@ -173,7 +262,7 @@ export class MonitorIngestor {
     const url = normalizeRelayUrl(relayUrl);
     if (this.verbose) console.log(`Connecting to ${url}...`);
 
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(url, { maxPayload: 512 * 1024 });
 
     ws.on('open', () => {
       if (this.verbose) console.log(`Connected to ${url}`);
@@ -264,7 +353,12 @@ export class MonitorIngestor {
     // Store in database
     try {
       await this.config.db.storeNip66Metric(metric);
-      await this.config.db.updateMonitorStats(event.pubkey);
+      // Buffer the monitor-stat update (flushed periodically) instead of a
+      // second synchronous write per event.
+      const existing = this.monitorStatBuffer.get(event.pubkey);
+      const now = Math.floor(Date.now() / 1000);
+      if (existing) { existing.count++; existing.lastSeen = now; }
+      else this.monitorStatBuffer.set(event.pubkey, { count: 1, lastSeen: now });
       this.eventCount++;
 
       // Call callback if provided
@@ -299,7 +393,7 @@ export async function discoverMonitors(
 ): Promise<Array<{ pubkey: string; frequency?: number }>> {
   return new Promise((resolve, reject) => {
     const monitors: Array<{ pubkey: string; frequency?: number }> = [];
-    const ws = new WebSocket(normalizeRelayUrl(relayUrl));
+    const ws = new WebSocket(normalizeRelayUrl(relayUrl), { maxPayload: 512 * 1024 });
     const subId = `discover-${crypto.randomUUID()}`;
 
     const timeoutId = setTimeout(() => {
@@ -317,6 +411,13 @@ export async function discoverMonitors(
         const msg = JSON.parse(data.toString());
         if (msg[0] === 'EVENT' && msg[2]?.kind === 10166) {
           const event = msg[2] as Event;
+          // Verify the signature before trusting the announced pubkey — without
+          // this, anyone can forge a kind-10166 for an arbitrary pubkey and get
+          // it enrolled as a "monitor" whose metrics feed relay scoring.
+          // (Malformed events make verifyEvent throw → caught below → skipped.)
+          if (!verifyEvent(event)) {
+            return;
+          }
           const freqTag = event.tags.find((t) => t[0] === 'frequency');
           monitors.push({
             pubkey: event.pubkey,

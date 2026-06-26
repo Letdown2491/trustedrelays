@@ -16,5 +16,15 @@
     "port": 3000,
     "host": "0.0.0.0",
     "trustProxy": false
+  },
+  "database": {
+    "path": "./data/trustedrelays.sqlite",
+    "retentionDays": 90,
+    "probeRetentionDays": 45,
+    "nip66RetentionDays": 45
+  },
+  "sources": {
+    "minMonitorSources": 2,
+    "maxMonitors": 200
   }
 }

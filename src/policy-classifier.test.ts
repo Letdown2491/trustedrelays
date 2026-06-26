@@ -89,6 +89,49 @@ describe('classifyPolicy', () => {
   });
 });
 
+describe('classifyPolicy with NIP-66 observed signals', () => {
+  test('observed auth overrides an open NIP-11 claim and flags conflict', () => {
+    const nip11: NIP11Info = { limitation: { auth_required: false } };
+    const result = classifyPolicy(nip11, undefined, undefined, {
+      monitorCount: 3,
+      authRequired: true,
+    });
+    expect(result.indicators.authRequired).toBe(true);
+    expect(result.policy).toBe('curated');
+    expect(result.observedConflict).toBe(true);
+  });
+
+  test('observed signal that agrees raises confidence (corroboration)', () => {
+    const nip11: NIP11Info = { limitation: { auth_required: true } };
+    const claimedOnly = classifyPolicy(nip11);
+    const corroborated = classifyPolicy(nip11, undefined, undefined, {
+      monitorCount: 5,
+      authRequired: true,
+    });
+    expect(corroborated.confidence).toBeGreaterThan(claimedOnly.confidence);
+    expect(corroborated.observedConflict).toBe(false);
+  });
+
+  test('observed kind restrictions populate the kindRestrictions indicator', () => {
+    const nip11: NIP11Info = { name: 'Test Relay', limitation: {} };
+    const result = classifyPolicy(nip11, undefined, undefined, {
+      monitorCount: 2,
+      kindRestrictions: true,
+    });
+    expect(result.indicators.kindRestrictions).toBe(true);
+    expect(result.policy).toBe('moderated');
+  });
+
+  test('undefined observed keys leave the claimed classification untouched', () => {
+    const nip11: NIP11Info = { limitation: { auth_required: true } };
+    const baseline = classifyPolicy(nip11);
+    const withEmpty = classifyPolicy(nip11, undefined, undefined, { monitorCount: 0 });
+    expect(withEmpty.policy).toBe(baseline.policy);
+    expect(withEmpty.confidence).toBe(baseline.confidence);
+    expect(withEmpty.observedConflict).toBe(false);
+  });
+});
+
 describe('isPaidRelay', () => {
   test('returns false for undefined NIP-11', () => {
     expect(isPaidRelay(undefined)).toBe(false);

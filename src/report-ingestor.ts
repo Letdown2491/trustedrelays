@@ -225,7 +225,7 @@ export class ReportIngestor {
   }
 
   private connectToRelay(relayUrl: string): void {
-    const ws = new WebSocket(relayUrl);
+    const ws = new WebSocket(relayUrl, { maxPayload: 512 * 1024 });
     this.sockets.set(relayUrl, ws);
 
     const subId = `reports-${crypto.randomUUID()}`;
@@ -401,7 +401,7 @@ async function queryRelayForReports(
 ): Promise<RelayReport[]> {
   return new Promise((resolve) => {
     const reports: RelayReport[] = [];
-    const ws = new WebSocket(sourceRelay);
+    const ws = new WebSocket(sourceRelay, { maxPayload: 512 * 1024 });
     const subId = `rpt-${crypto.randomUUID()}`;
 
     const timeoutId = setTimeout(() => {

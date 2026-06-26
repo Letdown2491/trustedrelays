@@ -13,7 +13,7 @@ import { MonitorIngestor, discoverMonitors } from './ingestor.js';
 import { ReportIngestor } from './report-ingestor.js';
 import { AssertionPublisher } from './assertion-publisher.js';
 import { normalizePrivateKey } from './key-utils.js';
-import { startApiServer } from './api.js';
+import { startApiServer, refreshPrecomputed } from './api.js';
 import { RelayPool } from './relay-pool.js';
 import { getTrustScore } from './wot-client.js';
 import type { OperatorResolution } from './types.js';
@@ -43,6 +43,31 @@ export interface ServiceStats {
  * - Report ingestion
  * - Score computation and publishing
  */
+
+/**
+ * Run `worker` over `items` with at most `concurrency` in flight at once, using
+ * a continuous pool (each finished worker grabs the next item) rather than
+ * fixed batches — so one slow item never idles the other slots. Stops pulling
+ * new items when `shouldStop()` returns true. Individual worker errors must be
+ * handled by the worker; an unhandled throw aborts the pool.
+ */
+async function runPool<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>,
+  shouldStop: () => boolean = () => false
+): Promise<void> {
+  let next = 0;
+  const run = async (): Promise<void> => {
+    while (!shouldStop() && next < items.length) {
+      const i = next++;
+      await worker(items[i]);
+    }
+  };
+  const workers = Math.max(1, Math.min(concurrency, items.length));
+  await Promise.all(Array.from({ length: workers }, run));
+}
+
 export class RelayTrustService {
   private config: ServiceConfig;
   private db: DataStore;
@@ -144,6 +169,7 @@ export class RelayTrustService {
         db: this.db,
         trustProxy: this.config.api.trustProxy ?? false,
         maxRequestedRelays: this.config.targets?.maxRelays,
+        getMetrics: () => this.getMetrics(),
       });
       this.log('info', `API server started at http://${this.config.api.host}:${this.config.api.port}`);
     }
@@ -269,6 +295,38 @@ export class RelayTrustService {
   }
 
   /**
+   * Operational metrics snapshot for the /api/metrics endpoint. In-memory
+   * counters only (no DB queries), safe to scrape frequently.
+   */
+  getMetrics(): object {
+    const now = Date.now();
+    const probeTotal = this.stats.probeCount + this.stats.probeErrorCount;
+    return {
+      running: this.running,
+      uptimeSeconds: this.stats.startedAt ? Math.floor((now - this.stats.startedAt) / 1000) : 0,
+      relaysTracked: this.stats.relaysTracked,
+      probe: {
+        success: this.stats.probeCount,
+        errors: this.stats.probeErrorCount,
+        successRate: probeTotal > 0 ? Math.round((this.stats.probeCount / probeTotal) * 100) : null,
+        lastAt: this.stats.lastProbeAt,
+        ageSeconds: this.stats.lastProbeAt ? Math.floor((now - this.stats.lastProbeAt) / 1000) : null,
+      },
+      publish: {
+        published: this.stats.publishCount,
+        skipped: this.stats.publishSkipCount,
+        lastAt: this.stats.lastPublishAt,
+        ageSeconds: this.stats.lastPublishAt ? Math.floor((now - this.stats.lastPublishAt) / 1000) : null,
+      },
+      ingest: {
+        nip66Events: this.monitorIngestor?.getEventCount() ?? 0,
+        nip66Connections: this.monitorIngestor?.getConnectionCount() ?? 0,
+        reports: this.reportIngestor?.getReportCount() ?? 0,
+      },
+    };
+  }
+
+  /**
    * Check if service is healthy
    */
   isHealthy(): boolean {
@@ -288,7 +346,11 @@ export class RelayTrustService {
    * Prioritizes relay.nostr.watch as the primary source for monitor announcements
    */
   private async discoverMonitors(): Promise<void> {
-    const allMonitors: string[] = [];
+    // Track which source relays announced each monitor pubkey, so we can require
+    // cross-source corroboration before auto-trusting a NEW monitor (Sybil
+    // resistance — a kind-10166 is a public event anyone can sign, so a single
+    // appearance is not sufficient evidence of a legitimate monitor).
+    const monitorSources = new Map<string, Set<string>>();
 
     // Prioritize relay.nostr.watch for monitor discovery
     const priorityRelays = this.config.sources.sourceRelays.filter(r =>
@@ -303,10 +365,9 @@ export class RelayTrustService {
       try {
         const monitors = await discoverMonitors(relay, 10000);
         for (const m of monitors) {
-          if (!allMonitors.includes(m.pubkey)) {
-            allMonitors.push(m.pubkey);
-            this.log('debug', `Discovered monitor ${m.pubkey.slice(0, 8)}... from ${relay}`);
-          }
+          let sources = monitorSources.get(m.pubkey);
+          if (!sources) { sources = new Set(); monitorSources.set(m.pubkey, sources); }
+          sources.add(relay);
         }
         if (monitors.length > 0) {
           this.log('info', `Discovered ${monitors.length} monitors from ${relay}`);
@@ -316,13 +377,28 @@ export class RelayTrustService {
       }
     }
 
-    // Add discovered monitors to trusted list
-    for (const pubkey of allMonitors) {
+    const minSources = this.config.sources.minMonitorSources ?? 2;
+    const maxMonitors = this.config.sources.maxMonitors ?? 200;
+    const configTrusted = new Set(this.config.sources.trustedMonitors ?? []);
+    // Already-trusted monitors are kept (never dropped here); corroboration +
+    // cap only gate ENROLLING new ones.
+    const existing = new Set((await this.db.getTrustedMonitors()).map(m => m.pubkey));
+
+    let trustedCount = existing.size;
+    let added = 0, skippedUncorroborated = 0, skippedCap = 0;
+    for (const [pubkey, sources] of monitorSources) {
+      if (existing.has(pubkey)) continue;
+      const corroborated = sources.size >= minSources || configTrusted.has(pubkey);
+      if (!corroborated) { skippedUncorroborated++; continue; }
+      if (trustedCount >= maxMonitors) { skippedCap++; continue; }
       await this.db.addTrustedMonitor(pubkey);
+      trustedCount++; added++;
     }
 
-    const totalMonitors = await this.db.getTrustedMonitors();
-    this.log('info', `Total trusted monitors: ${totalMonitors.length} (${allMonitors.length} newly discovered)`);
+    this.log('info',
+      `Monitor discovery: ${added} newly trusted (≥${minSources} sources), ` +
+      `${skippedUncorroborated} uncorroborated skipped, ${skippedCap} over cap (${maxMonitors}). ` +
+      `Total trusted: ${trustedCount}`);
   }
 
   /**
@@ -395,6 +471,18 @@ export class RelayTrustService {
       await this.cleanupOldData();
     }
 
+    // Refresh the API read-model snapshots off the request path, using the
+    // fresh probe/score data from this cycle. A failure here must not abort the
+    // cycle.
+    if (this.config.api?.enabled) {
+      try {
+        await refreshPrecomputed(this.db);
+        this.log('debug', 'Refreshed API read-model snapshots');
+      } catch (err) {
+        this.log('warn', `Failed to refresh API snapshots: ${err}`);
+      }
+    }
+
     this.logMemoryUsage();
     this.log('info', 'Cycle complete');
   }
@@ -403,11 +491,18 @@ export class RelayTrustService {
    * Clean up old data from the database
    */
   private async cleanupOldData(): Promise<void> {
-    const retentionDays = this.config.database.retentionDays;
-    this.log('info', `Cleaning up data older than ${retentionDays} days...`);
+    const { retentionDays, probeRetentionDays, nip66RetentionDays } = this.config.database;
+    const probeDays = probeRetentionDays ?? 45;
+    const nip66Days = nip66RetentionDays ?? 45;
+    this.log('info', `Cleaning up data (score_history/reports ${retentionDays}d, probes ${probeDays}d, nip66 ${nip66Days}d)...`);
 
     try {
-      const result = await this.db.cleanupOldData(retentionDays);
+      const result = await this.db.cleanupOldData({
+        scoreHistoryDays: retentionDays,
+        reportDays: retentionDays,
+        probeDays,
+        nip66Days,
+      });
       const total = result.probes + result.nip66Metrics + result.reports + result.scoreHistory;
 
       if (total > 0) {
@@ -426,9 +521,9 @@ export class RelayTrustService {
   }
 
   /**
-   * Checkpoint the database WAL to prevent stale WAL issues.
-   * DuckDB can hang or OOM if there's a large uncommitted WAL file.
-   * Uses FORCE CHECKPOINT to push through even with active readers.
+   * Checkpoint the database WAL to keep it from growing unbounded.
+   * Uses a TRUNCATE checkpoint to fold committed pages into the main DB file
+   * and reset the WAL.
    *
    * WAL size threshold: 100MB - if exceeded after checkpoint, logs a warning.
    */
@@ -513,8 +608,16 @@ export class RelayTrustService {
         if (probe.reachable) {
           successCount++;
 
-          // Resolve and store operator if NIP-11 has pubkey
-          if (probe.nip11?.pubkey) {
+          // Resolve and store operator if NIP-11 has pubkey. TTL-gate it: the
+          // DNS-TXT + well-known fetch are expensive per-relay-per-cycle, and
+          // operator pubkeys rarely change. Skip if we resolved this relay in
+          // the last 7 days (WoT freshness is handled separately by
+          // refreshStaleWotScoresStandalone()).
+          const existingResolution = probe.nip11?.pubkey ? await this.db.getOperatorResolution(url) : null;
+          const resolveTtl = 7 * 86400;
+          const resolutionFresh = !!existingResolution?.verifiedAt &&
+            existingResolution.verifiedAt > (Math.floor(Date.now() / 1000) - resolveTtl);
+          if (probe.nip11?.pubkey && !resolutionFresh) {
             try {
               // First resolve operator WITHOUT fetching WoT
               const operatorResolution = await resolveOperator(url, probe.nip11, {
@@ -580,24 +683,16 @@ export class RelayTrustService {
       }
 
       completed++;
+      if (completed % concurrency === 0 || completed === relays.length) {
+        const progress = Math.round((completed / relays.length) * 100);
+        this.log('info', `Probe progress: ${completed}/${relays.length} (${progress}%)`);
+      }
     };
 
-    // Process in batches with concurrency limit
-    for (let i = 0; i < relays.length; i += concurrency) {
-      if (!this.running) break;
-
-      const batch = relays.slice(i, i + concurrency);
-      await Promise.all(batch.map(processRelay));
-
-      // Progress update every batch
-      const progress = Math.round((completed / relays.length) * 100);
-      this.log('info', `Probe progress: ${completed}/${relays.length} (${progress}%)`);
-
-      // Small delay between batches
-      if (i + concurrency < relays.length) {
-        await sleep(200);
-      }
-    }
+    // Continuous worker pool: `concurrency` workers drain a shared queue, so a
+    // slow/dead relay only ties up its own worker (no fixed-batch head-of-line
+    // blocking where one relay idles the rest of the slots).
+    await runPool(relays, concurrency, processRelay, () => !this.running);
 
     this.stats.lastProbeAt = Date.now();
     this.log('info', `Probe cycle complete: ${successCount} success, ${errorCount} failed`);
@@ -621,17 +716,23 @@ export class RelayTrustService {
     const [
       allLatestProbes,
       allProbeStats,
+      allProbes,
       allNip66Stats,
+      allNip66Signals,
       allJurisdictions,
       allOperatorResolutions,
       allReportStats,
+      allReports,
     ] = await Promise.all([
       this.db.getAllLatestProbes(),
       this.db.getAllProbeStats(30),
+      this.db.getAllProbes(30),
       this.db.getAllNip66Stats(90),
+      this.db.getAllNip66PolicySignals(90),
       this.db.getAllJurisdictions(),
       this.db.getAllOperatorResolutions(),
       this.db.getAllReportStats(90),
+      this.db.getAllReports(90),
     ]);
 
     // Note: WoT scores are refreshed in runCycle() before this method is called
@@ -655,9 +756,8 @@ export class RelayTrustService {
           continue;
         }
 
-        // For reliability scoring, we still need individual probes
-        // This could be further optimized with a bulk probe history fetch
-        const probes = await this.db.getProbes(url, 30);
+        // Individual probes for reliability scoring, from the bulk pre-fetch.
+        const probes = allProbes.get(url) ?? (latestProbe ? [latestProbe] : []);
 
         // Use cached operator resolution or resolve fresh
         let operatorResolution = allOperatorResolutions.get(url);
@@ -702,9 +802,9 @@ export class RelayTrustService {
           await this.db.storeJurisdiction(jurisdiction);
         }
 
-        // Use pre-fetched report stats (we only need aggregates for scoring)
+        // Use pre-fetched report stats + reports (bulk, no per-relay query)
         const reportStats = allReportStats.get(url);
-        const reports = reportStats ? await this.db.getReports(url, 90) : [];
+        const reports = reportStats ? (allReports.get(url) ?? []) : [];
 
         // Compute scores using pre-fetched NIP-66 stats
         const nip66StatsForScoring = nip66Stats ? {
@@ -724,6 +824,7 @@ export class RelayTrustService {
         const score = computeCombinedReliabilityScore(probes, nip66StatsForScoring);
         const qualityScore = computeQualityScore(latestProbe?.nip11, url, operatorResolution);
         const accessibilityScore = computeAccessibilityScore(latestProbe?.nip11, jurisdiction?.countryCode);
+        const nip66Signals = allNip66Signals.get(url);
 
         // Build assertion
         const assertion = buildAssertion(
@@ -736,6 +837,7 @@ export class RelayTrustService {
           {
             reports,
             jurisdiction,
+            nip66Signals,
             algorithmVersion: this.config.provider.algorithmVersion,
             algorithmUrl: this.config.provider.algorithmUrl,
           }
@@ -833,50 +935,34 @@ export class RelayTrustService {
 
     let refreshed = 0;
     let failed = 0;
-    const concurrency = 20; // Process 20 pubkeys in parallel
+    let done = 0;
+    const concurrency = 20;
 
-    // Process in batches for parallel lookups
-    for (let i = 0; i < stalePubkeys.length; i += concurrency) {
-      const batch = stalePubkeys.slice(i, i + concurrency);
-
-      const results = await Promise.allSettled(
-        batch.map(async (pubkey) => {
-          const trustScore = await getTrustScore(pubkey, { timeout: 10000 });
-
-          // Store WoT score directly in operators table
-          if (trustScore) {
-            await this.db.storeOperatorWot(
-              pubkey,
-              trustScore.score,
-              trustScore.confidence,
-              trustScore.providers.length
-            );
-          } else {
-            // Store with null score but updated timestamp to avoid re-fetching
-            await this.db.storeOperatorWot(pubkey, 0, null, 0);
-          }
-          return true;
-        })
-      );
-
-      for (const result of results) {
-        if (result.status === 'fulfilled') {
-          refreshed++;
+    // Continuous pool (no fixed-batch head-of-line blocking on a slow NIP-85
+    // lookup). Each worker handles its own errors so the pool isn't aborted.
+    await runPool(stalePubkeys, concurrency, async (pubkey) => {
+      try {
+        const trustScore = await getTrustScore(pubkey, { timeout: 10000 });
+        if (trustScore) {
+          await this.db.storeOperatorWot(
+            pubkey,
+            trustScore.score,
+            trustScore.confidence,
+            trustScore.providers.length
+          );
         } else {
-          failed++;
+          // Store with null score but updated timestamp to avoid re-fetching
+          await this.db.storeOperatorWot(pubkey, 0, null, 0);
         }
+        refreshed++;
+      } catch {
+        failed++;
       }
-
-      // Progress logging every 100 operators
-      if ((i + concurrency) % 100 < concurrency && i + concurrency < stalePubkeys.length) {
-        this.log('info', `WoT refresh progress: ${Math.min(i + concurrency, stalePubkeys.length)}/${stalePubkeys.length}`);
+      done++;
+      if (done % 100 === 0 && done < stalePubkeys.length) {
+        this.log('info', `WoT refresh progress: ${done}/${stalePubkeys.length}`);
       }
-
-      // Small delay between batches to be nice to NIP-85 relays
-      if (i + concurrency < stalePubkeys.length) {
-        await sleep(500);
-      }
-    }
+    }, () => !this.running);
 
     this.log('info', `WoT refresh complete: ${refreshed} updated, ${failed} failed`);
   }

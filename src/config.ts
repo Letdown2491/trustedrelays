@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, chmodSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, chmodSync, statSync } from 'fs';
 import { isValidPrivateKey } from './key-utils.js';
 import { ALGORITHM_VERSION, ALGORITHM_URL } from './version.js';
 
@@ -27,8 +27,14 @@ export interface ServiceConfig {
   sources: {
     // Relays to query for NIP-66 and report data
     sourceRelays: string[];
-    // Trusted NIP-66 monitor pubkeys (empty = discover automatically)
+    // Trusted NIP-66 monitor pubkeys (always trusted; auto-discovery adds more,
+    // gated by cross-source corroboration + maxMonitors below).
     trustedMonitors: string[];
+    // Cap on total auto-trusted monitors (Sybil bound). Default 200.
+    maxMonitors?: number;
+    // Min distinct source relays that must announce a NOT-yet-trusted monitor
+    // before it is auto-trusted (Sybil corroboration). Default 2.
+    minMonitorSources?: number;
   };
 
   // Publishing configuration
@@ -67,15 +73,18 @@ export interface ServiceConfig {
   // Logging
   logging: {
     level: 'debug' | 'info' | 'warn' | 'error';
-    // Log to file (in addition to console)
-    file?: string;
   };
 
   // Database
   database: {
     path: string;
-    // Retention period for historical data (days)
+    // Retention for score_history (and the default for reports). Must be >= the
+    // longest analytics window (90d rolling averages), so keep at 90+.
     retentionDays: number;
+    // Retention for raw probe rows (reliability scoring only looks back ~30d).
+    probeRetentionDays?: number;
+    // Retention for nip66_metrics (RTT stats use recent samples).
+    nip66RetentionDays?: number;
   };
 
   // API server (optional, runs inside daemon)
@@ -126,6 +135,10 @@ export const DEFAULT_CONFIG: ServiceConfig = {
     trustedMonitors: [
       '9bbbb845e5b6c831c29789900769843ab43bb5047abe697870cb50b6fc9bf923',  // nostr.watch Amsterdam
     ],
+    // Auto-discovery Sybil controls: a new monitor must be announced by this
+    // many distinct source relays before it's trusted, capped at maxMonitors.
+    minMonitorSources: 2,
+    maxMonitors: 200,
   },
 
   publishing: {
@@ -157,8 +170,10 @@ export const DEFAULT_CONFIG: ServiceConfig = {
   },
 
   database: {
-    path: './data/trustedrelays.db',
+    path: './data/trustedrelays.sqlite',
     retentionDays: 90,
+    probeRetentionDays: 45,
+    nip66RetentionDays: 45,
   },
 
   api: {
@@ -175,6 +190,15 @@ export function loadConfig(configPath: string): ServiceConfig {
   if (!existsSync(configPath)) {
     return DEFAULT_CONFIG;
   }
+
+  // Warn if the config (which may contain provider.privateKey) is group/world
+  // readable. Prefer chmod 600, or supply the key via NOSTR_PRIVATE_KEY.
+  try {
+    const mode = statSync(configPath).mode;
+    if (mode & 0o077) {
+      console.warn(`[config] WARNING: ${configPath} is group/world-accessible (mode ${(mode & 0o777).toString(8)}). It may contain your private key — run: chmod 600 ${configPath}`);
+    }
+  } catch { /* stat failure is non-fatal */ }
 
   let fileContent: string;
   let fileConfig: unknown;
