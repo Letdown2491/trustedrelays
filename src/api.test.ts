@@ -34,6 +34,16 @@ beforeAll(async () => {
   };
   await store.storeProbe(probe);
 
+  // A never-online relay: only unreachable probes -> should be "offline" (no
+  // score, hidden from the default relay list, shown with ?includeOffline=true).
+  await store.storeProbe({
+    url: 'wss://dead.example.com',
+    timestamp: Math.floor(Date.now() / 1000),
+    reachable: false,
+    relayType: 'unknown',
+    error: 'Connection timeout',
+  });
+
   // ...but two monitors observe auth required + topics. Conflict expected.
   const now = Math.floor(Date.now() / 1000);
   for (const m of ['mon1'.padEnd(64, 'a'), 'mon2'.padEnd(64, 'b')]) {
@@ -89,6 +99,26 @@ describe('API integration', () => {
     expect(relay).toBeDefined();
     expect(relay.topics.map((t: string) => t.toLowerCase()).sort()).toEqual(['dev', 'nostr']);
     expect(relay.policyDiscrepancy).toBe(true);
+  });
+
+  test('never-online relays are offline: hidden by default, shown with includeOffline', async () => {
+    const DEAD = 'wss://dead.example.com';
+
+    // Default list: live relay present + scorable; dead relay absent.
+    const def = await (await fetch(`${base}/api/relays`)).json();
+    const live = def.data.find((r: any) => r.url === RELAY);
+    expect(live).toBeDefined();
+    expect(live.scorable).toBe(true);
+    expect(typeof live.score).toBe('number');
+    expect(def.data.find((r: any) => r.url === DEAD)).toBeUndefined();
+
+    // With includeOffline: dead relay present, marked offline with null score.
+    const all = await (await fetch(`${base}/api/relays?includeOffline=true`)).json();
+    const dead = all.data.find((r: any) => r.url === DEAD);
+    expect(dead).toBeDefined();
+    expect(dead.scorable).toBe(false);
+    expect(dead.status).toBe('offline');
+    expect(dead.score).toBeNull();
   });
 
   test('GET /api/relay returns detail with observedConflict + topics', async () => {

@@ -58,6 +58,11 @@ export interface ServiceConfig {
   probing?: {
     // Number of relays to probe concurrently (default: 30)
     concurrency: number;
+    // A relay with no successful probe in this many days (and >=3 attempts) is
+    // demoted from every-cycle probing to a periodic revival check (default: 7).
+    demoteAfterDays?: number;
+    // How often (hours) demoted relays get a revival probe (default: 24).
+    revivalIntervalHours?: number;
   };
 
   // Timing intervals (in seconds)
@@ -157,6 +162,8 @@ export const DEFAULT_CONFIG: ServiceConfig = {
 
   probing: {
     concurrency: 30,          // Probe 30 relays concurrently
+    demoteAfterDays: 7,       // Demote relays dead >7d to periodic revival probing
+    revivalIntervalHours: 24, // Re-probe demoted relays once a day
   },
 
   intervals: {

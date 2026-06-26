@@ -590,8 +590,24 @@ export class RelayTrustService {
     }
 
     this.stats.relaysTracked = relays.length;
+
+    // Two-tier probing: relays with no success in `demoteAfterDays` (and >=3
+    // attempts) are "dead" — re-probe them only once per `revivalIntervalHours`
+    // instead of every cycle. Recently-alive relays (success within the window)
+    // keep every-cycle probing, so a normal multi-day outage recovers promptly.
+    const demoteAfterDays = this.config.probing?.demoteAfterDays ?? 7;
+    const revivalIntervalHours = this.config.probing?.revivalIntervalHours ?? 24;
+    const demoted = new Set(await this.db.getRelaysUnreachableFor(demoteAfterDays, 3));
+    const lastProbeTimes = await this.db.getLastProbeTimes();
+    const revivalCutoff = Math.floor(Date.now() / 1000) - revivalIntervalHours * 3600;
+    const activeRelays = relays.filter((url) => {
+      if (!demoted.has(url)) return true;
+      return (lastProbeTimes.get(url) ?? 0) <= revivalCutoff; // due for a revival probe
+    });
+    const demotedSkipped = relays.length - activeRelays.length;
+
     const concurrency = this.config.probing?.concurrency ?? 30;
-    this.log('info', `Probing ${relays.length} relays (concurrency: ${concurrency})...`);
+    this.log('info', `Probing ${activeRelays.length} relays (concurrency: ${concurrency}; ${demotedSkipped} dead relays deferred to ${revivalIntervalHours}h revival checks)...`);
 
     let successCount = 0;
     let errorCount = 0;
@@ -683,16 +699,16 @@ export class RelayTrustService {
       }
 
       completed++;
-      if (completed % concurrency === 0 || completed === relays.length) {
-        const progress = Math.round((completed / relays.length) * 100);
-        this.log('info', `Probe progress: ${completed}/${relays.length} (${progress}%)`);
+      if (completed % concurrency === 0 || completed === activeRelays.length) {
+        const progress = Math.round((completed / activeRelays.length) * 100);
+        this.log('info', `Probe progress: ${completed}/${activeRelays.length} (${progress}%)`);
       }
     };
 
     // Continuous worker pool: `concurrency` workers drain a shared queue, so a
     // slow/dead relay only ties up its own worker (no fixed-batch head-of-line
     // blocking where one relay idles the rest of the slots).
-    await runPool(relays, concurrency, processRelay, () => !this.running);
+    await runPool(activeRelays, concurrency, processRelay, () => !this.running);
 
     this.stats.lastProbeAt = Date.now();
     this.log('info', `Probe cycle complete: ${successCount} success, ${errorCount} failed`);
@@ -758,6 +774,14 @@ export class RelayTrustService {
 
         // Individual probes for reliability scoring, from the bulk pre-fetch.
         const probes = allProbes.get(url) ?? (latestProbe ? [latestProbe] : []);
+
+        // Liveness gate: don't score or publish relays with no successful probe
+        // in the 30-day window (never-online / long-dead). They auto-resume when
+        // a revival probe succeeds. Avoids publishing noise for dead relays.
+        if (!probes.some((p) => p.reachable)) {
+          this.log('debug', `No successful probe in 30d for ${url}, skipping publish`);
+          continue;
+        }
 
         // Use cached operator resolution or resolve fresh
         let operatorResolution = allOperatorResolutions.get(url);

@@ -755,9 +755,15 @@ export function startApiServer(config: ApiConfig): { stop: () => void; port: num
           }
 
           try {
+            // Offline (never-online / long-dead) relays are hidden by default;
+            // ?includeOffline=true returns them too.
+            const includeOffline = url.searchParams.get('includeOffline') === 'true';
+            const filterScorable = (list: any[]) =>
+              includeOffline ? list : list.filter((r) => r.scorable !== false);
+
             // Serve the daemon-precomputed snapshot (off the request path).
             if (precomputed) {
-              return addRateLimitHeaders(jsonResponse(precomputed.relays));
+              return addRateLimitHeaders(jsonResponse(filterScorable(precomputed.relays)));
             }
             // Cold-start fallback (before the first cycle refresh).
             const cacheKey = 'relays';
@@ -766,7 +772,7 @@ export function startApiServer(config: ApiConfig): { stop: () => void; port: num
               relays = await getRelayList(db);
               responseCache.set(cacheKey, relays, CACHE_TTL.RELAY_LIST);
             }
-            return addRateLimitHeaders(jsonResponse(relays));
+            return addRateLimitHeaders(jsonResponse(filterScorable(relays)));
           } catch (err) {
             console.error('Failed to get relays:', err);
             return addRateLimitHeaders(errorResponse(sanitizeError(err), 500));
@@ -1289,6 +1295,7 @@ async function getRelayList(db: DataStore): Promise<Array<{
   lastSeen: number | null;
   supportedNips: number[];
   operatorTrust: number | null;
+  scorable: boolean;
 }>> {
   // Fetch all data in parallel using bulk queries
   // getAllLatestProbes() provides NIP-11 data (one per relay, includes nip11_json)
@@ -1316,11 +1323,41 @@ async function getRelayList(db: DataStore): Promise<Array<{
   // Iterate over all relays with latest probes
   for (const [url, latestProbe] of allLatestProbes) {
     // Use bulk probe history for scoring (no nip11_json)
-    const probes = allProbes.get(url) ?? [latestProbe];
+    const probes = allProbes.get(url) ?? [];
     const nip66 = nip66Stats.get(url);
     const jurisdiction = jurisdictions.get(url);
     const operatorResolution = operatorResolutions.get(url);
     const trendData = scoreTrends.get(url);
+    const signals = nip66Signals.get(url);
+    const policy = classifyPolicy(latestProbe.nip11, latestProbe.relayType, [], signals);
+    const isSecure = url.toLowerCase().startsWith('wss://');
+    const name = latestProbe.nip11?.name || null;
+
+    // Liveness gate: a relay is "scorable" only if it had a successful probe in
+    // the 30-day window fetched above. Never-online / long-dead relays get no
+    // score and are marked offline (and excluded from the default list,
+    // rankings, and publishing). Auto-revives on the next successful probe.
+    const scorable = probes.some(p => p.reachable);
+    if (!scorable) {
+      results.push({
+        url, name, score: null, reliability: null, quality: null, accessibility: null,
+        status: 'offline', isOnline: false,
+        accessLevel: latestProbe.accessLevel ?? 'unknown',
+        relayType: latestProbe.relayType ?? 'unknown',
+        policy: policy.policy, policyDiscrepancy: policy.observedConflict ?? false,
+        topics: signals?.topics ?? [],
+        countryCode: jurisdiction?.countryCode ?? null,
+        countryName: jurisdiction?.countryName ?? null,
+        region: jurisdiction?.region ?? null,
+        observations: 0, confidence: getConfidenceLevel(0),
+        trend: null, trendChange: null, trendPeriod: null,
+        isSecure, lastSeen: latestProbe.timestamp ?? null,
+        supportedNips: normalizeNipArray(latestProbe.nip11?.supported_nips),
+        operatorTrust: operatorResolution?.trustScore ?? null,
+        scorable: false,
+      });
+      continue;
+    }
 
     // Compute scores using the SAME algorithm as detail view
     const reliabilityScore = computeCombinedReliabilityScore(probes, nip66 ?? null);
@@ -1342,10 +1379,6 @@ async function getRelayList(db: DataStore): Promise<Array<{
       : calculateOfflineReliability(uptimePercent, lastOnlineProbe?.timestamp);
     const qualityVal = qualityScore.overall;
     const accessibilityVal = accessibilityScore.overall;
-
-    // Get policy - pass empty array for reports since we only have stats
-    const signals = nip66Signals.get(url);
-    const policy = classifyPolicy(latestProbe.nip11, latestProbe.relayType, [], signals);
 
     // Calculate weighted observations for confidence
     const nip66MetricCount = nip66?.metricCount ?? 0;
@@ -1376,12 +1409,6 @@ async function getRelayList(db: DataStore): Promise<Array<{
       else if (trendData.change < -3) trend = 'down';
       else trend = 'stable';
     }
-
-    // Check if secure (wss://)
-    const isSecure = url.toLowerCase().startsWith('wss://');
-
-    // Get relay name from NIP-11
-    const name = latestProbe.nip11?.name || null;
 
     // Compute overall score using the same formula as detail view
     const overallScore = Math.round(
@@ -1416,6 +1443,7 @@ async function getRelayList(db: DataStore): Promise<Array<{
       lastSeen: latestProbe.timestamp ?? null,
       supportedNips: normalizeNipArray(latestProbe.nip11?.supported_nips),
       operatorTrust: operatorResolution?.trustScore ?? null,
+      scorable: true,
     });
   }
 
@@ -1615,7 +1643,7 @@ async function getRelayAssertion(db: DataStore, url: string): Promise<UnsignedEv
  * Get relay rankings (leaderboard)
  * Computes rankings for all relays with efficient bulk queries
  */
-async function getRelayRankings(db: DataStore): Promise<{
+async function getRelayRankings(db: DataStore, scorableUrls?: Set<string>): Promise<{
   rankings: Array<{
     rank: number;
     url: string;
@@ -1635,12 +1663,18 @@ async function getRelayRankings(db: DataStore): Promise<{
   generatedAt: number;
 }> {
   // Fetch all necessary data in parallel
-  const [relayScores, previousRankings, trendData, latestProbes] = await Promise.all([
+  const [allRelayScores, previousRankings, trendData, latestProbes] = await Promise.all([
     db.getAllRelayScoresForRanking(),
     db.getPreviousRankings(7),
     db.getAllTrendData(30),
     db.getAllLatestProbes(),
   ]);
+
+  // Rank only scorable relays (≥1 successful probe in 30d). When the caller
+  // doesn't supply the set (e.g. cold-start), fall back to all relays.
+  const relayScores = scorableUrls
+    ? allRelayScores.filter((r) => scorableUrls.has(r.url))
+    : allRelayScores;
 
   // Build relay score data for ranking calculation
   const scoreData: RelayScoreData[] = relayScores.map((r) => ({
@@ -2023,7 +2057,8 @@ async function computeNetworkStatsFromRelays(
  */
 export async function refreshPrecomputed(db: DataStore): Promise<void> {
   const relays = await getRelayList(db);
-  const rankings = await getRelayRankings(db);
+  const scorableUrls = new Set(relays.filter((r) => r.scorable).map((r) => r.url));
+  const rankings = await getRelayRankings(db, scorableUrls);
   const networkStats = new Map<string, object>();
   for (const period of ALLOWED_PERIODS) {
     networkStats.set(period, await computeNetworkStatsFromRelays(db, relays, parsePeriod(period)));

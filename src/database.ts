@@ -981,6 +981,18 @@ export class DataStore {
   }
 
   /**
+   * Map of relay_url -> most recent probe timestamp (any reachability). Cheap
+   * (covered by the probes PK). Used to pace revival probing of demoted relays.
+   */
+  async getLastProbeTimes(): Promise<Map<string, number>> {
+    const db = await this.ensureReady();
+    const rows = await db.all(`SELECT url, MAX(timestamp) AS ts FROM probes GROUP BY url`);
+    const m = new Map<string, number>();
+    for (const r of rows as any[]) m.set(r.url, Number(r.ts));
+    return m;
+  }
+
+  /**
    * Get relays that have been unreachable for at least N days
    * Only considers relays that have at least `minProbes` recent probes
    */

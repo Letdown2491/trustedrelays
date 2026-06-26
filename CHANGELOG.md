@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.3.1] - 2026-06-26
+
+Dead-relay curation. The relay set had accumulated ~1,200 relays that have never
+once responded (pulled in from NIP-66 monitor lists and re-probed every cycle),
+all sitting at the scorer's offline floor and cluttering the dashboard.
+
+> Algorithm version unchanged (`v0.3.0`): scores for live relays do not move.
+
+### Changed
+
+- **Liveness-gated scoring/display/publishing.** A relay is "scorable" only if it
+  had ≥1 successful probe in the last 30 days. Never-online / long-dead relays now
+  get no score (`status: offline`) and are excluded from the default `/api/relays`,
+  from rankings, and from published assertions. They auto-revive on the next
+  successful probe. Relays merely down for a few days keep their score (the outage
+  shows up as reduced reliability), so normal downtime is unaffected.
+- **Two-tier probing.** Relays with no success in `probing.demoteAfterDays` (7)
+  are demoted from every-cycle probing to a once-per-`probing.revivalIntervalHours`
+  (24h) revival check — lighter, faster cycles, while still catching recoveries
+  within a day.
+
+### Added
+
+- `?includeOffline=true` on `/api/relays` to include offline relays.
+- Config: `probing.demoteAfterDays`, `probing.revivalIntervalHours`.
+
 ## [0.3.0] - 2026-06-26
 
 > The scoring **algorithm version is unchanged (`v0.3.0`)** — this release is a
