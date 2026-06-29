@@ -329,7 +329,8 @@ time_factor = 1 + (min(days, 30) / 30)                // range: 1.0-2.0
 | `GET /api/health` | Health check |
 | `GET /api/relays` | List all relays with scores (rate limited: 10/min) |
 | `GET /api/relay?url=<url>` | Single relay details |
-| `GET /api/score?url=<url>` | Lightweight score only |
+| `GET /api/score?url=<url>` | Lightweight score only (served from the precomputed snapshot) |
+| `GET /api/scores?url=<url>&url=<url>` | Batch scores for many relays in one request (up to 100; snapshot-only, never blocks) |
 | `GET /api/assertion?url=<url>` | Kind 30385 event JSON |
 | `GET /api/history?url=<url>&days=N` | Score history and trend |
 | `GET /api/countries` | Country distribution stats |
@@ -550,10 +551,14 @@ server {
 
 ## Performance & data lifecycle
 
-- **Precomputed read models.** The daemon computes the relay-list, rankings, and
-  network-stats snapshots once per cycle (`refreshPrecomputed` in `api.ts`); the
-  `/api/relays`, `/api/rankings`, and `/api/network/stats` handlers serve those
-  in-memory snapshots, so no heavy aggregation runs on the request path.
+- **Precomputed read models.** The daemon computes the relay-list, rankings,
+  network-stats, and per-relay score snapshots once per cycle (`refreshPrecomputed`
+  in `api.ts`); the `/api/relays`, `/api/rankings`, `/api/network/stats`,
+  `/api/score`, and `/api/scores` handlers serve those in-memory snapshots, so no
+  heavy aggregation runs on the request path. (Before this, a cold-cache
+  `/api/score` ran an on-demand recompute that blocked the response ~14s on busy
+  relays.) `/api/score` falls back to on-demand compute only for relays absent
+  from the snapshot (non-scorable / never-seen), where it is cheap.
 - **Indexing.** Latest-per-entity reads use `GROUP BY MAX(timestamp)` joins over
   the table primary keys plus composite covering indexes
   (`idx_score_history_relay_ts_score`, `idx_nip66_*`).

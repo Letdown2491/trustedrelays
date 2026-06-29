@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.4.0] - 2026-06-28
+
+Cold-cache latency fix for `/api/score`. The first (cache-miss) request for a
+relay recomputed its score on-demand and blocked the response for ~14s on busy
+relays, tripping typical client HTTP timeouts; repeat requests were fast. The
+daemon already computes every scorable relay's score each cycle, so the endpoint
+now serves that snapshot instead of recomputing.
+
+> Algorithm version unchanged (`v0.3.0`): scoring math does not change, and
+> published kind-30385 scores do not move. `/api/score` readouts now match the
+> dashboard's canonical (90-day NIP-66 window) score rather than the old
+> on-demand 365-day-window recompute, so a relay's reported score may shift a
+> point or two — a consistency fix, not a re-scoring.
+
+### Added
+
+- **`GET /api/scores?url=…&url=…`** — batch endpoint returning many relay scores
+  in one request (up to 100), so clients don't fan out N parallel calls on
+  startup. Served from the in-memory snapshot and never blocks: a relay not yet
+  in the snapshot returns `{url, status: "pending"}` (re-query `/api/score` for
+  it), and an invalid URL returns `{url, status: "invalid"}` without failing the
+  whole batch.
+
+### Changed
+
+- **`/api/score` serves the precomputed snapshot.** Known/scorable relays now
+  return in ~0.2s on a cold cache instead of ~14s. The on-demand path remains
+  only as a fallback for relays not in the snapshot (non-scorable / never-seen),
+  where it is cheap. Request/response shape is unchanged — existing callers need
+  no changes and can drop any inflated client timeouts.
+
 ## [0.3.1] - 2026-06-26
 
 Dead-relay curation. The relay set had accumulated ~1,200 relays that have never

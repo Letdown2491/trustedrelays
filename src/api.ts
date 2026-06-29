@@ -425,6 +425,10 @@ class ResponseCache {
 // analytics:<url>) under load.
 const responseCache = new ResponseCache(500);
 
+// Cap for the batch GET /api/scores endpoint — bounds URL length and work per
+// request. Lookups are O(1) map gets, so this is generous.
+const MAX_BATCH_SCORE_URLS = 100;
+
 // Cache TTLs
 const CACHE_TTL = {
   RELAY_LIST: 30000,    // 30 seconds
@@ -440,10 +444,24 @@ const CACHE_TTL = {
 // Null until the first refresh; handlers fall back to on-demand compute then.
 let precomputed: {
   relays: any[];
+  // url -> the /api/score response shape, projected from the relay list the
+  // daemon already computes each cycle. Lets /api/score serve from memory
+  // instead of running the ~14s on-demand getRelayScore() per request.
+  scores: Map<string, ScoreResponse>;
   rankings: object;
   networkStats: Map<string, object>;
   computedAt: number;
 } | null = null;
+
+type ScoreResponse = {
+  url: string;
+  score: number;
+  reliability: number;
+  quality: number;
+  accessibility: number;
+  confidence: 'low' | 'medium' | 'high';
+  status: 'evaluated' | 'insufficient_data' | 'unreachable';
+};
 
 /**
  * Get client IP from request (Cloudflare Workers)
@@ -535,6 +553,19 @@ function serveApiDocs(): Response {
           confidence: 'high',
           status: 'evaluated'
         }
+      },
+      {
+        path: '/api/scores',
+        method: 'GET',
+        description: 'Batch trust scores for many relays in one request (avoids fanning out N calls). Served from the in-memory snapshot; a relay not yet in the snapshot returns {status:"pending"} — re-query /api/score for it.',
+        parameters: [
+          { name: 'url', type: 'string', required: true, description: `Relay WebSocket URL; repeat for each relay (max ${MAX_BATCH_SCORE_URLS})` }
+        ],
+        example: '/api/scores?url=wss://relay.damus.io&url=wss://relay.primal.net',
+        response: [
+          { url: 'wss://relay.damus.io', score: 85, reliability: 90, quality: 82, accessibility: 78, confidence: 'high', status: 'evaluated' },
+          { url: 'wss://new.relay.example', status: 'pending' }
+        ]
       },
       {
         path: '/api/relay',
@@ -713,7 +744,17 @@ export function startApiServer(config: ApiConfig): { stop: () => void; port: num
           }
 
           try {
-            // Check cache first
+            // Serve the daemon-precomputed score (off the request path). This is
+            // the hot path for every known/scorable relay: O(1) map lookup
+            // instead of the ~14s on-demand getRelayScore() rebuild.
+            const snapshot = precomputed?.scores.get(validation.url);
+            if (snapshot) {
+              return addRateLimitHeaders(jsonResponse(snapshot));
+            }
+
+            // Fallback for relays not in the snapshot (non-scorable / never
+            // seen). Cheap for these — they have little/no monitor history — so
+            // the old on-demand path is fine here. Cache to smooth repeats.
             const cacheKey = `score:${validation.url}`;
             let score = responseCache.get<object>(cacheKey);
             if (!score) {
@@ -730,6 +771,38 @@ export function startApiServer(config: ApiConfig): { stop: () => void; port: num
             console.error('Failed to get score:', err);
             return addRateLimitHeaders(errorResponse(sanitizeError(err), 500));
           }
+        }
+
+        // Batch score endpoint: GET /api/scores?url=wss://a&url=wss://b
+        // Lets clients fetch many relay scores in one request instead of fanning
+        // out N parallel calls on startup. Snapshot-only (never blocks): a relay
+        // missing from the in-memory snapshot is returned with status "pending"
+        // so the client can re-query the single /api/score endpoint for it.
+        if (path === '/api/scores') {
+          const rawUrls = url.searchParams.getAll('url');
+          if (rawUrls.length === 0) {
+            return addRateLimitHeaders(errorResponse('At least one ?url= is required'));
+          }
+          if (rawUrls.length > MAX_BATCH_SCORE_URLS) {
+            return addRateLimitHeaders(
+              errorResponse(`Too many URLs (max ${MAX_BATCH_SCORE_URLS})`),
+            );
+          }
+
+          const seen = new Set<string>();
+          const data: Array<ScoreResponse | { url: string; status: 'pending' | 'invalid' }> = [];
+          for (const raw of rawUrls) {
+            const validation = validateRelayUrl(raw);
+            if (!validation.valid) {
+              data.push({ url: raw, status: 'invalid' });
+              continue;
+            }
+            if (seen.has(validation.url)) continue;
+            seen.add(validation.url);
+            const snapshot = precomputed?.scores.get(validation.url);
+            data.push(snapshot ?? { url: validation.url, status: 'pending' });
+          }
+          return addRateLimitHeaders(jsonResponse(data));
         }
 
         // List all relays with scores (expensive endpoint - stricter rate limit)
@@ -2063,7 +2136,25 @@ export async function refreshPrecomputed(db: DataStore): Promise<void> {
   for (const period of ALLOWED_PERIODS) {
     networkStats.set(period, await computeNetworkStatsFromRelays(db, relays, parsePeriod(period)));
   }
-  precomputed = { relays, rankings, networkStats, computedAt: Date.now() };
+  // Project the score-endpoint shape for every scorable relay. getRelayList
+  // computes score/reliability/quality/accessibility/confidence/status with the
+  // same formula and status enum as the on-demand getRelayScore(), so this is a
+  // faithful, request-free source for /api/score.
+  const scores = new Map<string, ScoreResponse>();
+  for (const r of relays) {
+    if (!r.scorable || r.score === null || r.reliability === null ||
+        r.quality === null || r.accessibility === null) continue;
+    scores.set(r.url, {
+      url: r.url,
+      score: r.score,
+      reliability: r.reliability,
+      quality: r.quality,
+      accessibility: r.accessibility,
+      confidence: r.confidence,
+      status: r.status as ScoreResponse['status'],
+    });
+  }
+  precomputed = { relays, scores, rankings, networkStats, computedAt: Date.now() };
   responseCache.set('relays', relays, CACHE_TTL.RELAY_LIST);
   responseCache.set('rankings', rankings, CACHE_TTL.RELAY_LIST);
 }

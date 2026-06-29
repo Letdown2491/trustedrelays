@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { startApiServer } from './api.js';
+import { startApiServer, refreshPrecomputed } from './api.js';
 import { DataStore } from './database.js';
 import type { ProbeResult } from './types.js';
 import { tmpdir } from 'os';
@@ -127,5 +127,49 @@ describe('API integration', () => {
     const body = await res.json();
     expect(body.data.policy.observedConflict).toBe(true);
     expect(body.data.topics.map((t: string) => t.toLowerCase()).sort()).toEqual(['dev', 'nostr']);
+  });
+
+  test('GET /api/score serves the precomputed snapshot for a scorable relay', async () => {
+    // Warm the snapshot so the score is served off the request path (the fix for
+    // the ~14s cold-cache on-demand compute).
+    await refreshPrecomputed(store);
+
+    const res = await fetch(`${base}/api/score?url=${encodeURIComponent(RELAY)}`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.url).toBe(RELAY);
+    expect(typeof body.data.score).toBe('number');
+    expect(['evaluated', 'insufficient_data', 'unreachable']).toContain(body.data.status);
+  });
+
+  test('GET /api/scores batches: hit -> score, unknown -> pending, bad -> invalid', async () => {
+    await refreshPrecomputed(store);
+
+    const UNKNOWN = 'wss://never.seen.example';
+    const res = await fetch(
+      `${base}/api/scores?url=${encodeURIComponent(RELAY)}` +
+        `&url=${encodeURIComponent(UNKNOWN)}&url=not-a-relay`,
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(Array.isArray(body.data)).toBe(true);
+
+    const hit = body.data.find((r: any) => r.url === RELAY);
+    expect(typeof hit.score).toBe('number');
+
+    const pending = body.data.find((r: any) => r.url === UNKNOWN);
+    expect(pending.status).toBe('pending');
+
+    const invalid = body.data.find((r: any) => r.status === 'invalid');
+    expect(invalid).toBeDefined();
+  });
+
+  test('GET /api/scores rejects an empty or oversized url list', async () => {
+    const empty = await fetch(`${base}/api/scores`);
+    expect(empty.status).toBe(400);
+
+    const many = Array.from({ length: 101 }, (_, i) => `url=wss://r${i}.example`).join('&');
+    const over = await fetch(`${base}/api/scores?${many}`);
+    expect(over.status).toBe(400);
   });
 });
